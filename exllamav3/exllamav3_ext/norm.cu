@@ -171,8 +171,10 @@ void rms_norm_kernel
     constexpr bool output_fp32 = std::is_same_v<output_t, float>;
     constexpr bool input_fp16 = std::is_same_v<input_t, half>;
     constexpr bool output_fp16 = std::is_same_v<output_t, half>;
-    static_assert(input_fp32 || input_fp16, "rms_norm_kernel: input must be float or half type");
-    static_assert(output_fp32 || output_fp16, "rms_norm_kernel: output must be float or half type");
+    constexpr bool input_bf16 = std::is_same_v<input_t, bfloat16>;    // P28
+    constexpr bool output_bf16 = std::is_same_v<output_t, bfloat16>;  // P28
+    static_assert(input_fp32 || input_fp16 || input_bf16, "rms_norm_kernel: bad input type");
+    static_assert(output_fp32 || output_fp16 || output_bf16, "rms_norm_kernel: bad output type");
     constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
     constexpr bool residual_fp16 = std::is_same_v<residual_t, half>;
 
@@ -188,6 +190,7 @@ void rms_norm_kernel
     {
         if constexpr (input_fp16) read_half4<true>(f4, (const half4*) addr);
         if constexpr (input_fp32) read_float4(f4, (const float4*) addr);
+        if constexpr (input_bf16) read_bfloat164(f4, (const bfloat164*) addr);   // P28
     };
 
     auto add_resid_in = [&] (float4& x4, int column)
@@ -243,6 +246,7 @@ void rms_norm_kernel
             float4 r4;
             if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row * dim)) + column);
             if constexpr (output_fp32) read_float4(r4, ((float4*) (y + row * dim)) + column);
+            if constexpr (output_bf16) read_bfloat164(r4, ((bfloat164*) (y + row * dim)) + column);  // P28
             x4.x += r4.x;
             x4.y += r4.y;
             x4.z += r4.z;
@@ -251,6 +255,12 @@ void rms_norm_kernel
 
         if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
+        if constexpr (output_bf16)                                                    // P28
+        {
+            bfloat164 b4(__float2bfloat16_rn(x4.x), __float2bfloat16_rn(x4.y),
+                         __float2bfloat16_rn(x4.z), __float2bfloat16_rn(x4.w));
+            WRITE64(((bfloat164*) (y + row * dim)) + column, b4);
+        }
     };
 
     if (single)
@@ -386,6 +396,12 @@ void rms_norm_impl
     else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, RES_NONE, kHalf,  half)
     else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_NONE, kFloat, float)
     else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, RES_NONE, kFloat, float)
+    else __(kBFloat16, bfloat16, kHalf,     half,     kHalf,     half,     RES_NONE, kBFloat16, bfloat16)
+    else __(kBFloat16, bfloat16, kHalf,     half,     kFloat,    float,    RES_NONE, kBFloat16, bfloat16)
+    else __(kBFloat16, bfloat16, kHalf,     half,     kBFloat16, bfloat16, RES_NONE, kBFloat16, bfloat16)
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kHalf,     half,     RES_NONE, kBFloat16, bfloat16)
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kFloat,    float,    RES_NONE, kBFloat16, bfloat16)
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kBFloat16, bfloat16, RES_NONE, kBFloat16, bfloat16)
     else __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_POST, kHalf,  half)
     else __(kHalf,  half,  kHalf,     half,     kFloat, float, RES_POST, kHalf,  half)
     else __(kFloat, float, kHalf,     half,     kHalf,  half,  RES_POST, kFloat, float)

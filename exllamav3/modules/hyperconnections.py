@@ -29,7 +29,9 @@ class ExpandStreams(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
-        return x.float().unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
+        import os as _hc_os
+        _dt = torch.bfloat16 if _hc_os.environ.get("EXL3_HC_BF16") == "1" else torch.float
+        return x.to(_dt).unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
 
     def tp_export(self, plan, producer):
         # Stateless stream broadcast; the residual (and its stream stack) is replicated
@@ -118,7 +120,7 @@ class HyperConnection(Module):
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
         hc = self.hc_mult
         b, s, H, D = streams.shape
-        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+        if hc == 4 and streams.dtype in (torch.float, torch.bfloat16) and D % 4 == 0 and streams.is_contiguous():
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
@@ -169,7 +171,7 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if not converting and H == 4 and x.dtype in (torch.float, torch.bfloat16) and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s

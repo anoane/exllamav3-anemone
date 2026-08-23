@@ -6,6 +6,37 @@
 #include "util.cuh"
 #include "graph.cuh"
 
+// bf16 stream support — templated 4-wide stream accessors. The float
+// specializations compile to the original float4 loads/stores (byte-identical fast path).
+#include <cuda_bf16.h>
+template <typename ST>
+__device__ __forceinline__ float4 ld_s4(const ST* base, size_t idx4);
+template <>
+__device__ __forceinline__ float4 ld_s4<float>(const float* base, size_t idx4)
+{ return ((const float4*) base)[idx4]; }
+template <>
+__device__ __forceinline__ float4 ld_s4<nv_bfloat16>(const nv_bfloat16* base, size_t idx4)
+{
+    int2 pk = ((const int2*) base)[idx4];
+    float2 lo = __bfloat1622float2(*(const nv_bfloat162*) &pk.x);
+    float2 hi = __bfloat1622float2(*(const nv_bfloat162*) &pk.y);
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+template <typename ST>
+__device__ __forceinline__ void st_s4(ST* base, size_t idx4, float4 v);
+template <>
+__device__ __forceinline__ void st_s4<float>(float* base, size_t idx4, float4 v)
+{ ((float4*) base)[idx4] = v; }
+template <>
+__device__ __forceinline__ void st_s4<nv_bfloat16>(nv_bfloat16* base, size_t idx4, float4 v)
+{
+    int2 pk;
+    *(nv_bfloat162*) &pk.x = __floats2bfloat162_rn(v.x, v.y);
+    *(nv_bfloat162*) &pk.y = __floats2bfloat162_rn(v.z, v.w);
+    ((int2*) base)[idx4] = pk;
+}
+
+
 /*
 
 Fused mHC HyperConnection mix() kernel
@@ -38,11 +69,11 @@ __device__ __forceinline__ float sigmoidf_(float x)
     return 1.0f / (1.0f + __expf(-x));
 }
 
-template <int H, int M_, typename FN_T>
+template <int H, int M_, typename FN_T, typename ST_T = float>
 __global__ __launch_bounds__(NUM_THREADS_A)
 void hc_mix_partials_kernel
 (
-    const float* __restrict__ streams,   // (R, H * D)
+    const ST_T* __restrict__ streams,    // (R, H * D) float or bf16
     const FN_T* __restrict__ fn,         // (M, H * D) float, or half (opt-in, halves traffic)
     float* __restrict__ partials,        // (R, chunksA, M + 1)
     const int row_len,
@@ -54,7 +85,7 @@ void hc_mix_partials_kernel
     const int c0 = blockIdx.x * chunk_cols;
     const int c1 = min(c0 + chunk_cols, row_len);
 
-    const float4* s4 = (const float4*) (streams + (size_t) r * row_len);
+    const ST_T* srow = streams + (size_t) r * row_len;
     const int row_len4 = row_len / 4;
 
     float acc[M + 1];
@@ -63,7 +94,7 @@ void hc_mix_partials_kernel
 
     for (int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS_A)
     {
-        float4 s = s4[c];
+        float4 s = ld_s4<ST_T>(srow, c);
         acc[M] = fmaf(s.x, s.x, acc[M]);
         acc[M] = fmaf(s.y, s.y, acc[M]);
         acc[M] = fmaf(s.z, s.z, acc[M]);
@@ -115,11 +146,11 @@ void hc_mix_partials_kernel
     }
 }
 
-template <int H, int M_, bool HEAD, bool HALF_OUT>
+template <int H, int M_, bool HEAD, bool HALF_OUT, typename ST_T = float>
 __global__ __launch_bounds__(NUM_THREADS)
 void hc_mix_finalize_kernel
 (
-    const float* __restrict__ streams,   // (R, H * D)
+    const ST_T* __restrict__ streams,    // (R, H * D) float or bf16
     const float* __restrict__ partials,  // (R, chunksA, M + 1)
     const float* __restrict__ base,      // (M)
     const float* __restrict__ scale,     // (3)
@@ -233,7 +264,7 @@ void hc_mix_finalize_kernel
     const int nth = shrunk ? NUM_THREADS - 32 : NUM_THREADS;
     const int c0 = blockIdx.x * chunk_cols_c;
     const int c1 = min(c0 + chunk_cols_c, D);
-    const float4* s4 = (const float4*) (streams + (size_t) r * row_len);
+    const ST_T* srow = streams + (size_t) r * row_len;
     const int D4 = D / 4;
     for (int c = c0 / 4 + tid; c < c1 / 4; c += nth)
     {
@@ -241,7 +272,7 @@ void hc_mix_finalize_kernel
         #pragma unroll
         for (int h = 0; h < H; ++h)
         {
-            float4 s = s4[(size_t) h * D4 + c];
+            float4 s = ld_s4<ST_T>(srow, (size_t) h * D4 + c);
             o.x = fmaf(pre_r[h], s.x, o.x);
             o.y = fmaf(pre_r[h], s.y, o.y);
             o.z = fmaf(pre_r[h], s.z, o.z);
@@ -263,11 +294,11 @@ void hc_mix_finalize_kernel
 // x[h', d]. Pure per-column mix of the H stream rows, so it runs in place: each thread
 // loads all H values of its columns into registers before writing any back.
 
-template <int H, typename Y_T>
+template <int H, typename Y_T, typename ST_T = float>
 __global__ __launch_bounds__(NUM_THREADS)
 void hc_apply_kernel
 (
-    float* __restrict__ x,               // (R, H, D), updated in place
+    ST_T* __restrict__ x,                // (R, H, D) float or bf16, updated in place
     const Y_T* __restrict__ y,           // (R, D) float or half
     const float* __restrict__ post,      // (R, H)
     const float* __restrict__ comb,      // (R, H, H)
@@ -291,13 +322,13 @@ void hc_apply_kernel
             comb_r[h][g] = __ldg(comb + ((size_t) r * H + h) * H + g);
     }
 
-    float4* x4 = (float4*) (x + (size_t) r * H * D);
+    ST_T* xrow = x + (size_t) r * H * D;
     for (int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS)
     {
         float4 xv[H];
         #pragma unroll
         for (int h = 0; h < H; ++h)
-            xv[h] = x4[(size_t) h * D4 + c];
+            xv[h] = ld_s4<ST_T>(xrow, (size_t) h * D4 + c);
 
         float4 yv;
         if constexpr (std::is_same_v<Y_T, half>)
@@ -327,7 +358,7 @@ void hc_apply_kernel
                 o.z = fmaf(comb_r[g][h], xv[g].z, o.z);
                 o.w = fmaf(comb_r[g][h], xv[g].w, o.w);
             }
-            x4[(size_t) h * D4 + c] = o;
+            st_s4<ST_T>(xrow, (size_t) h * D4 + c, o);
         }
     }
 }
@@ -353,7 +384,8 @@ static void hc_mix_launch
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK_DTYPE(streams, kFloat);
+    const bool s_bf16 = streams.dtype() == at::kBFloat16;
+    if (!s_bf16) TORCH_CHECK_DTYPE(streams, kFloat);
     TORCH_CHECK(streams.is_contiguous() && fn.is_contiguous(), "hc_mix: contiguous inputs required");
     int R = streams.size(0);
     int H = streams.size(1);
@@ -382,40 +414,44 @@ static void hc_mix_launch
 
     dim3 grid_a(n_chunks_a, R);
     dim3 grid_c(n_chunks_c, R);
-    #define ARGS_A(FN_T) \
-        (const float*) streams.data_ptr(), (const FN_T*) fn.data_ptr(), \
+    #define ARGS_A(FN_T, ST) \
+        (const ST*) streams.data_ptr(), (const FN_T*) fn.data_ptr(), \
         (float*) partials.data_ptr(), row_len, chunk_cols
-    #define ARGS_C(POST, COMB) \
-        (const float*) streams.data_ptr(), (const float*) partials.data_ptr(), \
+    #define ARGS_C(POST, COMB, ST) \
+        (const ST*) streams.data_ptr(), (const float*) partials.data_ptr(), \
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         POST, COMB, collapsed.data_ptr(), \
         D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters
-    if (!head)
-    {
-        if (fn_half)
-            hc_mix_partials_kernel<4, 24, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
-        else
-            hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
-        cuda_check(cudaPeekAtLastError());
-        float* post_p = (float*) post->data_ptr();
-        float* comb_p = (float*) comb->data_ptr();
-        if (half_out)
-            hc_mix_finalize_kernel<4, 24, false, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p));
-        else
-            hc_mix_finalize_kernel<4, 24, false, false><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p));
+    #define HC_DISPATCH(ST) \
+    if (!head) \
+    { \
+        if (fn_half) \
+            hc_mix_partials_kernel<4, 24, half, ST><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half, ST)); \
+        else \
+            hc_mix_partials_kernel<4, 24, float, ST><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float, ST)); \
+        cuda_check(cudaPeekAtLastError()); \
+        float* post_p = (float*) post->data_ptr(); \
+        float* comb_p = (float*) comb->data_ptr(); \
+        if (half_out) \
+            hc_mix_finalize_kernel<4, 24, false, true, ST><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p, ST)); \
+        else \
+            hc_mix_finalize_kernel<4, 24, false, false, ST><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p, ST)); \
+    } \
+    else \
+    { \
+        if (fn_half) \
+            hc_mix_partials_kernel<4, 4, half, ST><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half, ST)); \
+        else \
+            hc_mix_partials_kernel<4, 4, float, ST><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float, ST)); \
+        cuda_check(cudaPeekAtLastError()); \
+        if (half_out) \
+            hc_mix_finalize_kernel<4, 4, true, true, ST><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(nullptr, nullptr, ST)); \
+        else \
+            hc_mix_finalize_kernel<4, 4, true, false, ST><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(nullptr, nullptr, ST)); \
     }
-    else
-    {
-        if (fn_half)
-            hc_mix_partials_kernel<4, 4, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
-        else
-            hc_mix_partials_kernel<4, 4, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
-        cuda_check(cudaPeekAtLastError());
-        if (half_out)
-            hc_mix_finalize_kernel<4, 4, true, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(nullptr, nullptr));
-        else
-            hc_mix_finalize_kernel<4, 4, true, false><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(nullptr, nullptr));
-    }
+    if (s_bf16) { HC_DISPATCH(nv_bfloat16); }
+    else       { HC_DISPATCH(float); }
+    #undef HC_DISPATCH
     #undef ARGS_A
     #undef ARGS_C
     cuda_check(cudaPeekAtLastError());
@@ -500,7 +536,8 @@ void hc_apply
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK_DTYPE(x, kFloat);
+    const bool x_bf16 = x.dtype() == at::kBFloat16;
+    if (!x_bf16) TORCH_CHECK_DTYPE(x, kFloat);
     TORCH_CHECK_DTYPE(post, kFloat);
     TORCH_CHECK_DTYPE(comb, kFloat);
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && post.is_contiguous() && comb.is_contiguous(), "hc_apply: contiguous inputs required");
@@ -518,19 +555,15 @@ void hc_apply
     int n_chunks = (D + chunk_cols - 1) / chunk_cols;
 
     dim3 grid(n_chunks, R);
-    if (y.dtype() == at::kHalf)
-        hc_apply_kernel<4, half><<<grid, NUM_THREADS, 0, stream>>>
-        (
-            (float*) x.data_ptr(), (const half*) y.data_ptr(),
-            (const float*) post.data_ptr(), (const float*) comb.data_ptr(),
-            D, chunk_cols
-        );
-    else
-        hc_apply_kernel<4, float><<<grid, NUM_THREADS, 0, stream>>>
-        (
-            (float*) x.data_ptr(), (const float*) y.data_ptr(),
-            (const float*) post.data_ptr(), (const float*) comb.data_ptr(),
-            D, chunk_cols
-        );
+    #define HC_APPLY(Y_T, ST) \
+        hc_apply_kernel<4, Y_T, ST><<<grid, NUM_THREADS, 0, stream>>> \
+        ( \
+            (ST*) x.data_ptr(), (const Y_T*) y.data_ptr(), \
+            (const float*) post.data_ptr(), (const float*) comb.data_ptr(), \
+            D, chunk_cols \
+        )
+    if (y.dtype() == at::kHalf) { if (x_bf16) HC_APPLY(half, nv_bfloat16);  else HC_APPLY(half, float); }
+    else                        { if (x_bf16) HC_APPLY(float, nv_bfloat16); else HC_APPLY(float, float); }
+    #undef HC_APPLY
     cuda_check(cudaPeekAtLastError());
 }
