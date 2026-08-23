@@ -6,6 +6,104 @@ from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
 from ..modules.quant.exl3_lib.quantize import auto_split
+
+# ===== bf16 + tiered calibration state =====
+# EXL3_CAL_BF16=1  : store rows in bf16 (halves state size; validated against the
+#                    fp32 path on a full conversion)
+# EXL3_CAL_TIER=1  : tiered residency — spare VRAM -> bounded host RAM -> disk spill.
+#   Rows are independent and H is a sum over rows, so the corpus never needs to be
+#   host-resident; this removes the hc_expand OOM wall (~67 MB/row 4-stream state).
+import os as _anemone_os
+import tempfile as _cal_tempfile
+import threading as _cal_threading
+import weakref as _cal_weakref
+CAL_STATE_DTYPE = torch.bfloat16 if _anemone_os.environ.get("EXL3_CAL_BF16", "0") == "1" else torch.float32
+_CAL_TIER = _anemone_os.environ.get("EXL3_CAL_TIER", "0") == "1"
+_CAL_VRAM_B = int(float(_anemone_os.environ.get("EXL3_CAL_VRAM_GB", "48")) * (1 << 30))
+_CAL_RAM_B = int(float(_anemone_os.environ.get("EXL3_CAL_RAM_GB", "20")) * (1 << 30))
+_CAL_SPILL_DIR = _anemone_os.environ.get(
+    "EXL3_CAL_SPILL_DIR", _anemone_os.path.join(_cal_tempfile.gettempdir(), "exl3_cal_spill"))
+_cal_lock = _cal_threading.Lock()
+_cal_used = {"vram": 0, "ram": 0}
+_cal_seq = [0]
+_cal_stats = {"vram": 0, "ram": 0, "disk": 0}
+
+
+class _CalSpillHandle:
+    """Marker for a row spilled to disk; load with _cal_fetch."""
+    __slots__ = ("path", "__weakref__")
+
+    def __init__(self, path):
+        self.path = path
+
+
+def _cal_release(tier, n, path):
+    with _cal_lock:
+        if tier in _cal_used:
+            _cal_used[tier] -= n
+    if path is not None:
+        try:
+            _anemone_os.unlink(path)
+        except OSError:
+            pass
+
+
+def _cal_fetch(x):
+    """Materialize a stored row as a tensor (any device); no-op for tensors."""
+    if isinstance(x, _CalSpillHandle):
+        return torch.load(x.path, map_location="cpu", weights_only=True)
+    return x
+
+
+def store_state(t):
+    """Cast to CAL_STATE_DTYPE and park the row in the first tier with room."""
+    if t.is_floating_point() and t.dtype != CAL_STATE_DTYPE:
+        t = t.to(CAL_STATE_DTYPE)
+    else:
+        t = t.clone()  # break views into forward/graph buffers before parking the row
+    if not _CAL_TIER:
+        return t.cpu()
+    n = t.numel() * t.element_size()
+    with _cal_lock:
+        if t.is_cuda and _cal_used["vram"] + n <= _CAL_VRAM_B:
+            tier = "vram"
+        elif _cal_used["ram"] + n <= _CAL_RAM_B:
+            tier = "ram"
+        else:
+            tier = "disk"
+        if tier != "disk":
+            _cal_used[tier] += n
+        _cal_seq[0] += 1
+        seq = _cal_seq[0]
+        _cal_stats[tier] += 1
+    if tier == "vram":
+        out = t.contiguous()
+        _cal_weakref.finalize(out, _cal_release, "vram", n, None)
+        return out
+    if tier == "ram":
+        out = t.cpu()
+        _cal_weakref.finalize(out, _cal_release, "ram", n, None)
+        return out
+    _anemone_os.makedirs(_CAL_SPILL_DIR, exist_ok=True)
+    path = _anemone_os.path.join(_CAL_SPILL_DIR, f"row_{seq}.pt")
+    torch.save(t.cpu(), path)
+    h = _CalSpillHandle(path)
+    _cal_weakref.finalize(h, _cal_release, "disk", n, path)
+    return h
+
+
+def load_state(module, t, params):
+    """Materialize a stored row on the module's device, upcast to fp32 (hc_* kernels need it)."""
+    t = _cal_fetch(t)
+    t = module.prepare_for_device(t, params)
+    if t.is_floating_point() and t.dtype != torch.float32:
+        t = t.float()
+    # -headfix: head is a plain LinearFP16; its ext.hgemm needs fp16 (kHalf),
+    # the fp32 upcast above (for hc_* trunk kernels) breaks it -> downcast for the head.
+    if getattr(module, "key", "") == "head":
+        t = t.half()
+    return t
+# ===== end /P1b =====
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -57,6 +155,10 @@ group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
+
+
+from ..anemone_flags import add_convert_args, apply_convert_args
+add_convert_args(parser)
 
 num_ref_states = 5
 
@@ -128,6 +230,7 @@ def prepare_env(args):
 
 
 def prepare(args) -> (dict, dict, bool, str):
+    apply_convert_args(args)
     check_system()
 
     if not args.work_dir:
@@ -738,6 +841,7 @@ def capture_module_parallel(
                 if slicing:
                     params["q_mlp_slice"] = current_slice
                 get_preserve(i, params)
+                model.per_layer_quant_preamble(params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
                 put_preserve(i, params)
@@ -751,12 +855,13 @@ def capture_module_parallel(
                         if slicing:
                             params["q_mlp_slice"] = current_slice
                         get_preserve(i, params)
+                        model.per_layer_quant_preamble(params)
                         rs = module.prepare_for_device(state[i], params)
                         rs = module.forward(rs, params)
                         put_preserve(i, params)
                     if torch.isfinite(rs).all().item():
                         with lock:
-                            ref_map[i] = rs.cpu()
+                            ref_map[i] = store_state(rs)
                     else:
                         with lock:
                             bad_rows.add(i)
@@ -832,7 +937,7 @@ def advance_state_parallel(
                     "attn_mode": "flash_attn_nc",
                     "input_ids": original_input_ids[i],
                 }
-                state[i] = module.prepare_for_device(state[i], params)
+                state[i] = load_state(module, state[i], params)
                 row_bad = False
                 if i < num_ref_states or not is_last_module:
                     get_preserve(i, params)
@@ -842,12 +947,13 @@ def advance_state_parallel(
                         with lock:
                             bad_rows.add(i)
                         print(f" !! Non-finite hidden state in calibration row {i}, excluding row")
-                    state[i] = rs.cpu()
+                    state[i] = store_state(rs)
                     put_preserve(i, params)
                 ref = ref_states.get(i) if i < num_ref_states else None
                 if ref is not None and have_linears and not row_bad:
-                    ref = ref.to(state[i].device)
-                    rfn, cos, sq = get_state_error(state[i], ref)
+                    _st_i = _cal_fetch(state[i])
+                    ref = _cal_fetch(ref).to(_st_i.device)
+                    rfn, cos, sq = get_state_error(_st_i, ref)
                     ref_states[i] = None
                     with lock:
                         sums[0] += rfn
@@ -1036,6 +1142,22 @@ def main(args, job_state):
             model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
         )
+
+    # apply a per-tensor K override on top of whichever strategy was produced above.
+    # Upstream's recipe assigns one bitrate per tensor from a measured sensitivity solve; this
+    # map is how a per-expert allocation is expressed. The two compose -- a recipe can set the
+    # dense and attention tensors while this override sets each routed expert -- and either
+    # mechanism works on its own.
+    _anemone_sj = os.environ.get("EXL3_STRATEGY_JSON")
+    if _anemone_sj:
+        with open(_anemone_sj) as _f:
+            _anemone_ov = json.load(_f)
+        _anemone_unknown = [k for k in _anemone_ov if k not in strategy]
+        strategy.update(_anemone_ov)
+        print(f" -- ANEMONE: strategy override for {len(_anemone_ov)} tensors from {_anemone_sj}")
+        if _anemone_unknown:
+            print(f" !! ANEMONE: {len(_anemone_unknown)} override keys not in base strategy, "
+                  f"e.g. {_anemone_unknown[:3]}")
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))
@@ -1145,6 +1267,7 @@ def main(args, job_state):
                                 if slicing:
                                      params["q_mlp_slice"] = current_slice
                                 get_preserve(i, params)
+                                model.per_layer_quant_preamble(params)
                                 rs = module.prepare_for_device(state[i], params)
                                 rs = module.forward(rs, params)
                                 put_preserve(i, params)
@@ -1158,11 +1281,12 @@ def main(args, job_state):
                                         if slicing:
                                             params["q_mlp_slice"] = current_slice
                                         get_preserve(i, params)
+                                        model.per_layer_quant_preamble(params)
                                         rs = module.prepare_for_device(state[i], params)
                                         rs = module.forward(rs, params)
                                         put_preserve(i, params)
                                     if torch.isfinite(rs).all().item():
-                                        ref_states[i] = rs.cpu()
+                                        ref_states[i] = store_state(rs)
                                     else:
                                         bad_rows.add(i)
                                         print(f" !! Non-finite reference state in calibration row {i}, excluding row")
@@ -1286,19 +1410,20 @@ def main(args, job_state):
                             "attn_mode": "flash_attn_nc",
                             "input_ids": original_input_ids[i],
                         }
-                        state[i] = module.prepare_for_device(state[i], params)
+                        state[i] = load_state(module, state[i], params)
                         if i < num_ref_states or idx < len(model.modules) - 1:
                             get_preserve(i, params)
                             rs = module.forward(state[i], params)
                             if not torch.isfinite(rs).all().item():
                                 bad_rows.add(i)
                                 print(f" !! Non-finite hidden state in calibration row {i}, excluding row")
-                            state[i] = rs.cpu()
+                            state[i] = store_state(rs)
                             put_preserve(i, params)
                         ref = ref_states.get(i) if i < num_ref_states else None
                         if ref is not None and len(linears) and i not in bad_rows:
-                            ref = ref.to(state[i].device)
-                            rfn, cos, sq = get_state_error(state[i], ref)
+                            _st_i = _cal_fetch(state[i])
+                            ref = _cal_fetch(ref).to(_st_i.device)
+                            rfn, cos, sq = get_state_error(_st_i, ref)
                             error += rfn
                             cos_error += cos
                             sqnr_ += sq

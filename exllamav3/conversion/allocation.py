@@ -127,6 +127,15 @@ def create_q_strategy(
 
     # Promotion order: group priority first, then distance to the nearer end of the forward pass.
     # End layers contribute disproportionately to end-to-end error
+    # EXL3_SCORE_JSON={qgroup: score} adds a -score tiebreak after dist — higher
+    # scores (e.g. P2-measured per-expert usage) get promoted first at equal priority/distance.
+    # Groups absent from the file default to score 0; unset env is a byte-for-byte no-op.
+    import os as _os, json as _json
+    _score_path = _os.environ.get("EXL3_SCORE_JSON")
+    _scores = {}
+    if _score_path:
+        with open(_score_path) as _sf:
+            _scores = _json.load(_sf)
     stack_max = {}
     group_meta = []
     for idx, (gkey, tlist) in enumerate(target_groups.items()):
@@ -134,12 +143,16 @@ def create_q_strategy(
         stack, layer = (gkey[:m.start()], int(m.group(1))) if m else (None, -1)
         if stack is not None:
             stack_max[stack] = max(stack_max.get(stack, -1), layer)
-        group_meta.append((tlist, stack, layer, idx))
+        group_meta.append((tlist, stack, layer, idx, float(_scores.get(gkey, 0.0))))
 
     def group_order_key(meta):
-        tlist, stack, layer, idx = meta
+        tlist, stack, layer, idx, score = meta
         dist = 0 if stack is None else min(layer, stack_max[stack] - layer)
-        return (-max(t.priority for t in tlist), dist, layer, idx)
+        # score-primary — measured usage drives promotion; layer distance is
+        # only a tiebreak (the V-shape heuristic yields to the P2 data when a score is loaded)
+        if _scores:
+            return (-max(t.priority for t in tlist), -score, dist, layer, idx)
+        return (-max(t.priority for t in tlist), dist, -score, layer, idx)
 
     order = [meta[0] for meta in sorted(group_meta, key = group_order_key)]
 

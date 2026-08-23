@@ -234,6 +234,14 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        # P25: whole-chunk graph capture/replay for eligible chunks (needs P24 dev-args)
+        import os as _pg_os
+        if _pg_os.environ.get("EXL3_PREFILL_GRAPHS") == "1" \
+                and _pg_os.environ.get("EXL3_PREFILL_GRAPHS_HOOK", "1") != "0":
+            from .prefill_graphs import get_harness
+            if get_harness(self).try_chunk(x, params):
+                params.pop("prefill", None)
+                return None
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
