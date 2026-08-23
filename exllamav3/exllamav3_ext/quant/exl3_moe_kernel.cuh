@@ -1,5 +1,14 @@
 #pragma once
 
+#ifndef EXL3_RUNTIME_K_MIN
+#define EXL3_RUNTIME_K_MIN 1
+#endif
+#ifndef EXL3_RUNTIME_K_MAX
+#define EXL3_RUNTIME_K_MAX 8
+#endif
+
+
+
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <stdio.h>
@@ -14,8 +23,36 @@
 #include "exl3_devctx.cuh"
 #include "../ptx.cuh"
 
+// ptxas targets 2 blocks/SM for this 512-thread kernel unless pinned, halving the
+// register budget to 64 and spilling (~250 LDL/STL) in the runtime-K instance; SMEM_MAX caps
+// residency at 1 block/SM regardless, so the K=0 TUs define EXL3_MOE_MIN_BLOCKS=1 to reclaim
+// the full 128-register budget. Undefined = attribute expands byte-identical to the original.
+#if defined(EXL3_MOE_MIN_BLOCKS) && EXL3_MOE_MIN_BLOCKS > 0
+#define MOE_LAUNCH_BOUNDS __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16, EXL3_MOE_MIN_BLOCKS)
+#else
+#define MOE_LAUNCH_BOUNDS __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+#endif
+
+// each runtime-K arm as a separate __noinline__ ABI function so every arm
+// gets an independent register allocation instead of joining a multi-arm union in the kernel
+// body (the union spills 280-648B of stack even at REG 128). One materialization per
+// K per TU, shared by the gate/up and down call sites. K0 TUs define EXL3_MOE_NOINLINE_ARMS=1;
+// elsewhere the wrapper force-inlines (and is constexpr-dead in templated TUs regardless).
+#if defined(EXL3_MOE_NOINLINE_ARMS) && EXL3_MOE_NOINLINE_ARMS > 0
+#define MOE_ARM_DECL __device__ __noinline__
+#else
+#define MOE_ARM_DECL __device__ __forceinline__
+#endif
+
+template <int K_arm, int MOE_TILESIZE_N, int cb, typename... Ts>
+MOE_ARM_DECL void exl3_moe_gemm_arm(Ts... args)
+{
+    exl3_gemm_kernel_inner<K_arm, false, cb, MOE_TILESIZE_M, MOE_TILESIZE_K, MOE_TILESIZE_N,
+                           MOE_SH_STAGES, MOE_FRAG_STAGES, false>(args...);
+}
+
 template<int t_bits, int MOE_TILESIZE_N, int cb>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+__global__ MOE_LAUNCH_BOUNDS
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
     const int group_idx = blockIdx.z;
@@ -138,14 +175,31 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+#if EXL3_RUNTIME_K_MIN <= 1 && EXL3_RUNTIME_K_MAX >= 1
+                    case 1: exl3_moe_gemm_arm<1, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 2 && EXL3_RUNTIME_K_MAX >= 2
+                    case 2: exl3_moe_gemm_arm<2, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 3 && EXL3_RUNTIME_K_MAX >= 3
+                    case 3: exl3_moe_gemm_arm<3, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 4 && EXL3_RUNTIME_K_MAX >= 4
+                    case 4: exl3_moe_gemm_arm<4, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 5
+                    case 5: exl3_moe_gemm_arm<5, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 6
+                    case 6: exl3_moe_gemm_arm<6, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 7
+                    case 7: exl3_moe_gemm_arm<7, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 8
+                    case 8: exl3_moe_gemm_arm<8, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+                    default: __trap();
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
@@ -157,8 +211,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate[expert_idx]);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up[expert_idx]);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for g, u + activation+gate + input hadamard for d
@@ -212,14 +266,31 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+#if EXL3_RUNTIME_K_MIN <= 1 && EXL3_RUNTIME_K_MAX >= 1
+                    case 1: exl3_moe_gemm_arm<1, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 2 && EXL3_RUNTIME_K_MAX >= 2
+                    case 2: exl3_moe_gemm_arm<2, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 3 && EXL3_RUNTIME_K_MAX >= 3
+                    case 3: exl3_moe_gemm_arm<3, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 4 && EXL3_RUNTIME_K_MAX >= 4
+                    case 4: exl3_moe_gemm_arm<4, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 5
+                    case 5: exl3_moe_gemm_arm<5, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 6
+                    case 6: exl3_moe_gemm_arm<6, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 7
+                    case 7: exl3_moe_gemm_arm<7, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+#if EXL3_RUNTIME_K_MAX >= 8
+                    case 8: exl3_moe_gemm_arm<8, MOE_TILESIZE_N, cb>(ARGS); break;
+#endif
+                    default: __trap();
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
@@ -230,7 +301,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             }
         };
 
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down[expert_idx]);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for d + scatter add

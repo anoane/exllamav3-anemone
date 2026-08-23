@@ -11,6 +11,7 @@ namespace cg = cooperative_groups;
 #include <map>
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
+#include "comp_units/exl3_comp_unit_0.cuh"
 #include "comp_units/exl3_comp_unit_1.cuh"
 #include "comp_units/exl3_comp_unit_2.cuh"
 #include "comp_units/exl3_comp_unit_3.cuh"
@@ -90,7 +91,8 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     return (size_k % tilesize_k == 0) && (size_n % tilesize_n == 0);
 }
 
-// Instance tables, [K][cb] -> array indexed by shape_idx. Row 0 unused (no K = 0 instances)
+// Instance tables, [K][cb] -> array indexed by shape_idx. Row 0: gemm has no K = 0 instances;
+// mgemm row 0 holds the runtime-K instances (), which read the per-matrix K_list arg
 
 #define EXL3_KERNEL_TABLE_ROW(fp, K) \
     { tfp_exl3_gemm_kernel_##fp##_b##K##_cb0, tfp_exl3_gemm_kernel_##fp##_b##K##_cb1, tfp_exl3_gemm_kernel_##fp##_b##K##_cb2 }
@@ -115,7 +117,7 @@ static fp_exl3_gemm_kernel* const tab_gemm_fp16[9][3] =
 
 static fp_exl3_mgemm_kernel* const tab_mgemm_fp32[9][3] =
 {
-    { nullptr, nullptr, nullptr },
+    EXL3_MKERNEL_TABLE_ROW(fp32, 0),
     EXL3_MKERNEL_TABLE_ROW(fp32, 1), EXL3_MKERNEL_TABLE_ROW(fp32, 2), EXL3_MKERNEL_TABLE_ROW(fp32, 3),
     EXL3_MKERNEL_TABLE_ROW(fp32, 4), EXL3_MKERNEL_TABLE_ROW(fp32, 5), EXL3_MKERNEL_TABLE_ROW(fp32, 6),
     EXL3_MKERNEL_TABLE_ROW(fp32, 7), EXL3_MKERNEL_TABLE_ROW(fp32, 8)
@@ -123,7 +125,7 @@ static fp_exl3_mgemm_kernel* const tab_mgemm_fp32[9][3] =
 
 static fp_exl3_mgemm_kernel* const tab_mgemm_fp16[9][3] =
 {
-    { nullptr, nullptr, nullptr },
+    EXL3_MKERNEL_TABLE_ROW(fp16, 0),
     EXL3_MKERNEL_TABLE_ROW(fp16, 1), EXL3_MKERNEL_TABLE_ROW(fp16, 2), EXL3_MKERNEL_TABLE_ROW(fp16, 3),
     EXL3_MKERNEL_TABLE_ROW(fp16, 4), EXL3_MKERNEL_TABLE_ROW(fp16, 5), EXL3_MKERNEL_TABLE_ROW(fp16, 6),
     EXL3_MKERNEL_TABLE_ROW(fp16, 7), EXL3_MKERNEL_TABLE_ROW(fp16, 8)
@@ -194,7 +196,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
         *num_sms = MIN(max_slices, *num_sms);
     }
 
-    TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
+    TORCH_CHECK(K >= 0 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
     return (c_fp32 ? tab_mgemm_fp32 : tab_mgemm_fp16)[K][cb][shape_idx];
 }
 
@@ -208,6 +210,6 @@ fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int c
 
 fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb)
 {
-    TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
+    TORCH_CHECK(K >= 0 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
     return (c_fp32 ? tab_mgemm_fp32 : tab_mgemm_fp16)[K][cb][shape_idx];
 }

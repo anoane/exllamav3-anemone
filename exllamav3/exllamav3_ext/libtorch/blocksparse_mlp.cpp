@@ -112,7 +112,46 @@ void BC_BlockSparseMLP::run_bszN_gr
     at::Tensor sel_idx = selected_experts.reshape({1, -1});
     at::Tensor w_idx    = routing_weights.reshape({1, -1});
 
-    if (gated)
+    at::Tensor gi = interm_g_n;
+    at::Tensor ui = interm_u_n;
+    if (use_gu)
+    {
+        // one cooperative launch for gate+up over the interleaved gu_* tables;
+        // gate results land in slots [0, bszm), up in [bszm, 2*bszm) of the combined buffer.
+        // interm_gu is sized 2*bszn_rows and yh2 2*bszn_rows (python side) for exactly this.
+        int bszm2 = bszm * 2;
+        at::Tensor gu_out = interm_gu.slice(0, 0, bszm2).view({bszm2, 1, interm_g.size(2)});
+        at::Tensor gu_had = yh2.slice(0, 0, bszm2);
+        exl3_mgemm_gr
+        (
+            yi,
+            gu_trellis_ptr.view({-1}),   // [E,2] interleaved table -> flat [2E]
+            gu_out,
+            gu_suh_ptr.view({-1}),
+            gu_had,
+            gu_svh_ptr.view({-1}),
+            sel_idx,
+            {},
+            gate_K,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            -1,
+            -1,
+            0,
+            graph,
+            num_tokens,
+            {},
+            {},
+            gu_K_list,
+            1
+        );
+        gi = gu_out.slice(0, 0, bszm);
+        ui = gu_out.slice(0, bszm, bszm2);
+        if (gate_bias_ptrs)
+            moe_bias_add_gr(gi, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+    }
+    else if (gated)
     {
         exl3_mgemm_gr
         (
@@ -132,47 +171,56 @@ void BC_BlockSparseMLP::run_bszN_gr
             max_expert,
             0,
             graph,
-            num_tokens
+            num_tokens,
+            {},
+            {},
+            gate_K_list
         );
         if (gate_bias_ptrs)
             moe_bias_add_gr(interm_g_n, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
     }
 
-    exl3_mgemm_gr
-    (
-        yi,
-        up_ptrs_trellis,
-        interm_u_n,
-        up_ptrs_suh,
-        yh_n,
-        up_ptrs_svh,
-        sel_idx,
-        {},
-        up_K,
-        -1,
-        up_mcg,
-        up_mul1,
-        min_expert,
-        max_expert,
-        0,
-        graph,
-        num_tokens
-    );
+    if (!use_gu)
+    {
+        exl3_mgemm_gr
+        (
+            yi,
+            up_ptrs_trellis,
+            interm_u_n,
+            up_ptrs_suh,
+            yh_n,
+            up_ptrs_svh,
+            sel_idx,
+            {},
+            up_K,
+            -1,
+            up_mcg,
+            up_mul1,
+            min_expert,
+            max_expert,
+            0,
+            graph,
+            num_tokens,
+            {},
+            {},
+            up_K_list
+        );
+    }
 
     if (up_bias_ptrs)
-        moe_bias_add_gr(interm_u_n, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+        moe_bias_add_gr(ui, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
 
     if (!gated)
         // relu(u) * u = relu^2(u), the non-gated activation
-        relu_mul_gr(interm_u_n, interm_u_n, interm_a_n, act_limit, graph);
+        relu_mul_gr(ui, ui, interm_a_n, act_limit, graph);
     else if (act_silu)
-        silu_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
+        silu_mul_gr(gi, ui, interm_a_n, act_limit, graph);
     else if (act_gelu)
-        gelu_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
+        gelu_mul_gr(gi, ui, interm_a_n, act_limit, graph);
     else if (act_silu_oai)
-        silu_oai_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
+        silu_oai_mul_gr(gi, ui, interm_a_n, act_limit, graph);
     else if (act_relu2)
-        relu2_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
+        relu2_mul_gr(gi, ui, interm_a_n, act_limit, graph);
 
     // A_had must not alias A: the kernel stages the rotated input in A_had, and the autotuner
     // relaunches the (otherwise idempotent) kernel on the first call. interm_g_n is free here
@@ -194,7 +242,10 @@ void BC_BlockSparseMLP::run_bszN_gr
         max_expert,
         0,
         graph,
-        num_tokens
+        num_tokens,
+        {},
+        {},
+        down_K_list
     );
     if (down_bias_ptrs)
         moe_bias_add_weighted_gr(out_d_n, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
@@ -306,7 +357,7 @@ void BC_BlockSparseMLP::run_bszN
         if (num_tokens == 1 && y_pad)
             args.push_back(PPTR(GP_copy2d_src, (void*) y.data_ptr()));
 
-        if (gated)
+        if (gated && !use_gu)
         {
             args.push_back(PPTR(GP_mgemm_A,            yptr));
             args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
@@ -319,9 +370,17 @@ void BC_BlockSparseMLP::run_bszN
             }
         }
 
+        // with use_gu this group is the single merged gate+up mgemm (captured first),
+        // otherwise it is the up mgemm as before
         args.push_back(PPTR(GP_mgemm_A,            yptr));
         args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
         args.push_back(PPTR(GP_end,                nullptr));
+
+        if (use_gu && gate_bias_ptrs)
+        {
+            args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+        }
 
         if (up_bias_ptrs)
         {
@@ -507,7 +566,65 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
 
     TORCH_CHECK(max_expert <= MAX_EXPERTS, "BC_BlockSparseMLP: Too many experts");
 
-    use_mgemm = gate_K == up_K;
+    // derive per-expert K tables from the per-linear BC objects. A projection whose
+    // experts share one K keeps the templated mgemm path; a mixed projection gets an int32 device
+    // K_list and dispatches through the runtime-K (row 0) instances. The K scalars are normalized
+    // to expert 0's K (callers may pass 0 for a mixed projection)
+    k_mixed = false;
+    auto build_k_list = [&](const std::vector<std::shared_ptr<BC_LinearEXL3>>& lins,
+                            int& k_scalar, c10::optional<at::Tensor>& k_list)
+    {
+        if (lins.empty()) return;
+        k_scalar = lins[0]->K;
+        std::vector<int> ks(lins.size());
+        bool mixed = false;
+        for (size_t i = 0; i < lins.size(); ++i)
+        {
+            ks[i] = lins[i]->K;
+            if (ks[i] != k_scalar) mixed = true;
+        }
+        if (mixed)
+        {
+            k_list = at::from_blob(ks.data(), {(int64_t) ks.size()},
+                at::TensorOptions().dtype(at::kInt)).clone().to(up_ptrs_trellis.device());
+            k_mixed = true;
+        }
+    };
+    build_k_list(gates, gate_K, gate_K_list);
+    build_k_list(ups, up_K, up_K_list);
+    build_k_list(downs, down_K, down_K_list);
+    if (!gated && !ups.empty()) gate_K = up_K;
+
+    use_mgemm = gate_K == up_K && !k_mixed;
+
+    // merged gate+up launch (see .h). Env-gated, default off. Per-expert-mixed
+    // gate/up pairs merge too: the interleaved gu_K_list rides the same mat_index the gu_dual
+    // mapping already computes; uniform pairs keep the templated row (no K_list).
+    static const bool gu_env = [](){ const char* e = getenv("EXL3_GU_MERGE"); return e && e[0] == '1'; }();
+    use_gu = gu_env && gated
+             && gate_mcg == up_mcg && gate_mul1 == up_mul1 && min_expert < 0;
+    if (use_gu)
+    {
+        bool uniform_pair = !k_mixed && gate_K == up_K;
+        if (!uniform_pair)
+        {
+            std::vector<int> ks(gates.size() * 2);
+            for (size_t i = 0; i < gates.size(); ++i)
+            {
+                ks[2 * i] = gates[i]->K;
+                ks[2 * i + 1] = ups[i]->K;
+            }
+            gu_K_list = at::from_blob(ks.data(), {(int64_t) ks.size()},
+                at::TensorOptions().dtype(at::kInt)).clone().to(up_ptrs_trellis.device());
+        }
+        static bool once = false;
+        if (!once)
+        {
+            once = true;
+            fprintf(stderr, " -- ANEMONE: merged gate+up mgemm enabled (%s, K=%d)\n",
+                    uniform_pair ? "uniform" : "per-expert K_list", gate_K);
+        }
+    }
 }
 
 void BC_BlockSparseMLP::run_single_expert_gr
@@ -601,6 +718,15 @@ void BC_BlockSparseMLP::run_single_expert
     c10::cuda::CUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    // mixed-K experts can't share the single-expert graphs — the gemm kernel
+    // instance is baked at capture from the captured expert's K (inferred from its trellis), and
+    // replay only patches pointers. Run eagerly instead.
+    if (k_mixed)
+    {
+        run_single_expert_gr(y, expert_idx, nullptr);
+        return;
+    }
+
     if (graph_single[graphidx].disabled || (!graph_single[graphidx].ready && !graph_single[graphidx].ready_to_record))
     {
         run_single_expert_gr(y, expert_idx, nullptr);
@@ -662,9 +788,9 @@ void BC_BlockSparseMLP::run_single_expert_dq
         had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
                        y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
 
-        reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
+        reconstruct(dq_temp_up, gates[expert_idx]->trellis, gates[expert_idx]->K, gate_mcg, gate_mul1);
         hgemm(yh1, dq_temp_up, interm1);
-        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        reconstruct(dq_temp_up, ups[expert_idx]->trellis, ups[expert_idx]->K, up_mcg, up_mul1);
         hgemm(yh2, dq_temp_up, interm2);
 
         had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
@@ -673,7 +799,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
     else
     {
         had_r_128(y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
-        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        reconstruct(dq_temp_up, ups[expert_idx]->trellis, ups[expert_idx]->K, up_mcg, up_mul1);
         hgemm(yh2, dq_temp_up, interm2);
         had_r_128(interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
     }
@@ -690,7 +816,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
         relu2_mul(interm1, interm2, interm_a, act_limit);
 
     had_r_128(interm_a, interm_a, downs[expert_idx]->suh, c10::nullopt, 1.0);
-    reconstruct(dq_temp_down, downs[expert_idx]->trellis, down_K, down_mcg, down_mul1);
+    reconstruct(dq_temp_down, downs[expert_idx]->trellis, downs[expert_idx]->K, down_mcg, down_mul1);
     hgemm(interm_a, dq_temp_down, out);
     had_r_128(out, out, c10::nullopt, downs[expert_idx]->svh, 1.0);
 }

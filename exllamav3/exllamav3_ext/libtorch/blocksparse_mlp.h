@@ -96,6 +96,23 @@ struct BC_BlockSparseMLP
 
     bool use_mgemm;
 
+    // merged gate+up mgemm (env EXL3_GU_MERGE=1) — one cooperative launch per layer
+    // over the interleaved gu_* tables; requires gated, per-projection-uniform equal K, same
+    // codebook, unsharded experts
+    bool use_gu;
+    // GU-mixed: interleaved [Kg0,Ku0,Kg1,Ku1,..] int32 device table for merged launches
+    // over per-expert-mixed projections (empty when the gate/up pair is uniform -> templated row)
+    c10::optional<at::Tensor> gu_K_list;
+
+    // derived in the ctor from the per-linear BC objects (each BC_LinearEXL3 carries
+    // its own K). k_mixed = any per-expert K variation in any projection. A mixed projection gets
+    // an int32 device K_list and its mgemms dispatch through the runtime-K instances; uniform
+    // projections keep the templated fast path (K_list stays empty)
+    bool k_mixed;
+    c10::optional<at::Tensor> gate_K_list;
+    c10::optional<at::Tensor> up_K_list;
+    c10::optional<at::Tensor> down_K_list;
+
     // graph_bszN[bsz - 1] covers bsz 1..MAX_BSZN (bsz==1 keeps the original zero-copy behavior
     // internally; replaces the old single-instance graph_bsz1)
     Graph graph_bszN[MAX_BSZN];

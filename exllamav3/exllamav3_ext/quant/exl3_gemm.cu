@@ -400,11 +400,19 @@ int exl3_mgemm_gr
     Graph* graph,
     int num_tokens,
     const c10::optional<at::Tensor>& size_n_list,
-    const c10::optional<at::Tensor>& c_ptrs
+    const c10::optional<at::Tensor>& c_ptrs,
+    const c10::optional<at::Tensor>& K_list,
+    int gu_dual
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    // merged gate+up launch over the interleaved [g0,u0,g1,u1,..] table; slots double
+    // (gate half then up half), incompatible with expert-range filtering / weighted reduction /
+    // per-matrix widths (none of which the gate/up projections use)
+    TORCH_CHECK(!gu_dual || (min_index < 0 && !weights && !size_n_list),
+                "exl3_mgemm: gu_dual incompatible with expert-range/weights/per-matrix-N");
 
     TORCH_CHECK(num_tokens == 1 || min_index < 0,
         "exl3_mgemm: multi-token reduction (num_tokens > 1) is not compatible with expert-range "
@@ -459,9 +467,10 @@ int exl3_mgemm_gr
     {
         TORCH_CHECK_DIM(indices.value(), 2);
         int num_indices = indices.value().size(1);
-        TORCH_CHECK(num_indices <= bszm_in || num_indices <= bszm_out, "mgemm: too many indices for tensor batch");
-        if (bszm_in > num_indices) bszm_in = num_indices;
-        if (bszm_out > num_indices) bszm_out = num_indices;
+        int eff_indices = gu_dual ? 2 * num_indices : num_indices;   // 2 slots/index
+        TORCH_CHECK(eff_indices <= bszm_in || eff_indices <= bszm_out, "mgemm: too many indices for tensor batch");
+        if (bszm_in > eff_indices) bszm_in = eff_indices;
+        if (bszm_out > eff_indices) bszm_out = eff_indices;
     }
 
     if (weights)
@@ -488,6 +497,23 @@ int exl3_mgemm_gr
     const half* A_had_ptr = (const half*) A_had.data_ptr();
     const uintptr_t* suh_ptr_ptr = (const uintptr_t*) suh.data_ptr();
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
+
+    // per-matrix K -> the runtime-dispatch (table row 0) instances; K_list[i] is the
+    // K of B_list[i]. The scalar K argument is overridden to 0 so hash/select/get all route to
+    // row 0; shape heuristics then see K = 0 (small-K choices), which is fine for K in {2,3}
+    const int* K_list_ptr = nullptr;
+    if (K_list)
+    {
+        TORCH_CHECK_DTYPE(K_list.value(), kInt);
+        TORCH_CHECK_DIM(K_list.value(), 1);
+        TORCH_CHECK_SHAPES(B, 0, K_list.value(), 0, 1);
+        TORCH_CHECK(K_list.value().is_cuda(), "exl3_mgemm: K_list must be a CUDA tensor");
+        K_list_ptr = (const int*) K_list.value().data_ptr();
+        K = 0;
+    }
+    // Row-0 kernels without a K table would silently skip every GEMM (K_j = 0 matches no switch
+    // case) while still running the hadamard stages — keep the pre-P3b fail-fast contract
+    TORCH_CHECK(K > 0 || K_list_ptr, "exl3_mgemm: K == 0 requires K_list");
 
     // Select kernel
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
@@ -520,7 +546,9 @@ int exl3_mgemm_gr
         (void*)& max_index,
         (void*)& num_tokens,
         (void*)& size_n_list_ptr,
-        (void*)& c_list_ptr
+        (void*)& c_list_ptr,
+        (void*)& K_list_ptr,
+        (void*)& gu_dual
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -670,6 +698,57 @@ int exl3_mgemm
         nullptr,
         num_tokens,
         size_n_list,
-        c_ptrs
+        c_ptrs,
+        {}
+    );
+}
+
+// per-matrix-K variant. Identical to exl3_mgemm plus a trailing int32 CUDA tensor
+// K_list (one K per B_list entry); dispatches to the runtime-K instances (kernel table row 0)
+int exl3_mgemm_pk
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    const c10::optional<at::Tensor>& indices,
+    const c10::optional<at::Tensor>& weights,
+    int K,
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult,
+    int min_index,
+    int max_index,
+    int force_num_sms,
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs,
+    const c10::optional<at::Tensor>& K_list
+)
+{
+    return exl3_mgemm_gr
+    (
+        A,
+        B,
+        C,
+        suh,
+        A_had,
+        svh,
+        indices,
+        weights,
+        K,
+        force_shape_idx,
+        mcg_mult,
+        mul1_mult,
+        min_index,
+        max_index,
+        force_num_sms,
+        nullptr,
+        num_tokens,
+        size_n_list,
+        c_ptrs,
+        K_list
     );
 }

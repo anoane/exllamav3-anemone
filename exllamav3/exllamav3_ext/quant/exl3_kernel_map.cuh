@@ -45,7 +45,9 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const int max_index, \
     const int num_tokens, \
     const int* __restrict__ size_n_list, \
-    void** __restrict__ C_list
+    void** __restrict__ C_list, \
+    const int* __restrict__ K_list, \
+    const int gu_dual
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
@@ -105,6 +107,34 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
         EXL3_MGEMM_KERNEL_INSTANCES(K, true, cb) \
     }; \
     \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb##cb[] = { \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, false, cb) \
+    };
+
+// runtime-K (bits = 0) instances exist only for the mgemm kernel — one extern/instance
+// pair per (fp, cb), split across comp units by (cb, fp) because the runtime switch instantiates
+// every inner K variant and compiles slowly (same reason the K=0 moe TUs are split)
+
+#define EXL3_MGEMM_KERNEL_EXTERNS_CB_FP32(K, cb) \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb##cb[];
+
+#define EXL3_MGEMM_KERNEL_EXTERNS_CB_FP16(K, cb) \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb##cb[];
+
+#define ALL_EXL3_MGEMM_KERNEL_EXTERNS(K) \
+    EXL3_MGEMM_KERNEL_EXTERNS_CB_FP32(K, 0) \
+    EXL3_MGEMM_KERNEL_EXTERNS_CB_FP16(K, 0) \
+    EXL3_MGEMM_KERNEL_EXTERNS_CB_FP32(K, 1) \
+    EXL3_MGEMM_KERNEL_EXTERNS_CB_FP16(K, 1) \
+    EXL3_MGEMM_KERNEL_EXTERNS_CB_FP32(K, 2) \
+    EXL3_MGEMM_KERNEL_EXTERNS_CB_FP16(K, 2) \
+
+#define EXL3_MGEMM_KERNEL_INSTANCES_CB_FP32(K, cb) \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb##cb[] = { \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, true, cb) \
+    };
+
+#define EXL3_MGEMM_KERNEL_INSTANCES_CB_FP16(K, cb) \
     fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb##cb[] = { \
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, cb) \
     };

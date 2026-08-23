@@ -20,9 +20,9 @@ void exl3_moe
 
     const int act_function,
 
-    const int K_gate,
-    const int K_up,
-    const int K_down,
+    const at::Tensor& K_gate,
+    const at::Tensor& K_up,
+    const at::Tensor& K_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,
@@ -42,6 +42,7 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
-    const int num_active
+    const int num_active,
+    const int K_uniform
 );
 

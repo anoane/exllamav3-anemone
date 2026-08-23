@@ -52,7 +52,9 @@ int exl3_mgemm_gr
     Graph* graph,
     int num_tokens = 1,
     const c10::optional<at::Tensor>& size_n_list = {},
-    const c10::optional<at::Tensor>& c_ptrs = {}
+    const c10::optional<at::Tensor>& c_ptrs = {},
+    const c10::optional<at::Tensor>& K_list = {},
+    int gu_dual = 0
 );
 
 int exl3_mgemm
@@ -75,4 +77,28 @@ int exl3_mgemm
     int num_tokens = 1,
     const c10::optional<at::Tensor>& size_n_list = {},
     const c10::optional<at::Tensor>& c_ptrs = {}
+);
+
+// exl3_mgemm plus a trailing per-matrix int32 CUDA K_list (runtime-K dispatch)
+int exl3_mgemm_pk
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    const c10::optional<at::Tensor>& indices,
+    const c10::optional<at::Tensor>& weights,
+    int K,
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult,
+    int min_index,
+    int max_index,
+    int force_num_sms,
+    int num_tokens = 1,
+    const c10::optional<at::Tensor>& size_n_list = {},
+    const c10::optional<at::Tensor>& c_ptrs = {},
+    const c10::optional<at::Tensor>& K_list = {}
 );

@@ -10,6 +10,8 @@ namespace cg = cooperative_groups;
 #include "comp_units/exl3_moe_instances.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
+#include <cstdlib>
+#include <cstdio>
 
 int exl3_moe_max_concurrency(int device)
 {
@@ -111,9 +113,12 @@ void exl3_moe
 
     const int act_function,
 
-    const int K_gate,
-    const int K_up,
-    const int K_down,
+    // per-expert K tables, int32, shape (num_experts,). K_uniform (last arg) > 0
+    // selects the compile-time-K instance (all experts, all projections share that K); 0 selects
+    // the runtime-dispatch instance, which reads these tables per expert.
+    const at::Tensor& K_gate,
+    const at::Tensor& K_up,
+    const at::Tensor& K_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,
@@ -133,7 +138,8 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
-    const int num_active
+    const int num_active,
+    const int K_uniform
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -186,8 +192,28 @@ void exl3_moe
 
     // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
+    // K_uniform > 0 = caller guarantees every expert of every projection uses that
+    // K -> compile-time instance. K_uniform == 0 = runtime instance, per-expert K from the tables.
+    // EXL3_FORCE_K0=1 forces the runtime-dispatch path even for uniform K (validation).
     int K = 0;
-    if (K_gate == K_up && K_up == K_down) K = K_gate;
+    TORCH_CHECK(K_uniform >= 0 && K_uniform <= 8, "MoE kernel: K_uniform out of range");
+    static const bool force_k0 = [](){ const char* e = getenv("EXL3_FORCE_K0"); return e && e[0] == '1'; }();
+    if (force_k0)
+    {
+        static bool once = false;
+        if (!once)
+        {
+            once = true;
+            fprintf(stderr, " -- ANEMONE: exl3_moe K=0 dispatch forced (K_uniform=%d)\n", K_uniform);
+        }
+    }
+    if (!force_k0) K = K_uniform;
+
+    TORCH_CHECK_DTYPE(K_gate, kInt);
+    TORCH_CHECK_DTYPE(K_up, kInt);
+    TORCH_CHECK_DTYPE(K_down, kInt);
+    TORCH_CHECK(K_gate.is_cuda() && K_up.is_cuda() && K_down.is_cuda(),
+                "MoE kernel: K tables must be CUDA tensors");
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -199,6 +225,9 @@ void exl3_moe
     TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_trellis);
     TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_suh);
     TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_svh);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, K_gate);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, K_up);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, K_down);
 
     // Device properties
     int device;
@@ -253,6 +282,10 @@ void exl3_moe
     void* _token_sorted = token_sorted.data_ptr();
     void* _weight_sorted = weight_sorted.data_ptr();
 
+    void* _K_gate = K_gate.data_ptr();
+    void* _K_up = K_up.data_ptr();
+    void* _K_down = K_down.data_ptr();
+
     void* kernelArgs[] =
     {
         &_hidden_state,
@@ -281,9 +314,9 @@ void exl3_moe
         (void*) &num_groups,
         (void*) &act_limit,
         (void*) &act_function,
-        (void*) &K_gate,
-        (void*) &K_up,
-        (void*) &K_down,
+        &_K_gate,
+        &_K_up,
+        &_K_down,
         (void*) &locks
     };
 

@@ -1,6 +1,13 @@
 #pragma once
 
 #include "exl3_kernel_map.cuh"
+
+#ifndef EXL3_RUNTIME_K_MIN
+#define EXL3_RUNTIME_K_MIN 1
+#endif
+#ifndef EXL3_RUNTIME_K_MAX
+#define EXL3_RUNTIME_K_MAX 8
+#endif
 #include "hadamard_inner.cuh"
 #include "exl3_gemm_inner.cuh"
 #include "exl3_devctx.cuh"
@@ -130,13 +137,25 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     {
         int j = i + blockIdx.z;
         int mat_index = -1;
+        int a_slot = j;      // input slab index (dual mode folds the two halves)
         const uint16_t* B = nullptr;
         if (j >= bszm) j = -1;
         else
         {
-            mat_index = B_indices ? (int) B_indices[j] : j;
+            // gu_dual maps slot j onto the interleaved gate/up table [g0,u0,g1,u1..]:
+            // slots [0, bszm/2) = gate of B_indices[j], slots [bszm/2, bszm) = up of the same
+            // expert — one cooperative launch covers both projections (same A row per pair)
+            int jj = j, gu_off = 0;
+            if (gu_dual)
+            {
+                int half = bszm >> 1;
+                if (j >= half) { jj = j - half; gu_off = 1; }
+                a_slot = jj;
+            }
+            mat_index = B_indices ? (int) B_indices[jj] : jj;
             if (mat_index >= 0)
             {
+                if (gu_dual) mat_index = 2 * mat_index + gu_off;
                 B = B_list[mat_index];
             }
         }
@@ -150,7 +169,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
             const half* suh = suh_list[mat_index];
-            const half* A_ = bszm_in == 1 ? A : A + j * size_m * size_k;
+            const half* A_ = bszm_in == 1 ? A : A + a_slot * size_m * size_k;
             half* A_had_ = A_had + j * size_m * size_k;
 
             for(; this_warp < total_warps; this_warp += warps_grid)
@@ -182,15 +201,53 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         else                       C_ = (void*) (((half*) C) + j * size_m * size_n);
         void* C_base = C_;
 
+        // bits == 0 instances dispatch on the per-matrix K at runtime (same pattern
+        // as exl3_moe_kernel's gemm lambdas); the host guarantees K_list is non-null for them
+        [[maybe_unused]] int K_j = 0;
+        if constexpr (!bits)
+            if (B && K_list) K_j = K_list[mat_index];
+
         while (size_m_ > 0)
         {
             if (B)
             {
                 int lock_offs = blockIdx.z * size_n / 128;
 
-                exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr);
+                #define MGEMM_INNER_ARGS \
+                    (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr)
+                if constexpr (bits)
+                    exl3_gemm_kernel_inner
+                    <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                    MGEMM_INNER_ARGS;
+                else switch (K_j)
+                {
+#if EXL3_RUNTIME_K_MIN <= 1 && EXL3_RUNTIME_K_MAX >= 1
+                    case 1: exl3_gemm_kernel_inner<1, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 2 && EXL3_RUNTIME_K_MAX >= 2
+                    case 2: exl3_gemm_kernel_inner<2, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 3 && EXL3_RUNTIME_K_MAX >= 3
+                    case 3: exl3_gemm_kernel_inner<3, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 4 && EXL3_RUNTIME_K_MAX >= 4
+                    case 4: exl3_gemm_kernel_inner<4, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 5 && EXL3_RUNTIME_K_MAX >= 5
+                    case 5: exl3_gemm_kernel_inner<5, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 6 && EXL3_RUNTIME_K_MAX >= 6
+                    case 6: exl3_gemm_kernel_inner<6, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 7 && EXL3_RUNTIME_K_MAX >= 7
+                    case 7: exl3_gemm_kernel_inner<7, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+#if EXL3_RUNTIME_K_MIN <= 8 && EXL3_RUNTIME_K_MAX >= 8
+                    case 8: exl3_gemm_kernel_inner<8, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false> MGEMM_INNER_ARGS; break;
+#endif
+                    default: __trap();
+                }
+                #undef MGEMM_INNER_ARGS
             }
 
             A_ += 16 * size_k;

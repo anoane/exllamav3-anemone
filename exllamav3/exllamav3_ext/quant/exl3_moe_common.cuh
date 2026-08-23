@@ -52,8 +52,8 @@
     const int concurrency,                      \
     const float act_limit,                      \
     const int act_function,                     \
-    const int K_gate,                           \
-    const int K_up,                             \
-    const int K_down,                           \
+    const int* __restrict__ K_gate,             \
+    const int* __restrict__ K_up,               \
+    const int* __restrict__ K_down,             \
                                                 \
     int* __restrict__ locks
