@@ -179,6 +179,15 @@ class Model(Model_TPMixin, Model_LSMixin):
         raise NotImplementedError()
 
 
+    def per_layer_quant_preamble(self, params: dict):
+        """
+        Hook run once per layer during conversion, before that layer is quantized. Architectures
+        that must materialize something before their layer sees calibration input override this;
+        for everything else it is a no-op.
+        """
+        pass
+
+
     @torch.inference_mode
     def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
         """

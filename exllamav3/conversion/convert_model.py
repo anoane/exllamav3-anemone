@@ -842,7 +842,7 @@ def capture_module_parallel(
                     params["q_mlp_slice"] = current_slice
                 get_preserve(i, params)
                 model.per_layer_quant_preamble(params)
-                rs = module.prepare_for_device(state[i], params)
+                rs = load_state(module, state[i], params)
                 rs = module.forward(rs, params)
                 put_preserve(i, params)
                 if i < num_ref_states:
@@ -856,7 +856,7 @@ def capture_module_parallel(
                             params["q_mlp_slice"] = current_slice
                         get_preserve(i, params)
                         model.per_layer_quant_preamble(params)
-                        rs = module.prepare_for_device(state[i], params)
+                        rs = load_state(module, state[i], params)
                         rs = module.forward(rs, params)
                         put_preserve(i, params)
                     if torch.isfinite(rs).all().item():
@@ -1268,7 +1268,7 @@ def main(args, job_state):
                                      params["q_mlp_slice"] = current_slice
                                 get_preserve(i, params)
                                 model.per_layer_quant_preamble(params)
-                                rs = module.prepare_for_device(state[i], params)
+                                rs = load_state(module, state[i], params)
                                 rs = module.forward(rs, params)
                                 put_preserve(i, params)
                                 if i < num_ref_states:
@@ -1282,7 +1282,7 @@ def main(args, job_state):
                                             params["q_mlp_slice"] = current_slice
                                         get_preserve(i, params)
                                         model.per_layer_quant_preamble(params)
-                                        rs = module.prepare_for_device(state[i], params)
+                                        rs = load_state(module, state[i], params)
                                         rs = module.forward(rs, params)
                                         put_preserve(i, params)
                                     if torch.isfinite(rs).all().item():
