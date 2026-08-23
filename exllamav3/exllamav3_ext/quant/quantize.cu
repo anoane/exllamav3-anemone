@@ -67,6 +67,11 @@ void quantize_tiles
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+    // snap-aware search, EXL3_SNAP_E2M1=1 at convert time
+    static const int snap_e2m1 = [](){ const char* e = getenv("EXL3_SNAP_E2M1");
+        int v = (e && e[0] == '1') ? 1 : 0;
+        if (v) fprintf(stderr, " -- ANEMONE: snap-aware e2m1 trellis search ENABLED (K<=4 scope)\n");
+        return v; }();
     auto kernel = quantize_tiles_kernel_instances[K - 1 + 8 * cb];
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
@@ -80,7 +85,8 @@ void quantize_tiles
             ((float*) output_tiles.data_ptr()) + 256 * batch_i,
             ((uint16_t*) output_indices.data_ptr()) + 256 * batch_i,
             (half*) temp_costs.data_ptr(),
-            (uint16_t*) temp_edges.data_ptr()
+            (uint16_t*) temp_edges.data_ptr(),
+            snap_e2m1 && K <= 4   // snap only fp4-convertible K, never the K=6 head
         );
         cuda_check(cudaPeekAtLastError());
     }

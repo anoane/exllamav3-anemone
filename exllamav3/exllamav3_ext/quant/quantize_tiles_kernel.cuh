@@ -16,6 +16,29 @@
 #define H_INF __ushort_as_half(0x7c00)
 #endif
 
+
+// optional e2m1 grid snap inside the search and on the returned
+// reconstruction, so convert matches an FP4-prefill serving path that decodes + snaps.
+// Boundary semantics replicate cvt.rn.satfinite (ties-to-even on the e2m1 grid).
+__device__ __forceinline__ half snap_e2m1_h(half h)
+{
+    float a = fabsf(__half2float(h));
+    float m;
+    if      (a <= 0.25f) m = 0.0f;
+    else if (a <  0.75f) m = 0.5f;
+    else if (a <= 1.25f) m = 1.0f;
+    else if (a <  1.75f) m = 1.5f;
+    else if (a <= 2.5f)  m = 2.0f;
+    else if (a <  3.5f)  m = 3.0f;
+    else if (a <= 5.0f)  m = 4.0f;
+    else                 m = 6.0f;
+    return __float2half_rn(__half2float(h) < 0.0f ? -m : m);
+}
+__device__ __forceinline__ half2 snap_e2m1_h2(half2 v)
+{
+    return __halves2half2(snap_e2m1_h(__low2half(v)), snap_e2m1_h(__high2half(v)));
+}
+
 template <int K, int cb>
 __global__ __launch_bounds__(QUANTIZE_TILES_NUM_THREADS, 2)
 void quantize_tiles_kernel
@@ -24,7 +47,8 @@ void quantize_tiles_kernel
     float* __restrict__ output_tiles_ptr,
     uint16_t* __restrict__ output_indices_ptr,
     half* __restrict__ temp_costs_ptr,
-    uint16_t* __restrict__ temp_edges_ptr
+    uint16_t* __restrict__ temp_edges_ptr,
+    const int snap_e2m1
 )
 {
     extern __shared__ uint8_t shbuf[];
@@ -82,6 +106,7 @@ void quantize_tiles_kernel
             {
                 decoded2 = decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1);
             }
+            if (snap_e2m1) decoded2 = snap_e2m1_h2(decoded2);
             half2 dh2 = __hsub2(decoded2, w2);
             half2 min_err2 = __hmul2(dh2, dh2);
             if (pre_state >= 0 && in_edge_idx != pre_state) min_err2 = __half2half2(H_INF);
@@ -113,6 +138,7 @@ void quantize_tiles_kernel
                 {
                     decoded2 = decode_3inst_2<cb>(state0, state0 + 1);
                 }
+                if (snap_e2m1) decoded2 = snap_e2m1_h2(decoded2);
                 dh2 = __hsub2(decoded2, w2);
                 half2 err2 = __hmul2(dh2, dh2);
                 if (pre_state >= 0 && in_edge_idx != pre_state) err2 = __half2half2(H_INF);
@@ -164,6 +190,7 @@ void quantize_tiles_kernel
                 {
                     decoded2 = decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1);
                 }
+                if (snap_e2m1) decoded2 = snap_e2m1_h2(decoded2);
                 half2 dh2 = __hsub2(decoded2, w2);
                 half2 min_err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
                 int min_in_edge0 = in_edge_idx;
@@ -194,6 +221,7 @@ void quantize_tiles_kernel
                     {
                         decoded2 = decode_3inst_2<cb>(state0, state0 + 1);
                     }
+                    if (snap_e2m1) decoded2 = snap_e2m1_h2(decoded2);
                     dh2 = __hsub2(decoded2, w2);
                     half2 err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
                     if (__hlt(__low2half(err2), __low2half(min_err2)))
@@ -281,7 +309,7 @@ void quantize_tiles_kernel
                 if (write)
                 {
                     output_indices[ri] = (uint16_t) encoded;
-                    output_tile[ri] = __half2float(decode_3inst<cb>(encoded));
+                    { half p10_dec = decode_3inst<cb>(encoded); if (snap_e2m1) p10_dec = snap_e2m1_h(p10_dec); output_tile[ri] = __half2float(p10_dec); }
                 }
                 else if (ri == 0) break;
             }

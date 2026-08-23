@@ -3,7 +3,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-typedef void (*fp_quantize_tiles_kernel)(const float*, float*, uint16_t*, half*, uint16_t*);
+typedef void (*fp_quantize_tiles_kernel)(const float*, float*, uint16_t*, half*, uint16_t*, const int);
 
 fp_quantize_tiles_kernel quantize_tiles_kernel_k1_cb0();
 fp_quantize_tiles_kernel quantize_tiles_kernel_k1_cb1();
