@@ -225,7 +225,7 @@ class SafetensorsCollection:
         warn_if_override: bool = True
     ):
         st_pattern = os.path.join(directory, "*.safetensors")
-        new_tensor_files = glob.glob(st_pattern)
+        new_tensor_files = sorted(glob.glob(st_pattern))
         self.tensor_files += new_tensor_files
 
         overrides = 0
