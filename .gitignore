@@ -9,3 +9,8 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+# patch backups and stray build artifacts
+*.orig
+*.orig_*
+*.new
+*.so.bak
