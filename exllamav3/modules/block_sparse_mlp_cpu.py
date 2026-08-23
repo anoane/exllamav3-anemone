@@ -281,6 +281,14 @@ class BlockSparseMLP_CPU:
             if hdr_shape(l)[-1] // 16 > 8:
                 print(f" !! {self.key}: K > 8, CPU offload skipped")
                 return False
+        # per-expert K layers can't be offloaded -- the CPU worker derives a single
+        # layout per projection from expert 0 (staging byte offsets, reconstruct K), so mixed
+        # per-expert K would silently corrupt. Decline like the other eligibility probes.
+        for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]:
+            k0 = hdr_shape(ls[0])[-1]
+            if any(hdr_shape(l)[-1] != k0 for l in ls[1:]):
+                print(f" !! {self.key}: per-expert K, CPU offload skipped")
+                return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls]
             if any(has) and not all(has):
@@ -398,6 +406,14 @@ class BlockSparseMLP_CPU:
         for l in probe:
             if hdr_shape(l)[-1] // 16 > 8:
                 print(f" !! {self.key}: K > 8, CPU split skipped")
+                return False
+        # per-expert K layers can't be split -- the CPU worker derives a single
+        # layout per projection from expert 0 (staging byte offsets, reconstruct K), so mixed
+        # per-expert K would silently corrupt. Decline like the other eligibility probes.
+        for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]:
+            k0 = hdr_shape(ls[0])[-1]
+            if any(hdr_shape(l)[-1] != k0 for l in ls[1:]):
+                print(f" !! {self.key}: per-expert K, CPU split skipped")
                 return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]

@@ -1135,14 +1135,21 @@ class MoeCpuHost:
                 wts = torch.cat([wseg for _, _, _, wseg in per_e]).half()
                 Ku, Kd = pd["u"][2], pd["d"][2]
                 Kg = pd["g"][2] if gated else Ku
+                # exl3_moe takes per-expert K tables + a uniform-K fast-path scalar.
+                # This layout is per-projection uniform, so the tables are constant-filled
+                n_b = len(per_e)
+                kg_t = torch.full((n_b,), Kg, dtype = torch.int32, device = y.device)
+                ku_t = torch.full((n_b,), Ku, dtype = torch.int32, device = y.device)
+                kd_t = torch.full((n_b,), Kd, dtype = torch.int32, device = y.device)
+                k_uniform = Kg if Kg == Ku == Kd else 0
                 ext.exl3_moe(
                     y, out, ec, tok, wts,
                     fbufs[0], fbufs[1], fbufs[2], fbufs[3],
-                    spec["activation"], Kg, Ku, Kd,
+                    spec["activation"], kg_t, ku_t, kd_t,
                     tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                     tblt[6], tblt[7], tblt[8],
                     False, True, False, True, False, True,
-                    float(spec["act_limit"] or 0.0), n_fused)
+                    float(spec["act_limit"] or 0.0), n_fused, k_uniform)
 
             # Heavy tier: per-expert reconstruct
             for bi, e, idx, wseg in per_e:

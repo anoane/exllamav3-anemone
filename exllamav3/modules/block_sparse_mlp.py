@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -17,8 +18,49 @@ from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 
 TEMP_ROWS_FUSED = 128
+
+# FP4 prefill moe path (second extension, sm_120a), env-gated, lazy-loaded
+import os as _fp4_os
+BSM_FP4_PREFILL = _fp4_os.environ.get("EXL3_FP4_PREFILL") == "1"
+_fp4_hook = [None]
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+
+# EXL3_FORCE_K0=1 routes the expert mgemms through the runtime-K (K_list) path even
+# for uniform-K packs — validation of the row-0 kernels on existing packs; matches the same env's
+# effect on the fused exl3_moe dispatch (read in exl3_moe.cu)
+_FORCE_K0 = os.environ.get("EXL3_FORCE_K0", "0") == "1"
+
+
+def _mgemm_experts(multi, A, C, A_had, indices, weights, min_e, max_e):
+    # one chokepoint for the six expert mgemm call sites. Uniform-K MultiLinears
+    # keep the templated fast path; mixed-K (multi.K is None) or forced-K0 go through
+    # exl3_mgemm_pk with the per-expert K table
+    if multi.K is None or _FORCE_K0:
+        return ext.exl3_mgemm_pk(
+            A, multi.ptrs_trellis, C, multi.ptrs_suh, A_had, multi.ptrs_svh,
+            indices, weights, multi.K or 0, -1, multi.mcg, multi.mul1,
+            min_e, max_e, 0, 1, None, None, multi.ptrs_K)
+    return ext.exl3_mgemm(
+        A, multi.ptrs_trellis, C, multi.ptrs_suh, A_had, multi.ptrs_svh,
+        indices, weights, multi.K, -1, multi.mcg, multi.mul1,
+        min_e, max_e, 0, 1, None, None)
+
+
+def _expert_qgroup(key, idx, proj):
+    # /P3b conversion-side quant-group modes (EXL3_QGROUP):
+    #   unset          -> ".block_gud"          one group per layer (upstream behavior)
+    #   "split"        -> ".block_<proj>"       per-projection groups (allocator can emit Kg != Ku != Kd)
+    #   "expert"       -> ".block_gud.<idx>"    per-expert groups (projections tied within an expert)
+    #   "expert_split" -> ".block_<proj>.<idx>" fully per-tensor groups
+    mode = os.environ.get("EXL3_QGROUP")
+    if mode == "split":
+        return f"{key}.block_{proj}"
+    if mode == "expert":
+        return f"{key}.block_gud.{idx}"
+    if mode == "expert_split":
+        return f"{key}.block_{proj}.{idx}"
+    return f"{key}.block_gud"
 
 # Score activations for the nogroup routing kernels (must match routing.cu)
 ROUTING_ACT_SIGMOID = 0
@@ -493,7 +535,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
                     frange_dim = frange_dim,
-                    qgroup = key + ".block_gud",
+                    qgroup = _expert_qgroup(key, idx, "g"),
                     qbits_key = qbits_key,
                 )
                 up = Linear(
@@ -511,7 +553,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
                     frange_dim = frange_dim,
-                    qgroup = key + ".block_gud",
+                    qgroup = _expert_qgroup(key, idx, "u"),
                     qbits_key = qbits_key,
                     weight_scale = 1.0 / interm_div,
                 )
@@ -531,7 +573,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     # The input dim pads to match the gate/up padded output width; padded output
                     # columns (zeros, or quantization noise over zero weights) are trimmed
                     trim_padded_out = True,
-                    qgroup = key + ".block_gud",
+                    qgroup = _expert_qgroup(key, idx, "d"),
                     qbits_key = qbits_key,
                 )
 
@@ -681,9 +723,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
         if (self.support_quant_paths or self.support_bc_bsz1) and not self.config.infer_params.no_reconstruct:
-            self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
-            self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
-            self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
+            self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True, allow_mixed_K = True) if self.gated else None
+            self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True, allow_mixed_K = True)
+            self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True, allow_mixed_K = True)
 
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
@@ -714,7 +756,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # second entry under the same name would silently double memory forever)
         bszn_rows = MAX_BSZN * numex
 
-        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+        # 2 * bszn_rows: the merged gate+up mgemm stages hadamard slabs for both
+        # projections' slots in one launch
+        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
         temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
         temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
@@ -834,19 +878,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 multi_gate.ptrs_trellis,
                 multi_gate.ptrs_suh,
                 multi_gate.ptrs_svh,
-                multi_gate.K,
+                multi_gate.K or 0,      # 0 = mixed; BC derives per-expert K itself
                 multi_gate.mcg,
                 multi_gate.mul1,
                 self.multi_up.ptrs_trellis,
                 self.multi_up.ptrs_suh,
                 self.multi_up.ptrs_svh,
-                self.multi_up.K,
+                self.multi_up.K or 0,
                 self.multi_up.mcg,
                 self.multi_up.mul1,
                 self.multi_down.ptrs_trellis,
                 self.multi_down.ptrs_suh,
                 self.multi_down.ptrs_svh,
-                self.multi_down.K,
+                self.multi_down.K or 0,
                 self.multi_down.mcg,
                 self.multi_down.mul1,
                 self.activation_fn == "silu",
@@ -1097,15 +1141,44 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 weight_sorted = flat_weight[order]
 
                 # Count how many assignments per expert
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                expert_count_list = expert_count.tolist()
+                # bincount() host-syncs per call (cuda sync-debug verified);
+                # scatter_add_ is the sync-free equivalent (indices < E+1 by construction)
+                expert_count = torch.zeros(E + 1, dtype = torch.long, device = flat_expert_local.device)
+                expert_count.scatter_add_(0, flat_expert_local, torch.ones_like(flat_expert_local))
 
+                # FP4 prefill path handles ALL active experts when enabled
+                _fp4_done = False
+                if BSM_FP4_PREFILL and self.fused_mode_buffers is not None:
+                    if _fp4_hook[0] is None:
+                        import importlib.util as _ilu
+                        _default = _fp4_os.path.join(
+                            _fp4_os.path.dirname(_fp4_os.path.abspath(__file__)),
+                            "..", "anemone_fp4", "fp4_hook.py")
+                        _p = _fp4_os.environ.get("EXL3_FP4_HOOK", _default)
+                        _s = _ilu.spec_from_file_location("exl3_fp4_hook", _p)
+                        _m = _ilu.module_from_spec(_s)
+                        _s.loader.exec_module(_m)
+                        _fp4_hook[0] = _m
+                    _fp4_done = _fp4_hook[0].run(self, y, final_hidden_states,
+                        expert_count, token_sorted, weight_sorted, num_ex)
+                if _fp4_done:
+                    min_rows = 1 << 30
+                    expert_count_list = [0] * (num_ex + 1)   # loop below becomes a no-op
+                else:
+                    expert_count_list = expert_count.tolist()
                 # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
-                if self.fused_mode_buffers is not None:
+                if not _fp4_done and self.fused_mode_buffers is not None:
                     num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
                     multi_gate = self.multi_gate if self.gated else self.multi_up
+                    # K travels as per-expert int32 tables; K_uniform (last arg) > 0
+                    # keeps the compile-time-K instance when every expert of every projection
+                    # shares one K, 0 selects the runtime-dispatch instance
+                    k_uniform = multi_gate.K if (
+                        multi_gate.K is not None
+                        and multi_gate.K == self.multi_up.K == self.multi_down.K
+                    ) else 0
                     ext.exl3_moe(
                         y,
                         final_hidden_states,
@@ -1117,9 +1190,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.fused_mode_buffers.temp_intermediate_g,
                         self.fused_mode_buffers.temp_intermediate_u,
                         self.activation_fn_idx,
-                        multi_gate.K,
-                        self.multi_up.K,
-                        self.multi_down.K,
+                        multi_gate.ptrs_K,
+                        self.multi_up.ptrs_K,
+                        self.multi_down.ptrs_K,
                         multi_gate.ptrs_trellis,
                         multi_gate.ptrs_suh,
                         multi_gate.ptrs_svh,
@@ -1136,7 +1209,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.multi_down.mcg,
                         self.multi_down.mul1,
                         self.act_limit,
-                        num_active
+                        num_active,
+                        k_uniform
                     )
                     min_rows = TEMP_ROWS_FUSED
                 else:
@@ -1247,42 +1321,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Gate
                 if self.gated:
-                    ext.exl3_mgemm(
-                        y[i],
-                        self.multi_gate.ptrs_trellis,
-                        cfg.interm_g,
-                        self.multi_gate.ptrs_suh,
-                        cfg.yh,
-                        self.multi_gate.ptrs_svh,
-                        selected_experts[i],
-                        None,
-                        self.multi_gate.K,
-                        -1,
-                        self.multi_gate.mcg,
-                        self.multi_gate.mul1,
-                        mine,
-                        maxe,
-                        0,
-                        1, None, None)
+                    _mgemm_experts(self.multi_gate, y[i], cfg.interm_g, cfg.yh,
+                                   selected_experts[i], None, mine, maxe)
 
                 # Up
-                ext.exl3_mgemm(
-                    y[i],
-                    self.multi_up.ptrs_trellis,
-                    cfg.interm_u,
-                    self.multi_up.ptrs_suh,
-                    cfg.yh,
-                    self.multi_up.ptrs_svh,
-                    selected_experts[i],
-                    None,
-                    self.multi_up.K,
-                    -1,
-                    self.multi_up.mcg,
-                    self.multi_up.mul1,
-                    mine,
-                    maxe,
-                    0,
-                    1, None, None)
+                _mgemm_experts(self.multi_up, y[i], cfg.interm_u, cfg.yh,
+                               selected_experts[i], None, mine, maxe)
 
                 # Activation (gateless: relu_mul(u, u, a) = relu2(u))
                 act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1291,23 +1335,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Down
                 # A_had must not alias A (the autotuner relaunches on the first call); the
                 # gate buffer is free after the activation
-                ext.exl3_mgemm(
-                    cfg.interm_a,
-                    self.multi_down.ptrs_trellis,
-                    cfg.out_d,
-                    self.multi_down.ptrs_suh,
-                    cfg.interm_g,
-                    self.multi_down.ptrs_svh,
-                    selected_experts[i],
-                    routing_weights[i],
-                    self.multi_down.K,
-                    -1,
-                    self.multi_down.mcg,
-                    self.multi_down.mul1,
-                    mine,
-                    maxe,
-                    0,
-                    1, None, None)
+                _mgemm_experts(self.multi_down, cfg.interm_a, cfg.out_d, cfg.interm_g,
+                               selected_experts[i], routing_weights[i], mine, maxe)
 
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
@@ -1320,42 +1349,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
             # Gate
             if self.gated:
-                ext.exl3_mgemm(
-                    y,
-                    self.multi_gate.ptrs_trellis,
-                    cfg.interm_g,
-                    self.multi_gate.ptrs_suh,
-                    cfg.yh,
-                    self.multi_gate.ptrs_svh,
-                    selected_experts,
-                    None,
-                    self.multi_gate.K,
-                    -1,
-                    self.multi_gate.mcg,
-                    self.multi_gate.mul1,
-                    cfg.min_expert,
-                    cfg.max_expert,
-                    0,
-                    1, None, None)
+                _mgemm_experts(self.multi_gate, y, cfg.interm_g, cfg.yh,
+                               selected_experts, None, cfg.min_expert, cfg.max_expert)
 
             # Up
-            ext.exl3_mgemm(
-                y,
-                self.multi_up.ptrs_trellis,
-                cfg.interm_u,
-                self.multi_up.ptrs_suh,
-                cfg.yh,
-                self.multi_up.ptrs_svh,
-                selected_experts,
-                None,
-                self.multi_up.K,
-                -1,
-                self.multi_up.mcg,
-                self.multi_up.mul1,
-                cfg.min_expert,
-                cfg.max_expert,
-                0,
-                1, None, None)
+            _mgemm_experts(self.multi_up, y, cfg.interm_u, cfg.yh,
+                           selected_experts, None, cfg.min_expert, cfg.max_expert)
 
             # Activation (gateless: relu_mul(u, u, a) = relu2(u))
             act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1363,23 +1362,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
             # Down
             # A_had must not alias A (the autotuner relaunches on the first call)
-            ext.exl3_mgemm(
-                cfg.interm_a,
-                self.multi_down.ptrs_trellis,
-                cfg.out_d,
-                self.multi_down.ptrs_suh,
-                cfg.interm_g,
-                self.multi_down.ptrs_svh,
-                selected_experts,
-                routing_weights,
-                self.multi_down.K,
-                -1,
-                self.multi_down.mcg,
-                self.multi_down.mul1,
-                cfg.min_expert,
-                cfg.max_expert,
-                0,
-                1, None, None)
+            _mgemm_experts(self.multi_down, cfg.interm_a, cfg.out_d, cfg.interm_g,
+                           selected_experts, routing_weights, cfg.min_expert, cfg.max_expert)
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
