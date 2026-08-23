@@ -72,6 +72,9 @@ def add_args(
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
     parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
 
+    from .anemone_flags import add_serving_args
+    add_serving_args(parser)
+
     parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
 
     if add_sampling_args:
@@ -181,6 +184,9 @@ def init(
         tuple of (Model, Config, Cache | None, Tokenizer | None)  or
         tuple of (Model, Config, Cache | None, Tokenizer | None, Model, Config, Cache | None) if draft model args enabled
     """
+    from .anemone_flags import apply_serving_args
+    apply_serving_args(args, quiet = quiet)
+
 
     def printp(p: bool, s: str):
         if p: print(s)
