@@ -77,6 +77,28 @@ class Embedding(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        # P27: lookahead-staged device copy of this exact chunk's embedding (gathered
+        # while the previous chunk ran on the GPU). Identity-checked; any misprediction
+        # falls through to the eager path below
+        _st = params.pop("_p27_staged", None)
+        if _st is not None and not params.get("indexed_embeddings") \
+                and _st["gen"] == _st["slot"]["gen"] \
+                and _st["ids"].shape == x.shape and torch.equal(_st["ids"], x):
+            import os as _p27_os
+            params["input_ids"] = _st["ids_dev"]
+            torch.cuda.current_stream(_st["h_dev"].device).wait_event(_st["ev"])
+            if _p27_os.environ.get("EXL3_P27_CHECK") == "1":
+                torch.cuda.synchronize()
+                ref = self.embedding.forward(x)
+                if self.multiplier != 1.0:
+                    ref = ref * self.multiplier
+                ref = to2(ref, out_dtype or self.out_dtype or x.dtype, self.out_dtype)
+                if self.normalize:
+                    ref = ref * ref.shape[-1] ** 0.5
+                same = torch.equal(_st["h_dev"].cpu(), ref)
+                print(f" -- p27 check: staged chunk {'BITWISE-EQUAL' if same else 'MISMATCH'}")
+            return _st["h_dev"]
+
         # Ensure input IDs in params
         if "input_ids" not in params:
             params["input_ids"] = x

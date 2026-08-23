@@ -25,6 +25,21 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
 # Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
 # runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
 dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
+
+# P24: graph-ready prefill chunks (device-arg kernels + capacity statics). The forward is
+# identical in structure; only the argument FORM changes (device scalars instead of host
+# ints), so it is also valid outside capture. Gated off by default.
+prefill_graph_mode = os.environ.get("EXL3_PREFILL_GRAPHS", "0") == "1"
+# P29: capacity statics for the EAGER indexer chain / attention out (no device scalars)
+idx_static_mode = os.environ.get("EXL3_IDX_STATIC", "0") == "1"
+import itertools as _p24_it
+_p24_serial_counter = _p24_it.count()
+_P24_PIN_RING = 8
+# Long-context guard: graph mode allocates capacity-sized statics (csa scores ~2 bytes x
+# seq x capacity, the (seq, H, hd) attention-out static ~134 MB, x/pin statics) and the
+# 272 pack's headroom at 192k is tens of MB. Above this many cache tokens every dsv4
+# layer declines p24 (and the harness declines capture) instead of OOMing.
+_p24_max_tokens = int(os.environ.get("EXL3_P24_MAX_TOKENS", "131072"))
 from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
@@ -220,7 +235,7 @@ class DSV4Compressor:
 
 
     def forward_fused(self, x, params, buf_kv, buf_gate, ovl, dest_a, dest_b, position,
-                      pool_bt = None, pool_epp = 0):
+                      pool_bt = None, pool_epp = 0, position_tensor = None):
         """Cached-path forward (bsz 1): project + window-pool + norm + rope, writing emitted
         entries straight into the per-slot pools and updating the ring/snapshot state. One
         C++ transition via the BC companion when the chunk fits its scratch, else the two
@@ -231,6 +246,7 @@ class DSV4Compressor:
         # The BC companion bypasses Linear.forward, which must run during conversion so the
         # capture/override machinery sees the projection inputs
         use_bc = self.bc is not None and seq <= self.BC_MAX_QLEN and \
+            position_tensor is None and \
             not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
         if use_bc:
             self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, None, None,
@@ -240,8 +256,9 @@ class DSV4Compressor:
             gate = self.wgate.forward(x, params)[0]
             ext.dsv4_compress(
                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
-                self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
-                None, self.compress_rate, None, pool_bt, pool_epp,
+                self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b,
+                0 if position_tensor is not None else position,
+                position_tensor, self.compress_rate, None, pool_bt, pool_epp,
             )
 
 
@@ -893,10 +910,11 @@ class DSV4Attention(Module):
         return self.inv_freq_main_neg if self.layer_type == "sliding" else self.inv_freq_compress_neg
 
 
-    def _project_qkv(self, x, params, position):
+    def _project_qkv(self, x, params, position, positions = None):
         """Shared front: q_a/q_norm/q_b and wkv, then ONE in-place ext.rope call that also
         applies both head norms (unweighted per-head q norm via a ones weight, weighted
-        kv_norm) before rotating the trailing rope slice (rotate_offset)."""
+        kv_norm) before rotating the trailing rope slice (rotate_offset). P24: `positions`
+        is a (1,) i32 device tensor overriding the host position (graph form)."""
         bsz, seq, _ = x.shape
         rd = self.rope_head_dim
         q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
@@ -904,7 +922,7 @@ class DSV4Attention(Module):
         kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
         ext.rope(
             q, q, kv, kv,
-            self._rope_type(), position, None, None,
+            self._rope_type(), 0 if positions is not None else position, positions, None,
             int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
             self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
         )
@@ -1147,6 +1165,98 @@ class DSV4Attention(Module):
         return torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
 
 
+    def _p24_state(self, rs, device):
+        """Graph statics keyed (slot, device) ON THE CACHE OBJECT so the device pointers
+        survive job turnover -- captured graphs bake them, and a later job's refresh must
+        hit the same memory (bc_dsa keeps its statics alive the same way). (8,) i32 array
+        (layout in the patch header: universal / csa-class / zero / hca-class fields) +
+        a 4-deep event-fenced pinned ring + per-field-class mirrors + the (1, max_npr)
+        block-table static. Refresh runs OUTSIDE any capture."""
+        store = rs.cache.__dict__.setdefault("_p24_store", {})
+        key = (rs.slot, device)
+        st = store.get(key)
+        if st is None:
+            num_pages = rs.cache.max_num_tokens // PAGE_SIZE
+            st = dict(
+                arr = torch.zeros(8, dtype = torch.int32, device = device),
+                pins = [torch.zeros(8, dtype = torch.int32, pin_memory = True)
+                        for _ in range(_P24_PIN_RING)],
+                evs = [torch.cuda.Event() for _ in range(_P24_PIN_RING)],
+                pi = 0,
+                bt_st = torch.zeros((1, num_pages), dtype = torch.int32, device = device),
+                mu = [None],             # universal mirror: (job serial, pos)
+                mb = [None],             # block-table mirror: (job serial, pos)
+                mc = {},                 # class mirrors: (m, has_idx) -> (serial, pos)
+            )
+            store[key] = st
+        return st
+
+    def _p24_pin(self, st):
+        """Next pinned slot, fenced so the host cannot rewrite a pin whose H2D from
+        _P24_PIN_RING chunks ago has not executed (prefill has no per-iteration sync)."""
+        i = st["pi"]
+        st["pi"] = (i + 1) % _P24_PIN_RING
+        st["evs"][i].synchronize()
+        return i
+
+    def _p24_refresh(self, rs, st, seq, bt_row):
+        """Once per chunk per state per field class: host mirror -> pinned ring -> device
+        (async, stream-ordered ahead of the consuming kernels). Mirrors are tagged with a
+        per-rs serial so a NEW JOB at the same position still refreshes. Each compressor
+        class (compress_rate, has_indexer) owns its arr slots and primes itself, so layer
+        order cannot poison another class. Returns this layer's dict of (1,) i32 views."""
+        serial = rs.__dict__.setdefault("_p24_serial", next(_p24_serial_counter))
+        pos0 = rs.position
+        tag = (serial, pos0)
+        a = st["arr"]
+        if st["mu"][0] != tag:
+            i = self._p24_pin(st)
+            pin = st["pins"][i]
+            n_prev = min(self.sliding_window - 1, pos0 - rs.window_beg, pos0)
+            pin[0] = pos0
+            pin[1] = pos0 - n_prev
+            pin[2] = rs.window_beg
+            a[0:3].copy_(pin[0:3], non_blocking = True)
+            st["evs"][i].record()
+            st["mu"][0] = tag
+        if bt_row is not None and st["mb"][0] != tag:
+            npr = min(bt_row.shape[1], st["bt_st"].shape[1])
+            st["bt_st"][:, :npr].copy_(bt_row[0, :npr])
+            st["mb"][0] = tag
+        if self.compressor is not None:
+            has_idx = self.indexer is not None
+            base = 3 if has_idx else 6
+            ckey = (self.compress_rate, has_idx)
+            if st["mc"].get(ckey) != tag:
+                ec = (pos0 + seq) // self.compress_rate
+                i = self._p24_pin(st)
+                pin = st["pins"][i]
+                pin[base] = ec
+                pin[base + 1] = min(self.index_topk, ec) if has_idx else 0
+                a[base:base + 2].copy_(pin[base:base + 2], non_blocking = True)
+                st["evs"][i].record()
+                st["mc"][ckey] = tag
+            return dict(q_pos0 = a[0:1], win_floor = a[1:2], ring_beg = a[2:3],
+                        pool_len = a[base:base + 1], T = a[base:base + 1],
+                        bound_max = a[base:base + 1], k_len = a[base + 1:base + 2])
+        return dict(q_pos0 = a[0:1], win_floor = a[1:2], ring_beg = a[2:3],
+                    pool_len = a[5:6], T = a[5:6], bound_max = a[5:6], k_len = a[5:6])
+
+    def _p24_eligible(self, rs, rsl, seq):
+        """Graph-eligible chunk: page-aligned start, ring update takes the rebase branch
+        with nothing preserved from the old ring (n_keep <= seq). For aligned pos0 the
+        rebase slice constants depend only on seq, which keys the graphs. Mirrors bc_dsa's
+        decline-to-eager contract."""
+        pos0 = rs.position
+        if seq < PAGE_SIZE or pos0 % PAGE_SIZE:
+            return False
+        if pos0 - rs.window_beg + seq <= rsl.ring_rows:
+            return False               # in-place append branch: offsets vary per chunk
+        w = self.sliding_window
+        new_beg = max(pos0 + seq - (w - 1), 0) // PAGE_SIZE * PAGE_SIZE
+        n_keep = pos0 + seq - new_beg  # seq-only for aligned pos0
+        return 0 < n_keep <= min(seq, rsl.ring_rows)
+
     def _indexer_topk(
         self,
         x,
@@ -1158,6 +1268,8 @@ class DSV4Attention(Module):
         q_idx_pre = None,
         block_table = None,
         epp = 0,
+        dev_args = None,          # P24: device scalars + capacity statics
+        kl = None,
     ):
         """Lightning-indexer scoring + top-k selection over the indexer key pool (ec valid
         rows). The indexer query rope uses the compress table at the query positions == this
@@ -1169,8 +1281,40 @@ class DSV4Attention(Module):
             q_idx = q_idx_pre.view(1, seq, self.index_n_heads, self.index_head_dim)
         else:
             q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, self.index_n_heads, self.index_head_dim).contiguous()
+        if dev_args is not None:
+            # positions (bsz,) form: pos = token_pos + positions[0] (rope.cu:59-60)
+            qr = q_idx[..., -self.rope_head_dim:]
+            ext.rope(
+                qr, qr, None, None, self.inv_freq_compress, 0, dev_args["q_pos0"], None,
+                int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
+            wts = self.idx_weights.forward(x, params)
+            s_max = -(-kl.capacity // 128) * 128
+            scores = g_tensor_cache.get(x.device, (seq, s_max), torch.half, "p24_scores")
+            dsa_indexer_scores(q_idx[0], wts[0], idx_pool, 0, self.compress_rate, 0,
+                               scores = scores, block_table = block_table, epp = epp,
+                               dev_args = dev_args, cap = kl.capacity)
+            k = self.index_topk        # graph form only runs in the deep-context regime
+            K_pad = -(-k // 32) * 32
+            indices = g_tensor_cache.get(x.device, (seq, K_pad), torch.int32, "p24_idx")
+            ext.dsa_topk(scores, indices, k, dev_args["T"], 0)
+            return indices, k
         _ext_rope(q_idx[..., -self.rope_head_dim:], self.inv_freq_compress, position = pos0)
         wts = self.idx_weights.forward(x, params)
+        if idx_static_mode and kl is not None:
+            # P29: capacity-stride statics + host scalars — one Triton compile per config
+            # (S_stride constexpr no longer tracks ec) and no per-call allocations. Values
+            # identical: stores masked to T; topk reads a [:, :T] view (row stride = cap)
+            s_max = -(-kl.capacity // 128) * 128
+            scores_st = g_tensor_cache.get(x.device, (seq, s_max), torch.half, "p24_scores")
+            dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec,
+                               scores = scores_st, block_table = block_table, epp = epp,
+                               cap = kl.capacity)
+            k = min(self.index_topk, ec)
+            K_pad = -(-k // 32) * 32
+            indices = g_tensor_cache.get(x.device, (seq, -(-self.index_topk // 32) * 32),
+                                         torch.int32, "p24_idx")[:, :K_pad]
+            ext.dsa_topk(scores_st[:, :ec], indices, k, None, 0)
+            return indices, k
         scores = dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec,
                                     block_table = block_table, epp = epp)
         k = min(self.index_topk, ec)
@@ -1552,6 +1696,34 @@ class DSV4Attention(Module):
         pos0 = rs.position
         slot = rs.slot
 
+        # P24 graph mode: device-arg kernels + statics for graph-eligible chunks. p24 is
+        # this layer's dict of (1,) i32 device views; refresh is once per chunk per state
+        # per field class. Both regimes are shape-stable and key the graphs
+        p24 = None
+        if prefill_graph_mode and seq > 16 and not self.tp_mode \
+                and rs.cache.max_num_tokens <= _p24_max_tokens \
+                and self._p24_eligible(rs, rsl, seq):
+            st = self._p24_state(rs, device)
+            p24 = self._p24_refresh(rs, st, seq, bt_row)
+            if os.environ.get("EXL3_P24_CHECK") == "1":
+                torch.cuda.synchronize()
+                _av = st["arr"].tolist()
+                _exp = [pos0, pos0 - min(self.sliding_window - 1, pos0 - rs.window_beg, pos0),
+                        rs.window_beg]
+                assert _av[0:3] == _exp, f"p24 universal {_av} vs {_exp} L{self.layer_idx}"
+                if self.compressor is not None:
+                    _ec = (pos0 + seq) // self.compress_rate
+                    _b = 3 if self.indexer is not None else 6
+                    assert _av[_b] == _ec, f"p24 ec {_av} vs {_ec} L{self.layer_idx} b{_b}"
+                    if _b == 3:
+                        assert _av[4] == min(self.index_topk, _ec), f"p24 klen {_av} L{self.layer_idx}"
+                if bt_row is not None:
+                    _npr = min(bt_row.shape[1], st["bt_st"].shape[1])
+                    assert torch.equal(st["bt_st"][0, :_npr], bt_row[0, :_npr]), \
+                        f"p24 bt mismatch L{self.layer_idx}"
+            if bt_row is not None:
+                bt_row = st["bt_st"]
+
         if not self.x_fan_ready:
             self._build_x_fan()
 
@@ -1617,14 +1789,17 @@ class DSV4Attention(Module):
 
             ext.rope(
                 q, q, kv, kv,
-                self._rope_type(), pos0, None, None,
+                self._rope_type(), 0 if p24 is not None else pos0,
+                p24["q_pos0"] if p24 is not None else None, None,
                 int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
                 self.rms_norm_eps, 0.0, 0.0, 0, 1,
                 self.head_dim - self.rope_head_dim,
             )
             kv = kv.view(1, seq, self.head_dim)
         else:
-            q_res, q, kv = self._project_qkv(x, params, pos0)
+            q_res, q, kv = self._project_qkv(
+                x, params, pos0,
+                positions = p24["q_pos0"] if p24 is not None else None)
 
         # Window sources for the kernel: this chunk's kv rows plus prior rows read from the
         # ring at abs - window_beg; the kernel derives all per-query addressing from the
@@ -1654,30 +1829,32 @@ class DSV4Attention(Module):
             # compress kernels directly
             pool_c_flat = kl.pool_c.view(-1, kl.D_c)
             pool_r_flat = kl.pool_r.view(-1, kl.D_r)
+            _pt = p24["q_pos0"] if p24 is not None else None
+            _p0 = 0 if p24 is not None else pos0
             if use_fan:
                 comp = self.compressor
                 ext.dsv4_compress(
                     fouts[2], fouts[3], rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
                     comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps, comp.fused_inv_freq,
-                    pool_c_flat, pool_r_flat, pos0, None, m, None, bt_row, epp)
+                    pool_c_flat, pool_r_flat, _p0, _pt, m, None, bt_row, epp)
                 if self.layer_type == "csa":
                     idx = self.indexer
                     ext.dsv4_compress(
                         fouts[4], fouts[5], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
-                        idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, pos0,
-                        None, m, None, bt_row, epp)
+                        idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, _p0,
+                        _pt, m, None, bt_row, epp)
             else:
                 self.compressor.forward_fused(
                     x, params, rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
-                    pool_c_flat, pool_r_flat, pos0, bt_row, epp)
+                    pool_c_flat, pool_r_flat, pos0, bt_row, epp, position_tensor = _pt)
                 if self.layer_type == "csa":
                     self.indexer.forward_fused(
                         x, params, rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], kl.pool_idx.view(-1, kl.D_i), None, pos0,
-                        bt_row, epp)
+                        bt_row, epp, position_tensor = _pt)
             pool_len = ec
 
             # Selection is only non-trivial once the pool exceeds index_topk: below that,
@@ -1686,7 +1863,7 @@ class DSV4Attention(Module):
             if topk_regime:
                 indices, k_len = self._indexer_topk(
                     x, params, q_res, kl.pool_idx.view(-1, kl.D_i), ec, pos0, q_idx_pre,
-                    block_table = bt_row, epp = epp)
+                    block_table = bt_row, epp = epp, dev_args = p24, kl = kl)
 
         if self.compressor is not None:
             pool_c, pool_r = kl.pool_c, kl.pool_r
@@ -1699,6 +1876,9 @@ class DSV4Attention(Module):
         # eq. 26 de-rotation and the group-major store for the grouped o_proj are fused into
         # the kernel epilogue: output is (G, seq, hpg * D), fp16
         hpg = self.num_q_heads // self.o_groups
+        _out = g_tensor_cache.get(device, (self.o_groups, seq, hpg * self.head_dim), torch.half, "p24_dsaout") \
+            if (p24 is not None or idx_static_mode) else \
+            torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device)
         out = dsa_attn(
             q[0].half().contiguous(), pool_c, pool_r, bt, sinks = self.sinks,
             ring = ring, kv_chunk = kv[0], win_len = self.sliding_window,
@@ -1707,7 +1887,8 @@ class DSV4Attention(Module):
             compress_rate = dense_m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp,
-            out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
+            out = _out,
+            dev_args = p24,
         )
 
         # Ring update after attention: the shift/rebase branches move rows the kernel

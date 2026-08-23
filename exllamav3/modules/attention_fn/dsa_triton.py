@@ -90,6 +90,9 @@ if has_triton:
         BLOCK_W: tl.constexpr,         # window tile; smaller than BLOCK_N (two-source smem)
         DEBUG_BOUNDS: tl.constexpr = 0,
         DEBUG_PAGES: tl.constexpr = 0,
+        DEV_ARGS: tl.constexpr = 0,    # P24: k_len/pool_len/q_pos0/win_floor/ring_beg are
+                                       # i32 DEVICE pointers (single job), loaded below --
+                                       # graph-capture form, values patched per replay
         NC_BLOCK: tl.constexpr = 0,    # DSpark draft mode: every row sees the SAME range
                                        # [win_floor, q_pos0 + R) (window history ++ whole
                                        # chunk, non-causal); history rows are PAGED, read
@@ -109,6 +112,12 @@ if has_triton:
         h_blocks = tl.cdiv(H, BLOCK_H)
         row = pid // h_blocks
         h_block = pid % h_blocks
+        if DEV_ARGS:
+            k_len = tl.load(k_len)
+            pool_len = tl.load(pool_len)
+            q_pos0 = tl.load(q_pos0)
+            win_floor = tl.load(win_floor)
+            ring_beg = tl.load(ring_beg)
 
         offs_h = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
         valid_h = offs_h < H
@@ -562,6 +571,9 @@ if has_triton:
         EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous k_idx
         DEBUG_BOUNDS: tl.constexpr = 0,
         DEBUG_PAGES: tl.constexpr = 0,
+        DEV_ARGS: tl.constexpr = 0,      # P24: T/q_pos0/bound_max are i32 device pointers;
+                                         # grid dim 1 sized for pool CAPACITY, tiles past T
+                                         # retire immediately (same contract as fewq)
     ):
         """Lightning-indexer scoring: scores[r, s] = sum_h w[r, h] * relu(q[r, h] . k[s]) * scale.
         GEMM-shaped with a per-head ReLU epilogue; the head loop runs H_i full MMA dots against
@@ -569,6 +581,12 @@ if has_triton:
         CSA), only the key tensor differs. Causal entry bound applied in the epilogue."""
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
+        if DEV_ARGS:
+            T = tl.load(T)
+            q_pos0 = tl.load(q_pos0)
+            bound_max = tl.load(bound_max)
+        if pid_n * BLOCK_N >= T:
+            return
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_d = tl.arange(0, D_i)
@@ -694,14 +712,18 @@ def dsa_attn(
                              # holding a single o_group); default = (groups > 1)
     out = None,
     n_splits = 0,            # flash-decoding splits; 0 = auto (few queries -> split path)
-    block_h = 32,
-    block_n = 32,
-    num_warps = 4,
-    num_stages = 3,
+    block_h = int(__import__('os').environ.get('DSA_BLOCK_H', 32)),
+    block_n = int(__import__('os').environ.get('DSA_BLOCK_N', 32)),
+    num_warps = int(__import__('os').environ.get('DSA_NUM_WARPS', 8)),   # P18: 255-reg kernel at
+    num_stages = int(__import__('os').environ.get('DSA_NUM_STAGES', 2)),  # 4w = 8.3% occupancy; 8w/2s swept best
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
     nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
                              # (single job per call; forces the one-shot kernel)
+    dev_args = None,         # P24 graph mode: dict(k_len, pool_len, q_pos0, win_floor,
+                             # ring_beg) of (1,) i32 DEVICE tensors; forces the one-shot
+                             # kernel with in-kernel loads (scalar args of the same names
+                             # are ignored). Caller must pass a static `out`
     multirow = None,         # batched jobs: dict(q_pos, win_floor, ring_beg, pool_len,
                              # k_len (B,) i32; slot_ids (B,) i32; ring_stride int; seq int)
                              # -- scalar args of the same names are ignored, ring is the
@@ -847,6 +869,10 @@ def dsa_attn(
         return out
 
     grid = (R * triton.cdiv(H, block_h),)
+    if dev_args is not None:
+        assert out is not None and R > 8   # one-shot path only; caller provides the static
+        k_len, pool_len = dev_args["k_len"], dev_args["pool_len"]
+        q_pos0, win_floor, ring_beg = dev_args["q_pos0"], dev_args["win_floor"], dev_args["ring_beg"]
     with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
         _dsa_attn_kernel[grid](
             q, ring, kv_chunk, pool_c.reshape(-1, D_c), pool_r.reshape(-1, D_r),
@@ -862,6 +888,7 @@ def dsa_attn(
             HPG = hpg,
             BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+            DEV_ARGS = 1 if dev_args is not None else 0,
             NC_BLOCK = 1 if nc_block else 0,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             num_warps = num_warps, num_stages = num_stages,
@@ -884,6 +911,9 @@ def dsa_indexer_scores(
     num_stages = 2,
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
+    dev_args = None,         # P24 graph mode: dict(T, q_pos0, bound_max) of (1,) i32 device
+                             # tensors; requires cap (pool capacity) and a static `scores`
+    cap = 0,                 # P24: capacity used for S_stride/grid when dev_args is given
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
@@ -896,12 +926,20 @@ def dsa_indexer_scores(
         bt = block_table.reshape(-1)
     dbg = 1 if (dsa_debug_bounds and epp) else 0
     dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
-    S_stride = triton.cdiv(max(T, 1), block_n) * block_n
+    if dev_args is not None:
+        assert cap > 0 and scores is not None and block_table is not None and R > 4
+        T_grid = cap
+    else:
+        T_grid = cap if cap > 0 else T      # P29: capacity stride with host-scalar grid
+        if cap > 0:
+            assert scores is not None and T <= cap
+    S_stride = triton.cdiv(max(cap if cap > 0 else T_grid, 1), block_n) * block_n
     if scores is None:
         # Deliberately a per-call allocation: the shape grows with the visible context, so it
         # is not tensor-cache material.
         # TODO: The buffer should disappear entirely once scoring and top-k are fused into a streaming kernel
         scores = torch.empty((R, S_stride), dtype = torch.half, device = q_idx.device)
+    assert scores.shape[1] == S_stride
     with torch.cuda.device(q_idx.device):
         if R <= 4:
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
@@ -917,13 +955,19 @@ def dsa_indexer_scores(
                 num_warps = num_warps, num_stages = num_stages,
             )
         else:
-            grid = (triton.cdiv(R, block_m), triton.cdiv(max(T, 1), block_n))
+            if dev_args is not None:
+                T, q_pos0, bound_max = dev_args["T"], dev_args["q_pos0"], dev_args["bound_max"]
+            grid = (triton.cdiv(R, block_m),
+                    triton.cdiv(max(cap if dev_args is not None else T, 1), block_n))
             _dsa_indexer_kernel[grid](
                 q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt,
                 H_i = H_i, D_i = D_i, S_stride = S_stride, compress_rate = compress_rate,
                 scale = D_i ** -0.5 * H_i ** -0.5,
                 BLOCK_M = block_m, BLOCK_N = block_n, EPP = epp,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+                DEV_ARGS = 1 if dev_args is not None else 0,
                 num_warps = num_warps, num_stages = num_stages,
             )
+    if dev_args is not None:
+        return scores          # full capacity width; consumer bounds the scan via t_ptr
     return scores[:, :T]
