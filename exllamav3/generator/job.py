@@ -1279,7 +1279,8 @@ class Job:
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
             recurrent_last_page = False
-            if self.generator.recurrent_cache is not None:
+            import os as _rlp_os
+            if self.generator.recurrent_cache is not None and _rlp_os.environ.get('EXL3_NO_RLP') != '1':
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:
@@ -1326,6 +1327,16 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
+                # P27: consume the lookahead-staged embedding (identity-checked by the
+                # embedding module) and the per-job device block table
+                import os as _p27_os
+                if _p27_os.environ.get("EXL3_PREFILL_STAGE") == "1" and not self.embeddings:
+                    from .p27_stage import bt_device
+                    _st = getattr(seq, "_p27_staged", None)
+                    if _st is not None:
+                        params["_p27_staged"] = _st
+                        seq._p27_staged = None
+                    params["block_table"] = bt_device(seq, self.generator)
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 if self.generator.mtp_draft:
@@ -1335,6 +1346,14 @@ class Job:
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
                 else:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
+                    # P27: gather + upload the NEXT chunk's embedding while this chunk's
+                    # kernels run (its span is recomputed by the next iteration; the
+                    # identity check absorbs mispredictions)
+                    if _p27_os.environ.get("EXL3_PREFILL_STAGE") == "1" \
+                            and not self.embeddings \
+                            and self.generator.draft_model is None:
+                        from .p27_stage import stage_next
+                        stage_next(self.generator, seq, prefill_end)
 
                 if self.generator.dflash_draft:
                     self.generator.draft_model.update_kv_from_target(
