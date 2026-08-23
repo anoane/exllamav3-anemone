@@ -106,6 +106,7 @@ setup(
         "exllamav3.modules.gated_delta_net_fn",
         "exllamav3.modules.quant",
         "exllamav3.modules.quant.exl3_lib",
+        "exllamav3.anemone_fp4",
         "exllamav3.tokenizer",
         "exllamav3.cache",
         "exllamav3.loader",
@@ -132,6 +133,8 @@ setup(
     include_package_data=True,
     package_data = {
         "": ["py.typed"],
+        # the FP4 hook JIT-compiles this at first use, so it must be installed
+        "exllamav3.anemone_fp4": ["*.cu"],
     },
     verbose=verbose,
     **setup_kwargs,

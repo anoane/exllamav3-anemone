@@ -158,12 +158,44 @@ class LinearEXL3:
         return expanded.contiguous().to(device)
 
 
+    _fp4_dense = None
+
+    def _fp4_dense_mod(self):
+        # lazy-load the FP4 dense hook (second extension, sm_120a)
+        import os
+        cls = type(self)
+        if cls._fp4_dense is None:
+            if os.environ.get("EXL3_FP4_DENSE") != "1":
+                cls._fp4_dense = False
+            else:
+                import importlib.util as _ilu
+                _default = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "..", "anemone_fp4", "fp4_hook.py")
+                _p = os.environ.get("EXL3_FP4_HOOK", _default)
+                _s = _ilu.spec_from_file_location("exl3_fp4_hook_dense", _p)
+                _m = _ilu.module_from_spec(_s)
+                _s.loader.exec_module(_m)
+                cls._fp4_dense = _m
+        return cls._fp4_dense or None
+
     def reconstruct_hgemm(self, x: torch.Tensor, out_dtype):
 
         shape = x.shape
         rows = x.numel() // shape[-1]
         out_shape = shape[:-1] + (self.out_features,)
         x = x.view(rows, self.in_features)
+
+        # FP4 dense prefill path (EXL3_FP4_DENSE=1)
+        if rows >= 1024:
+            _m = self._fp4_dense_mod()
+            if _m is not None:
+                _y = _m.dense(self, x, rows)
+                if _y is not None:
+                    _y = _y.view(out_shape)
+                    _dt = out_dtype or self.default_out_dtype
+                    if _dt is not None and _dt != torch.half:
+                        _y = _y.to(_dt)
+                    return _y
         y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
 
         y_ = y.view(rows, self.out_features)

@@ -1,2 +1,3 @@
 include exllamav3/util/hadamard_data/*
 recursive-include exllamav3/exllamav3_ext *
+recursive-include exllamav3/anemone_fp4 *.cu
