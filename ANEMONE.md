@@ -108,7 +108,37 @@ graph capture and lookahead chunk staging are available for chunked prefill.
 **Tiered calibration** — conversion of a ~300B MoE at 2000 calibration rows needs more
 calibration state than a 62 GB host has; the state can now tier VRAM → RAM → disk spill.
 
-## 4. Building
+## 4. Serving a DeepSeek-V4-Flash pack correctly
+
+The flags above are this fork's. Two settings that are *not* this fork's dominate how the
+model behaves, and both are easy to get wrong.
+
+**There is no official Jinja chat template.** DeepSeek's model card says so and ships a Python
+encoder (`encoding/encoding_dsv4.py`) instead, so any `chat_template.jinja` beside a pack is a
+community reconstruction. The reasoning-effort prompt is the mechanism that makes effort
+levels work, and a paraphrase of it is not equivalent — DeepSeek's `max` prompt instructs the
+model not to stop reasoning until it has independently verified the solution from multiple
+angles. Take the strings verbatim from their encoder. The valid levels are `low`, `high` and
+`max`; there is no `medium`, and `low` injects no prompt at all.
+
+**Sampling should be theirs, not a frontend's defaults.** DeepSeek specify `temperature 1.0`
+with `top_p 1.0` (`0.95` for agentic use), and the model's `generation_config.json` agrees.
+Nothing else — in particular `min_p` is not one of their recommendations. Low temperature or
+aggressive truncation drives this model into repetition loops during long reasoning: at
+`temperature 0.2` it will emit tens of thousands of characters of self-checking and never
+answer.
+
+**Budget for the reasoning.** DeepSeek recommend a maximum output length of 384K tokens at
+`high` and `max` effort, and the model uses it — a hard competitive-programming problem
+measured here spent ~45,000 tokens reasoning before answering. If you cap generation too low
+you get `finish_reason: length`, a large `reasoning_content` and an empty `content`. That is
+a budget problem, not a quantization one. Note that a 2.72 bpw pack serving 262,144 tokens of
+context has less total context than the recommended output budget alone.
+
+A working TabbyAPI configuration, a template carrying the official prompts, and a sampler
+preset encoding the recommended values are in the recipe repository's `serve/` directory.
+
+## 5. Building
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
@@ -120,7 +150,7 @@ Build for plain `12.0` on Blackwell, **not** `12.0a`: a single-arch `120a` build
 observed to break the DSA decode graph path. (The optional FP4 prefill kernel is a separate
 extension that does target `sm_120a`, isolated from the main build.)
 
-## 5. Relationship to upstream
+## 6. Relationship to upstream
 
 This is a fork of `turboderp-org/exllamav3`. ANEMONE commits sit on top of upstream `dev`,
 each scoped to one subsystem so it can be reviewed, reverted or upstreamed independently.
@@ -141,7 +171,7 @@ sets each expert.
 Upstream's pipeline is documented as untested on sparse models, and this fork has not been
 run against it.
 
-## 6. What was verified, and how
+## 7. What was verified, and how
 
 Claims in this fork are measured rather than asserted. The load-bearing ones, and the
 evidence behind each:
@@ -169,7 +199,7 @@ measures almost nothing, because page-cache and checkpoint reuse mean the second
 prefills the tail. Use perplexity, or tensor comparison against a measured noise floor, and
 one process per configuration.
 
-## 7. Debug and experimental switches (environment only)
+## 8. Debug and experimental switches (environment only)
 
 Every user-facing option has a flag. A few knobs deliberately do not, because they exist
 for development rather than deployment:
