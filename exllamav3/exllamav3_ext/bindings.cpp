@@ -271,7 +271,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
-    m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.def("exl3_moe", &exl3_moe, "exl3_moe",
+        py::arg("hidden_state"), py::arg("output_state"), py::arg("expert_count"),
+        py::arg("token_sorted"), py::arg("weight_sorted"),
+        py::arg("temp_state_g"), py::arg("temp_state_u"),
+        py::arg("temp_intermediate_g"), py::arg("temp_intermediate_u"),
+        py::arg("act_function"), py::arg("K_gate"), py::arg("K_up"), py::arg("K_down"),
+        py::arg("gate_ptrs_trellis"), py::arg("gate_ptrs_suh"), py::arg("gate_ptrs_svh"),
+        py::arg("up_ptrs_trellis"), py::arg("up_ptrs_suh"), py::arg("up_ptrs_svh"),
+        py::arg("down_ptrs_trellis"), py::arg("down_ptrs_suh"), py::arg("down_ptrs_svh"),
+        py::arg("gate_mcg"), py::arg("gate_mul1"), py::arg("up_mcg"), py::arg("up_mul1"),
+        py::arg("down_mcg"), py::arg("down_mul1"), py::arg("act_limit"), py::arg("num_active"),
+        py::arg("output_scratch"), py::arg("fused_base"),
+        py::arg("count_lo"), py::arg("count_hi"), py::arg("m_tile"), py::arg("tile_rows") = false);
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 

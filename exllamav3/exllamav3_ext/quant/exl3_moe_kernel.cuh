@@ -60,7 +60,10 @@ void moe_gemm_tile
     #undef SHAPE_ARGS
 }
 
-template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M>
+// tile_rows: row-striped instances (fused-only prefill, EXL3_MOE_FUSED_PREFILL). An expert with more rows
+// than the group's temp buffers hold (max_tokens_per_expert) is not skipped but runs in stripes of at most that
+// many rows. A compile-time option, like M_TILE, so the default instances compile without the stripe code
+template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool tile_rows = false>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
@@ -109,12 +112,17 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
         // Skip if no tokens or too many tokens for fused kernel (batch is handled by reconstruct path outside kernel)
         if (token_count == 0) continue;
-        if (token_count > max_tokens_per_expert) continue;
+        if (!tile_rows && token_count > max_tokens_per_expert) continue;
         // Skip if outside this launch's row-tile tier
         if (token_count < count_lo || token_count > count_hi) continue;
 
         // Skip if expert is claimed by a different group
         if (expert_idx_assign++ != ticket) continue;
+
+        // Row stripes (tile_rows): the phases below run the expert's first stripe, and the jump back to
+        // next_stripe after had_d_out the others. row_offset is the stripe's first row within the expert
+        int row_offset = 0;
+        if constexpr (tile_rows) token_count = MIN(token_count, max_tokens_per_expert);
 
         // EXL3 weights for g, u, d
         const uint16_t* exp_gate_trellis = gate_trellis[expert_idx];
@@ -127,6 +135,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         const half* exp_down_suh = down_suh[expert_idx];
         const half* exp_down_svh = down_svh[expert_idx];
 
+    next_stripe:
         // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
         // below); the activation synthesizes the gate lane from u
         const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
@@ -248,7 +257,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             // stored there; exl3_moe_gather then sums each token's top-k slots in a fixed
             // order. Otherwise the contributions are atomically added into the token row in
             // arrival order, which is not bit-reproducible run to run
-            const int64_t slot_base = output_scratch ? fused_base[expert_idx] : 0;
+            const int64_t slot_base = output_scratch ? fused_base[expert_idx] + row_offset : 0;
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
                 int row = warp_idx / warps_per_token;
@@ -281,6 +290,23 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         had_d_out();
+
+        // Next row stripe (tile_rows): back to the phases above for the expert's next rows, after a barrier that
+        // keeps the stripe from overwriting the temp buffers before every block of the group is done with them. A
+        // jump rather than a loop around the phases: without stripes the code is then exactly the kernel's
+        // single pass (a loop around the phases, even one that always runs once, changes the default instances'
+        // register allocation and spilling)
+        if constexpr (tile_rows)
+        {
+            if (start + token_count < end)
+            {
+                group_barrier(group_idx, group_size, barrier_counters_sense);
+                start += token_count;
+                row_offset += token_count;
+                token_count = MIN(end - start, max_tokens_per_expert);
+                goto next_stripe;
+            }
+        }
 
         // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
         // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit

@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / "exllamav3" / "model" / "math_policy.py"
-POLICY_VARS = ("EXL3_HGEMM_FIXED_ROWS",)
+POLICY_VARS = ("EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL", "EXL3_MOE_FUSED_DET")
 
 
 def load(environ):
@@ -52,6 +52,32 @@ class FixedRowsTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("ValueError: EXL3_HGEMM_FIXED_ROWS must be 0 or 128", r.stderr)
+
+
+class FusedPrefillTests(unittest.TestCase):
+
+    def test_accepted_values(self):
+        policy = load({})
+        for environ, expected in (({}, False), ({"EXL3_MOE_FUSED_PREFILL": "0"}, False),
+                                  ({"EXL3_MOE_FUSED_PREFILL": "1"}, True),
+                                  ({"EXL3_MOE_FUSED_PREFILL": "1", "EXL3_MOE_FUSED_DET": "1"}, True),
+                                  ({"EXL3_MOE_FUSED_PREFILL": "0", "EXL3_MOE_FUSED_DET": "0"}, False)):
+            with self.subTest(environ = environ):
+                self.assertEqual(policy.fused_prefill_enabled(environ), expected)
+                self.assertEqual(load(environ).FUSED_PREFILL, expected)
+        self.assertEqual(policy.FUSED_COUNT_LIMIT, 2 ** 31 - 1)
+
+    def test_other_values_refused(self):
+        policy = load({})
+        for value in ("", "2", "-1", "true", "yes", "128", " 1"):
+            with self.subTest(value = value), self.assertRaisesRegex(ValueError, "EXL3_MOE_FUSED_PREFILL"):
+                policy.fused_prefill_enabled({"EXL3_MOE_FUSED_PREFILL": value})
+
+    def test_atomic_accumulation_refused(self):
+        # The setting exists for reproducible arithmetic, which atomic accumulation would undo
+        policy = load({})
+        with self.assertRaisesRegex(ValueError, "EXL3_MOE_FUSED_DET=0"):
+            policy.fused_prefill_enabled({"EXL3_MOE_FUSED_PREFILL": "1", "EXL3_MOE_FUSED_DET": "0"})
 
 
 if __name__ == "__main__":

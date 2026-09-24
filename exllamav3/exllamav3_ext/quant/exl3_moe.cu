@@ -11,6 +11,7 @@ namespace cg = cooperative_groups;
 #include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
+#include <limits>
 
 int exl3_moe_max_concurrency(int device)
 {
@@ -62,6 +63,45 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
     exl3_moe_kernel_k3_n128_cb2_m64(), exl3_moe_kernel_k4_n128_cb2_m64(), exl3_moe_kernel_k5_n128_cb2_m64(),
     exl3_moe_kernel_k6_n128_cb2_m64(), exl3_moe_kernel_k7_n128_cb2_m64(), exl3_moe_kernel_k8_n128_cb2_m64()
 };
+
+// Row-striped twins of the three tables above, same layout (tile_rows, see exl3_moe_kernel)
+fp_exl3_moe_kernel exl3_moe_kernel_instances_st[] =
+{
+    exl3_moe_kernel_k0_n128_cb1_st(), exl3_moe_kernel_k0_n256_cb1_st(), exl3_moe_kernel_k0_n128_cb2_st(), exl3_moe_kernel_k0_n256_cb2_st(),
+    exl3_moe_kernel_k1_n128_cb1_st(), exl3_moe_kernel_k1_n256_cb1_st(), exl3_moe_kernel_k1_n128_cb2_st(), exl3_moe_kernel_k1_n256_cb2_st(),
+    exl3_moe_kernel_k2_n128_cb1_st(), exl3_moe_kernel_k2_n256_cb1_st(), exl3_moe_kernel_k2_n128_cb2_st(), exl3_moe_kernel_k2_n256_cb2_st(),
+    exl3_moe_kernel_k3_n128_cb1_st(), exl3_moe_kernel_k3_n256_cb1_st(), exl3_moe_kernel_k3_n128_cb2_st(), exl3_moe_kernel_k3_n256_cb2_st(),
+    exl3_moe_kernel_k4_n128_cb1_st(), exl3_moe_kernel_k4_n256_cb1_st(), exl3_moe_kernel_k4_n128_cb2_st(), exl3_moe_kernel_k4_n256_cb2_st(),
+    exl3_moe_kernel_k5_n128_cb1_st(), exl3_moe_kernel_k5_n256_cb1_st(), exl3_moe_kernel_k5_n128_cb2_st(), exl3_moe_kernel_k5_n256_cb2_st(),
+    exl3_moe_kernel_k6_n128_cb1_st(), exl3_moe_kernel_k6_n256_cb1_st(), exl3_moe_kernel_k6_n128_cb2_st(), exl3_moe_kernel_k6_n256_cb2_st(),
+    exl3_moe_kernel_k7_n128_cb1_st(), exl3_moe_kernel_k7_n256_cb1_st(), exl3_moe_kernel_k7_n128_cb2_st(), exl3_moe_kernel_k7_n256_cb2_st(),
+    exl3_moe_kernel_k8_n128_cb1_st(), exl3_moe_kernel_k8_n256_cb1_st(), exl3_moe_kernel_k8_n128_cb2_st(), exl3_moe_kernel_k8_n256_cb2_st()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m32_st[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m32_st(), exl3_moe_kernel_k1_n128_cb2_m32_st(), exl3_moe_kernel_k2_n128_cb2_m32_st(),
+    exl3_moe_kernel_k3_n128_cb2_m32_st(), exl3_moe_kernel_k4_n128_cb2_m32_st(), exl3_moe_kernel_k5_n128_cb2_m32_st(),
+    exl3_moe_kernel_k6_n128_cb2_m32_st(), exl3_moe_kernel_k7_n128_cb2_m32_st(), exl3_moe_kernel_k8_n128_cb2_m32_st()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m64_st[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m64_st(), exl3_moe_kernel_k1_n128_cb2_m64_st(), exl3_moe_kernel_k2_n128_cb2_m64_st(),
+    exl3_moe_kernel_k3_n128_cb2_m64_st(), exl3_moe_kernel_k4_n128_cb2_m64_st(), exl3_moe_kernel_k5_n128_cb2_m64_st(),
+    exl3_moe_kernel_k6_n128_cb2_m64_st(), exl3_moe_kernel_k7_n128_cb2_m64_st(), exl3_moe_kernel_k8_n128_cb2_m64_st()
+};
+
+// One family of instances: the 16-row table [4 * K + 2 * cb_idx + N_off] and the 32- and 64-row tables [K]
+struct MoeInstanceFamily
+{
+    fp_exl3_moe_kernel* rows16;
+    fp_exl3_moe_kernel* rows32;
+    fp_exl3_moe_kernel* rows64;
+};
+
+static const MoeInstanceFamily moe_family_default = { exl3_moe_kernel_instances, exl3_moe_kernel_instances_m32, exl3_moe_kernel_instances_m64 };
+static const MoeInstanceFamily moe_family_striped = { exl3_moe_kernel_instances_st, exl3_moe_kernel_instances_m32_st, exl3_moe_kernel_instances_m64_st };
 
 /*
 Fused mixture-of-experts MLP operation for EXL3 weights
@@ -129,9 +169,16 @@ inputs:
         (mul1 codebook, N = 128 instances). Worth it for experts holding more than 16 / 32 rows
 
     num_active:
-        number of experts with 0 < token count <= max_tokens_per_expert, i.e. the number of experts this kernel
-        will process. Used to size the launch: fewer, wider expert groups when few experts are active. Pass -1 if
-        unknown (defaults to MOE_SMS_PER_EXPERT-wide groups at max concurrency)
+        number of experts with 0 < token count <= max_tokens_per_expert (any count > 0 with tile_rows), i.e. the
+        number of experts this kernel will process. Used to size the launch: fewer, wider expert groups when few
+        experts are active. Pass -1 if unknown (defaults to MOE_SMS_PER_EXPERT-wide groups at max concurrency)
+
+    tile_rows:
+        false (default): experts with more than max_tokens_per_expert rows (the temp buffers' row capacity) are
+        skipped, the caller's reconstruct tiers take them. true: every expert is processed, in row stripes of at
+        most max_tokens_per_expert rows that reuse the group's temp buffers; slot outputs keep each assignment's
+        row within its expert. Selects the row-striped instances (_st). Fused-only prefill
+        (EXL3_MOE_FUSED_PREFILL) sets it
 */
 
 void exl3_moe
@@ -176,7 +223,8 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const bool tile_rows
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -230,6 +278,19 @@ void exl3_moe
     TORCH_CHECK_SHAPES_FULL(temp_intermediate_g, temp_intermediate_u);
     TORCH_CHECK_SHAPES(temp_intermediate_g, 1, temp_state_g, 1, 1);
     size_t intermediate_dim = temp_intermediate_g.size(2);
+
+    if (tile_rows)
+    {
+        // Row stripes advance by the temp buffers' row capacity, and the kernel's row and element offsets
+        // are signed int: refuse an empty capacity and anything that would not be addressable
+        TORCH_CHECK(max_tokens_per_expert > 0, "exl3_moe: row stripes need temp buffers with at least one row");
+        const auto limit = std::numeric_limits<int>::max();
+        TORCH_CHECK(hidden_state.numel() <= limit && token_sorted.numel() <= limit &&
+                    temp_state_g.numel() <= limit && temp_intermediate_g.numel() <= limit,
+                    "exl3_moe: tiled source or scratch addressing exceeds int32");
+        TORCH_CHECK(max_tokens_per_expert <= (size_t) limit && concurrency > 0,
+                    "exl3_moe: invalid tiled scratch geometry");
+    }
 
     // TORCH_CHECK(!(gate_mcg && gate_mul1), "Specified both mcg and mul1 (gate)");
     // TORCH_CHECK(!(up_mcg && up_mul1), "Specified both mcg and mul1 (up)");
@@ -287,10 +348,13 @@ void exl3_moe
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
+    // Row stripes run in instances of their own (tile_rows is a template parameter of exl3_moe_kernel), so the
+    // default instances compile without the stripe code
+    const MoeInstanceFamily& family = tile_rows ? moe_family_striped : moe_family_default;
     fp_exl3_moe_kernel kernel;
     if (m_tile <= 16)
     {
-        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+        kernel = family.rows16[4 * K + 2 * cb_idx + N_off];
     }
     else
     {
@@ -300,7 +364,7 @@ void exl3_moe
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
         TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
-        kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+        kernel = m_tile >= 64 ? family.rows64[K] : family.rows32[K];
     }
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())

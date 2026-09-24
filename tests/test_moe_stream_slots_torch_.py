@@ -44,7 +44,7 @@ class StreamDispatcherTests(unittest.TestCase):
                 return None
 
         fn = Imports().visit(fn)
-        tuning = NS(stream_deterministic = True)
+        tuning = NS(stream_deterministic = True, fused_prefill = False)
         ns = dict(torch = torch, TUNING = tuning, PAD_MAX = 1.1, slot_rows_bound = helpers.slots.slot_rows_bound)
         exec(compile(ast.Module(body = [fn], type_ignores = []), "<production-workspace>", "exec"), ns)
         recon = NS(cap = 4, worst_case_bytes = Mock(side_effect = lambda a, slot_mode: 100000 if slot_mode else 200000))
@@ -53,6 +53,7 @@ class StreamDispatcherTests(unittest.TestCase):
         # 7 rows must take the streamed branch: a hybrid layer above its row floor (a fake floor
         # of 4), and a stream-mode layer, which streams at every row count (the upstream floor 32)
         for mode, floor, stream_only in (("hybrid", 4, False), ("stream", 32, True)):
+            tuning.fused_prefill = False
             host = NS(specs = [spec], aux = {0: {}}, cap_rows = 64, stream_min_rows = floor, wslot_size = 1024,
                       _device_buffers = lambda *a: {}, _stream_only = lambda *a, s = stream_only: s,
                       _stream_fused_t = lambda *a: 0, _stream_recon_layer = lambda *a: recon)
@@ -62,9 +63,17 @@ class StreamDispatcherTests(unittest.TestCase):
                         fixed, variable = ns[fn.name](host, 0, 7, "cpu", 42, hidden_width = width)
                         self.assertEqual(variable, expected)
                         self.assertGreaterEqual(fixed, helpers.slots.slot_rows_bound(42, 1.1, 4) * 32 * 4)
+                # Fused-only prefill: no reconstruct tier, no per-expert working set; the slots remain
+                tuning.fused_prefill = True
+                host._stream_recon_layer = lambda *a: None
+                with self.subTest(mode = mode, fused_prefill = True):
+                    fixed, variable = ns[fn.name](host, 0, 7, "cpu", 42, hidden_width = 32)
+                    self.assertEqual(variable, 0)
+                    self.assertGreaterEqual(fixed, 42 * 32 * 4)
 
     def run_case(self, rows, topk, fused_t, recon_enabled, padded, deterministic, batch_size,
-                 mixed = False, weight = 0.375, inexact = False, mode = "hybrid", drop = None):
+                 mixed = False, weight = 0.375, inexact = False, fused_prefill = False, mode = "hybrid",
+                 drop = None):
         cls = next(n for n in ast.parse((ROOT / "exllamav3/model/moe_cpu_host.py").read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == "MoeCpuHost")
         fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_submit_prefill_streamed")
@@ -72,7 +81,8 @@ class StreamDispatcherTests(unittest.TestCase):
         ext = NS()
         ns = dict(torch = torch, np = helpers.np, ext = ext, slot_layout = helpers.slots.slot_layout,
                   plan_groups = helpers.production_groups(),
-                  TUNING = NS(stream_deterministic = deterministic, stream_debug = False, mtile = True))
+                  TUNING = NS(stream_deterministic = deterministic, stream_debug = False, mtile = True,
+                              fused_prefill = fused_prefill))
         exec(compile(ast.Module(body = [fn], type_ignores = []), "<production-stream-dispatch>", "exec"), ns)
         E, h, nd = 4, 16, 32 if padded else 16
         gen = torch.Generator().manual_seed(1234)
@@ -121,8 +131,13 @@ class StreamDispatcherTests(unittest.TestCase):
 
         seen = dict(scratch = [], gather_out_zero = [])
 
-        def fused(*a):
+        fused_rows = []
+
+        def fused(*a, **kw):
+            # Row stripes are requested exactly under fused-only prefill
+            self.assertEqual(kw, {"tile_rows": fused_prefill})
             x, out, ec, tok, w = a[:5]
+            fused_rows.extend(c for c in ec[:-1].tolist() if a[32] <= c <= a[33])
             scratch, bases, lo, hi = a[30:34]
             seen["scratch"].append(scratch is not None)
             off = 0
@@ -164,6 +179,8 @@ class StreamDispatcherTests(unittest.TestCase):
         host._stream_recon_layer = lambda *a: recon
         host._dq_linear = lambda x, trellis, dims, suh, svh, bias, scratch: \
             torch.nn.functional.pad(x*suh[0], (0, dims[1]-x.shape[1]))
+        if fused_prefill:
+            host._dq_linear = Mock(side_effect = AssertionError("per-expert path under fused-only prefill"))
         host._act = lambda spec, g, u: u
         with patch.object(torch.cuda, "stream", lambda _: nullcontext()), \
              patch.object(torch.cuda, "current_stream", lambda: stream):
@@ -212,6 +229,8 @@ class StreamDispatcherTests(unittest.TestCase):
             torch.testing.assert_close(out, expected, rtol = 0, atol = 0)
         self.assertTrue(torch.isfinite(out).all())
         self.assertEqual(host.wseq, math_ceil(len(active), batch_size))
+        if fused_prefill:
+            self.assertEqual(sorted(fused_rows), sorted(counts[e] for e in active))
         return out
 
     def test_dispatch_matrix(self):
@@ -262,6 +281,33 @@ class StreamDispatcherTests(unittest.TestCase):
         self.assertTrue(all(torch.equal(outs[0], o) for o in outs[1:]))
         atomic = self.run_case(129, 6, 64, True, False, False, 2, mixed = True, inexact = True)
         self.assertFalse(torch.equal(atomic, outs[0]))
+
+    def test_fused_only_tier_limit_and_refusal(self):
+        cls = next(n for n in ast.parse((ROOT / "exllamav3/model/moe_cpu_host.py").read_text()).body
+                   if isinstance(n, ast.ClassDef) and n.name == "MoeCpuHost")
+        fns = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+               and n.name in ("_stream_fused_t", "_stream_recon_layer")]
+        tuning = NS(stream_fused_t = 256, fused_prefill = False)
+        ns = dict(TUNING = tuning, FUSED_COUNT_LIMIT = 2**31 - 1)
+        exec(compile(ast.Module(body = fns, type_ignores = []), "<production-fused-tier>", "exec"), ns)
+        good = dict(activation = 0, hi = 16, ho = 16)
+        padded = dict(activation = 0, hi = 16, ho = 32)
+        host = NS(batch_recon = True)
+        self.assertEqual(ns["_stream_fused_t"](host, good, {}, 16), 256)
+        self.assertEqual(ns["_stream_fused_t"](host, padded, {}, 16), 0)
+        tuning.fused_prefill = True
+        self.assertEqual(ns["_stream_fused_t"](host, good, {}, 16), 2**31 - 1)
+        for spec, aux in ((padded, {}), (good, {"bias_u": object()}), (dict(good, activation = 3), {})):
+            with self.subTest(spec = spec, aux = aux), self.assertRaisesRegex(ValueError, "EXL3_MOE_FUSED_PREFILL"):
+                ns["_stream_fused_t"](host, spec, aux, 16)
+        self.assertIsNone(ns["_stream_recon_layer"](host, {"recon": {}}, 0, good, {}, "cpu"))
+
+    def test_fused_only_prefill_fuses_every_expert(self):
+        # _stream_fused_t returns the unbounded tier limit under fused-only prefill: the 513-row
+        # experts go to the fused launches (with row stripes), none to reconstruct or per-expert
+        for batch in (1, 2, 4):
+            with self.subTest(batch = batch):
+                self.run_case(513, 6, 2**31 - 1, False, False, True, batch, fused_prefill = True)
 
 
 def math_ceil(n, d):

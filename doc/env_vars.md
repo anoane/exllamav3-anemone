@@ -448,6 +448,8 @@ regardless of count. The default was 512 while the alternative above it was the 
 loop; with the batched tier there, 128-256 measure best (Qwen3.8 4090 + 3090 split, 4k
 chunks: 512 -> 256 +4%; mistral-small-4 119B full offload on the PRO 6000: +2.8%), and the
 fused temp buffers (concurrency x T x (2 hidden + 2 intermediate) x 2 bytes per device) halve.
+With `EXL3_MOE_FUSED_PREFILL=1` every streamed expert is fused and this is the height of the row
+stripes instead of a tier limit (at least 64, or 16 with `EXL3_MOE_MTILE=0`).
 
 ### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
 
@@ -745,37 +747,135 @@ split (`-gs`) that fit before may need the extra room: on a device with no resid
 streamed layer call for a hidden size of 2048 with top-8 routing at 4096-row chunks.
 
 Measured on DeepSeek-V4.1-Flash on two GPUs, with the experts of 11 layers (12-22) held in RAM
-and every expert those layers select streamed to the second GPU in every call, decode
-included: `EXL3_PLACEMENT='0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1'` (below),
-which gives those layers alone the `stream_only` execution of `EXL3_MOE_CPU_MODE` (`-mcl`
-offloads the first layers and cannot express this), over a 4096-token prefill plus eight
-teacher-forced decode steps: two identical runs
-differed by up to 0.59 in actual-token log-probability (p99 0.062, one top-1 change) with
-atomic accumulation, and were bitwise identical with slots, also with 2048-token chunks.
+and every expert those layers select streamed to the second GPU in every call, decode included:
+`EXL3_PLACEMENT='0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1'` (below), which gives those
+layers alone the `stream_only` execution of `EXL3_MOE_CPU_MODE` (`-mcl` offloads the first layers
+and cannot express this), over a 4096-token prefill plus eight teacher-forced decode steps: two
+identical runs differed by up to 0.59 in actual-token log-probability (p99 0.062, one top-1 change)
+with atomic accumulation, and were bitwise identical with slots, also with 2048-token chunks.
 Prefill time +0.40% (1105 vs 1100 tok/s) and decode +0.65%, two interleaved trials each, a
-difference of the order of their noise. Allocated peaks were unchanged in that layout, where
-the resident MoE layers of the same device already allocate a slot scratch of the same size.
+difference of the order of their noise. Allocated peaks were unchanged in that layout, where the
+resident MoE layers of the same device already allocate a slot scratch of the same size.
 In the default mode, an explicit `EXL3_MOE_STREAM_T=1` streams every selected expert of a
 prefill chunk of at least `EXL3_MOE_STREAM_MIN_ROWS` rows; calls with fewer rows (decode) never
 reach the streamed path, so the decode figure above applies only where decode streams too.
 
 The switch orders the accumulation, nothing else. Results still differ between chunk sizes;
 between tiers (an expert whose row count crosses `EXL3_MOE_STREAM_FUSED_T` or the reconstruct
-row cap takes a different projection path); with the staging-batch partition
-(`EXL3_MOE_STREAM_BATCH_EXPERTS`, `EXL3_MOE_CPU_WSLOT_MB`), which decides the batched
-reconstruct groups and so the batch count and padded row count of their GEMMs (on
+row cap takes a different projection path; `EXL3_MOE_FUSED_PREFILL` removes the tiers); with the
+staging-batch partition (`EXL3_MOE_STREAM_BATCH_EXPERTS`, `EXL3_MOE_CPU_WSLOT_MB`), which decides
+the batched reconstruct groups and so the batch count and padded row count of their GEMMs (on
 DeepSeek-V4.1-Flash, one-expert batches against the default batches differed by p99 0.047, max
 0.22, in actual-token log-probability); between GPU types; on the CPU tail, whose arithmetic is
 its own; and, in the default `compute` mode with `EXL3_MOE_STREAM_T` unset, between processes on
 links slower than about 25 GB/s, where the bandwidth probed on a device's first streamed prefill
 sets the streaming threshold and so which experts run on the CPU tail (set `EXL3_MOE_STREAM_T`
-explicitly for reproducibility across processes; `stream_only` skips the probe). `EXL3_MOE_FUSED_DET=0` restores atomic accumulation on the
-resident and the streamed path alike, for A/B comparisons. `EXL3_MOE_RECON_DET` only matters
-where the batched tier does not write into slot scratch, i.e. with `EXL3_MOE_FUSED_DET=0`: `1`
-accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA recurrent
-decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice partial dot products in a
-fixed order unconditionally (no switch, no cost), so greedy decode on those models is
-reproducible as well.
+explicitly for reproducibility across processes; `stream_only` skips the probe).
+`EXL3_MOE_FUSED_DET=0` restores atomic accumulation on the resident and the streamed path alike,
+for A/B comparisons. `EXL3_MOE_RECON_DET` only matters where the batched tier does not write into
+slot scratch, i.e. with `EXL3_MOE_FUSED_DET=0`: `1` accumulates one expert at a time, `0` with one
+atomic `index_add_`. The GDN/KDA recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their
+per-slice partial dot products in a fixed order unconditionally (no switch, no cost), so greedy
+decode on those models is reproducible as well.
+
+### `EXL3_MOE_FUSED_PREFILL` (default: `0`)
+
+Fused-only MoE prefill. By default a prefill chunk sorts its routed experts into tiers by how many
+rows each one received: experts up to the fused kernel's row capacity (`EXL3_MOE_FUSED_ROWS`,
+`EXL3_MOE_FUSED_ROWS_WIDE` for GPU-resident experts, `EXL3_MOE_STREAM_FUSED_T` for experts
+streamed from system RAM) run through the fused `exl3_moe` kernel, which dequantizes the weights
+inside the GEMM and applies the Hadamard transforms around it; hotter experts take the batched
+reconstruct tier or the per-expert reconstruct path, which materialize FP16 weights and multiply
+with cuBLAS. The tiers compute the same function with different arithmetic, so the result for one
+row depends on how many rows its expert received in the same call: another chunk size, another
+prompt in the same batch, or a longer prefill moves experts between tiers. With `1`, every routed
+expert of every call that takes the fused MoE path (prefill chunks; calls of up to 8 rows keep the
+decode kernels, see below) is computed by the fused kernel, whatever its row count. An expert with
+more rows than the kernel's temp buffers hold runs in row stripes of the buffer height: each stripe
+is finished before the next one reuses the buffers, the expert stays with one group of SMs, and
+each assignment's output goes to its own slot as with `EXL3_MOE_FUSED_DET`, which is required. The
+stripes are a compile-time option of the kernel: every fused MoE kernel instance has a row-striped
+twin, which this setting selects for every row count of the fused path, and the default instances
+that every MoE prefill runs with the setting off are compiled without the stripe code.
+
+What it covers: GPU-resident experts (`BlockSparseMLP`) and experts held in system RAM and
+streamed to the GPU (`-mcl`, `-mcs`, placement `experts=stream`, and the streamed hot experts of
+`compute` layers). What it does not change: the bsz 1-8 decode kernels (`exl3_moe_coop` and the
+native block-sparse MLP's graphs), the CPU worker's arithmetic, routing, shared experts, and which
+experts a call selects. The temp buffers keep their size: the row capacities above become the
+stripe height, and no longer limit the tier.
+
+Values: `0` (default) or `1`. Anything else raises a `ValueError` when `exllamav3` is imported,
+as does `1` together with `EXL3_MOE_FUSED_DET=0` (the setting exists for reproducible arithmetic,
+which atomic accumulation would undo). Read once, at import; set it before importing `exllamav3`.
+`MoeCpuTuning.fused_prefill` holds the streamed tier's copy.
+
+Refused, never a silent fallback to the reconstruct tiers:
+
+- at load, an MoE layer on a GPU whose experts the fused kernel does not implement: not all EXL3,
+  codebooks other than one uniform `mcg` or `mul1`, an activation other than gated SiLU / GELU or
+  gateless ReLU^2, per-expert biases, padded dims, or `infer_params.no_reconstruct`; a
+  `ValueError` names the layer;
+- at load, resident temp buffers smaller than the largest row tile (64 rows with `EXL3_MOE_MTILE`
+  on mul1 experts, else 16; set by `EXL3_MOE_FUSED_ROWS_WIDE` / `EXL3_MOE_FUSED_ROWS`);
+- `EXL3_MOE_STREAM_FUSED_T` below that tile (64, or 16 with `EXL3_MOE_MTILE=0`), when the CPU
+  offload module is first imported, i.e. on the first load with experts held in system RAM;
+- a streamed layer the fused kernel does not implement, when its worst case is measured at load
+  (`EXL3_AUTOSPLIT_WORSTCASE`) or at the latest on its first streamed prefill.
+
+Memory: no new buffers; the fused tier's temp buffers are the ones described under
+`EXL3_MOE_FUSED_ROWS_WIDE` and `EXL3_MOE_STREAM_FUSED_T`, plus the slot scratch of
+`EXL3_MOE_FUSED_DET` (`assignments x hidden x 4` bytes per call). The batched reconstruct tier's
+slabs and dequantized weights and the per-expert path's intermediates are never allocated, and
+the autosplit's worst-case estimate of a layer drops them.
+
+Performance: the fused kernel is the faster tier below the row capacities above; for hot experts it
+dequantizes the expert's weights again for every row tile (64 rows with `EXL3_MOE_MTILE`) where the
+reconstruct tiers dequantize once per call, so long prefill chunks on models with few, hot experts
+slow down most. A traced (not controlled) diagnostic 4096-token prefill of DeepSeek-V4.1-Flash, with
+fixed-row GEMM tiles and a whole-column partition of the fused kernel's K reduction in both runs,
+and 4096-row fused buffers instead of stripes, took 5.37 s with every expert fused against about
+4.43 s with the tiers. The row stripes are compiled into instances of their own, the row-striped
+twins of the 54 fused MoE instances (`quant/comp_units/exl3_moe_inst_*_st.cu`), which only this
+setting selects. With it off every fused MoE launch runs the default instances, whose code the
+stripes do not change: ptxas reports the same registers and spill bytes, and the SASS is identical,
+for all 54 on sm_80, sm_86 and sm_120. The twins carry the stripe code. Their registers are the
+default instances' except in six instance and GPU pairs (k2 and k3 N=128 16-row on sm_86, 124 and
+122 -> 128; k5 and k6 mul1 N=128 16-row on sm_120, 128 -> 127), and ptxas reports more spilling in
+160 of the 162 pairs: about 2.2 times the bytes in the median, from about 1.04 to 14 times, and 17
+pairs that spilled nothing before spill now (bytes stored / loaded: k3 N=256 16-row 68/178 ->
+164/422 on sm_80 and 76/184 -> 136/272 on sm_120; the 64-row tile on sm_86 320/1402 -> 344/1446; k3
+N=128 16-row on sm_86 0/0 at 122 registers -> 52/148 at 128). Measured on its own on
+DeepSeek-V4.1-Flash, in a 32K-token prefill split over an sm_80 and an sm_120 GPU (the experts of 11
+layers computed by the CPU, the others resident): 904 and 906 tok/s with the setting against 997 and
+996 tok/s without (-9%), and a 64K-token teacher-forced NLL of 0.250987 against 0.250437. Build
+cost: 54 more instances, each about as costly to compile as its default unit, about 10 s of compiler
+CPU time per compilation unit for sm_80, sm_86 and sm_120 (38 units) and 135 MiB of objects, 93 MiB
+in an sm_80 + sm_120a build.
+
+Determinism: removes the tier boundaries, so an expert's arithmetic no longer depends on which
+tier its row count selects. On its own it does not make results independent of the row count:
+the fused kernel splits each dot product's K reduction over the SMs of its expert group, and the
+group width follows the number of active experts in the call. Row stripes themselves do not
+change results: `tests/test_moe_stripe_layout_.py` checks bitwise that 64-, 128- and 256-row
+buffers in stripes give the same slots as buffers holding all 700 rows of an expert. Real
+DeepSeek-V4.1-Flash experts (17 to 1025 input rows, 16/64/256-row buffers, both supported row
+tiles, two GPU types) and whole-model scores over 4,104 predictions were bitwise equal between
+striped and full-height buffers, measured together with the other row-count-independent changes.
+
+When to use it: as part of a row-count-independent arithmetic profile, or to take the tier
+boundaries out of a comparison. Keep it off for throughput.
+
+```sh
+EXL3_MOE_FUSED_PREFILL=1 python eval/ppl.py -m /path/to/moe/model
+```
+
+```python
+import os
+os.environ["EXL3_MOE_FUSED_PREFILL"] = "1"      # before importing exllamav3
+from exllamav3.model.math_policy import FUSED_PREFILL
+assert FUSED_PREFILL
+```
 
 ### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
 
@@ -846,7 +946,9 @@ Fused-tier row capacity per expert for layers that use the wide tiles (see `EXL3
 `EXL3_MOE_FUSED_ROWS` still applies to every other layer. With the wide tiles the fused kernel
 beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk on the PRO 6000: 6.87k ->
 7.06k tok/s over 128 rows), at 4 x concurrency x rows x (hidden + intermediate) x 2 bytes of
-static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows).
+static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows). With
+`EXL3_MOE_FUSED_PREFILL=1` this and `EXL3_MOE_FUSED_ROWS` set the height of the fused kernel's row
+stripes instead of the tier limit (at least 64 rows with the wide tiles, 16 without).
 
 ### `EXL3_MOE_BATCH_RECON` (default: `1`), `EXL3_MOE_STREAM_BATCH_RECON` (default: `1`)
 

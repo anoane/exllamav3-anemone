@@ -24,4 +24,27 @@ def hgemm_fixed_rows(environ = None) -> int:
     return 128
 
 
+def fused_prefill_enabled(environ = None) -> bool:
+    """
+    EXL3_MOE_FUSED_PREFILL: 1 computes every GPU-side routed expert of an MoE prefill with the
+    fused kernel, in row stripes of its temp buffers, instead of switching experts with many rows
+    to the reconstruct tiers; unset or 0 keeps the tiers. Needs the slot accumulation of
+    EXL3_MOE_FUSED_DET (default on)
+    """
+    environ = os.environ if environ is None else environ
+    value = environ.get("EXL3_MOE_FUSED_PREFILL", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"EXL3_MOE_FUSED_PREFILL must be 0 or 1, got {value!r}")
+    enabled = value == "1"
+    if enabled and environ.get("EXL3_MOE_FUSED_DET", "1") == "0":
+        raise ValueError("EXL3_MOE_FUSED_PREFILL=1 needs the ordered expert accumulation that "
+                         "EXL3_MOE_FUSED_DET=0 turns off")
+    return enabled
+
+
+# Fused-only prefill: the fused tier's row limit. A selection bound, not a buffer size (the
+# kernel stripes rows through its temp buffers and checks its int32 addressing itself)
+FUSED_COUNT_LIMIT = (1 << 31) - 1
+
 HGEMM_FIXED_ROWS = hgemm_fixed_rows()
+FUSED_PREFILL = fused_prefill_enabled()

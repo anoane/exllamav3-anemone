@@ -4,6 +4,7 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
+from ..model.math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
@@ -547,6 +548,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.support_quant_paths
             )
 
+        # Fused-only prefill never falls back to other expert arithmetic
+        if FUSED_PREFILL and not self.support_fused:
+            if self.config.infer_params.no_reconstruct:
+                raise ValueError(f"{self.key}: EXL3_MOE_FUSED_PREFILL=1 needs the fused MoE kernel, which "
+                                 f"infer_params.no_reconstruct disables")
+            raise ValueError(f"{self.key}: EXL3_MOE_FUSED_PREFILL=1 but these experts are not supported by the "
+                             f"fused MoE kernel (quantization, codebook, activation, biases or padded dims)")
+
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
         H = self.expert_size
@@ -726,6 +735,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.mtile_ok = MTILE and bool(self.multi_up.mul1)
                 self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
                 R = self.fused_rows
+                if FUSED_PREFILL:
+                    # Fused-only prefill: every expert row count takes the fused tier; the kernel
+                    # runs larger experts in row stripes of these R-row buffers, which must hold
+                    # the largest row tile
+                    if R < (64 if self.mtile_ok else 16):
+                        raise ValueError(f"{self.key}: EXL3_MOE_FUSED_PREFILL=1 needs fused temp buffers of at least "
+                                         f"{64 if self.mtile_ok else 16} rows (EXL3_MOE_FUSED_ROWS_WIDE / "
+                                         f"EXL3_MOE_FUSED_ROWS)")
+                    self.fused_rows = FUSED_COUNT_LIMIT
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
                 self.fused_mode_buffers = FusedBuffers(
                     temp_state_g = g_tensor_cache.get(device, (C, R, H), torch.half, "moe2_temp_state_g"),
@@ -868,6 +886,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         fixed = (rows + 1) * h * 4 + rows * h * 2
         if FUSED_DET:
             fixed += (int(assignments * PAD_MAX) + 1) * h * 4
+        if FUSED_PREFILL:
+            # Every routed row takes the fused kernel, whose temp buffers are persistent
+            return fixed, 0
         r = min(rows, assignments)
         isz = (self.interm_dtype or torch.float).itemsize
         per_expert = r * (2 * self.intermediate_size_padded * isz + 2 * h * 2 + h * 4)
@@ -1112,15 +1133,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Count how many assignments per expert. With few enough total assignments no
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
+                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused.
+                # The bound is the temp buffers' rows, which equals fused_rows except under
+                # fused-only prefill, where larger calls keep the host-side tier plan (and with it
+                # the wide row tiles)
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                if (self.fused_mode_buffers is not None and
+                        num_tokens * top_k <= self.fused_mode_buffers.temp_state_g.shape[1]):
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
 
                 # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
-                # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
+                # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond.
+                # Fused-only prefill (FUSED_PREFILL): fused_rows has no limit, every expert is fused
                 recon = None
                 groups = []
                 min_rows = 0
@@ -1131,7 +1157,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if self.fused_mode_buffers is not None:
                         min_rows = self.fused_rows
                         fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
-                    recon = self._batch_recon_layer(y)
+                    recon = None if FUSED_PREFILL else self._batch_recon_layer(y)
                     if recon is not None:
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
                         heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
@@ -1216,7 +1242,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.act_limit,
                         num_active,
                         scratch, tables[0] if tables is not None else None,
-                        count_lo, count_hi, m_tile
+                        count_lo, count_hi, m_tile,
+                        tile_rows = FUSED_PREFILL
                     )
 
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency

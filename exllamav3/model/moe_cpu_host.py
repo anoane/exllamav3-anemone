@@ -8,6 +8,7 @@ import torch
 from ..ext import exllamav3_ext as ext
 from .moe_expert_policy import validate_streaming, streamed_experts
 from .moe_stream_slots import slot_layout, slot_rows_bound
+from .math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
@@ -133,6 +134,13 @@ class MoeCpuTuning:
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+        # Fused-only prefill (EXL3_MOE_FUSED_PREFILL, model/math_policy.py): every streamed expert
+        # takes the fused kernel, in row stripes of its temp buffers (EXL3_MOE_STREAM_FUSED_T
+        # rows), which must hold the largest row tile
+        self.fused_prefill = FUSED_PREFILL
+        if self.fused_prefill and self.stream_fused_t < (64 if self.mtile else 16):
+            raise ValueError(f"EXL3_MOE_FUSED_PREFILL=1 needs EXL3_MOE_STREAM_FUSED_T >= "
+                             f"{64 if self.mtile else 16} (the fused kernel's largest row tile)")
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -1381,18 +1389,27 @@ class MoeCpuHost:
                 counts_h, flat, shifted, neg)
 
     def _stream_fused_t(self, spec, aux, h):
-        """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
-        (same rule as support_fused on the GPU side: silu/gelu gated or relu2 gateless, no
-        per-expert biases, no padded dims)"""
-        return TUNING.stream_fused_t if (
+        """Fused-tier row limit for a streamed layer, 0 when the layer isn't eligible (same rule
+        as support_fused on the GPU side: silu/gelu gated or relu2 gateless, no per-expert
+        biases, no padded dims). With fused-only prefill every row count is fused (the kernel
+        stripes rows through its temp buffers) and an ineligible layer is an error"""
+        eligible = (
             spec["activation"] in (0, 1, 2) and spec["hi"] == h and spec["ho"] == h
             and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))
-        ) else 0
+        )
+        if TUNING.fused_prefill:
+            if not eligible:
+                raise ValueError("CPU MoE: EXL3_MOE_FUSED_PREFILL=1 but a streamed layer's experts are not "
+                                 "supported by the fused kernel (activation, per-expert biases or padded dims)")
+            return FUSED_COUNT_LIMIT
+        return TUNING.stream_fused_t if eligible else 0
 
     def _stream_recon_layer(self, st, layer_idx, spec, aux, device):
         """Batched reconstruct tier state for a streamed layer, built once per (device,
-        layer); None when disabled or the experts carry biases (a batched add would be needed)"""
-        if not self.batch_recon or any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d")):
+        layer); None when disabled, under fused-only prefill, or when the experts carry biases (a
+        batched add would be needed)"""
+        if (TUNING.fused_prefill or not self.batch_recon
+                or any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))):
             return None
         recon = st["recon"].get(layer_idx)
         if recon is None:
@@ -1465,7 +1482,9 @@ class MoeCpuHost:
         # Without the caller's logical width, budget the cropped temporary conservatively.
         direct_slots = slot_mode and pd["d"][1] == hidden_width
         batched = recon.worst_case_bytes(A, slot_mode = direct_slots) if recon is not None else 0
-        return fixed, max(per_expert, batched)
+        # Fused-only prefill: no reconstruct or per-expert working set (the fused tier's temp
+        # buffers are persistent)
+        return fixed, 0 if TUNING.fused_prefill else max(per_expert, batched)
 
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
                                  streamed, st, counts_h, flat, shifted, neg):
@@ -1535,9 +1554,9 @@ class MoeCpuHost:
         blocks = self.layer_blocks[layer_idx] if self.pinned else None
 
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;
-        # experts too hot for the temp buffers take the per-expert reconstruct path. Same
-        # eligibility as support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2
-        # gateless, no per-expert biases, no padded dims
+        # experts too hot for the temp buffers take the reconstruct tiers. Same eligibility as
+        # support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2 gateless, no
+        # per-expert biases, no padded dims. Fused-only prefill fuses every expert (row stripes)
         fused_t = self._stream_fused_t(spec, aux, h)
         recon = self._stream_recon_layer(st, layer_idx, spec, aux, y.device)
         recon_ctx = None
@@ -1636,7 +1655,8 @@ class MoeCpuHost:
 
             # Mid tier: one fused kernel over the batch's cooler experts. Heavy experts stay in
             # the descriptor (the kernel skips counts above the temp-row capacity) so the
-            # token_sorted segments line up with expert_count
+            # token_sorted segments line up with expert_count. Under fused-only prefill every
+            # expert is in this tier, the larger ones in row stripes
             n_fused = sum(1 for _, e, _, _ in per_e if counts_h[e] <= fused_t) if fused_t else 0
             if TUNING.stream_debug:
                 print(f" --   batch L{layer_idx} ws{ws}: {len(batch)} experts, fused_t {fused_t}, "
@@ -1688,7 +1708,8 @@ class MoeCpuHost:
                         tblt[6], tblt[7], tblt[8],
                         False, True, False, True, False, True,
                         float(spec["act_limit"] or 0.0), n_act,
-                        scratch, tblt[9] if deterministic else None, lo, hi, mt
+                        scratch, tblt[9] if deterministic else None, lo, hi, mt,
+                        tile_rows = TUNING.fused_prefill
                     )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
