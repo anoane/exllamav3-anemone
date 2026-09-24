@@ -40,6 +40,7 @@ from typing_extensions import override
 from ..util.file import no_default
 from ..model.config import Config
 from ..model.model import Model
+from ..model.placement import parse as parse_placement
 from .dsv41 import numerics, pipeline
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
@@ -435,7 +436,7 @@ class DeepseekV41Model(Model):
       - the routed MoE is DSV41MoE, whose load asks the load guard
         (dsv41/placement.py) whether a change of device falls where nothing
         is shared across it. Which experts are kept in system RAM is -mcl /
-        -mcs, as for every MoE model
+        -mcs or the explicit placement (EXL3_PLACEMENT), as for every MoE model
     """
 
     config_class = DeepseekV41Config
@@ -443,7 +444,7 @@ class DeepseekV41Model(Model):
     def __init__(self, config: DeepseekV41Config, **kwargs):
         super().__init__(config, **kwargs)
         from .dsv41.cache_plan import CachePlan
-        from .dsv41.placement import DSV41LoadGuard
+        from .dsv41.placement import DSV41LoadGuard, check_placement
         from ..modules import Embedding, RMSNorm, Linear, GatedMLP, ExpandStreams
         from ..modules.dsv41 import DSV41Attention
         from ..modules.dsv41_engram import DSV41Engram
@@ -455,6 +456,12 @@ class DeepseekV41Model(Model):
 
         c = config
 
+        # The explicit placement (EXL3_PLACEMENT / --placement / config.infer_params.placement),
+        # checked now, before a Cache can be built for this model, and again at load: every
+        # change of device it makes must be a free cut (architecture/dsv41/placement.py)
+        placement = parse_placement(getattr(c.infer_params, "placement", None))
+        if placement is not None:
+            check_placement(placement, c)
         # Every compressed layer reads its kv source's pool
         self.cache_plan = CachePlan(c.compress_ratios, c.kv_source_layer_ids)
         # Shared by every DSV41MoE: while load_gen runs, fails fast when the autosplit
@@ -747,12 +754,13 @@ class DeepseekV41Model(Model):
     def load_gen(self, *args, **kwargs):
         """
         Model.load_gen (Model.load goes through here too), with V4.1's load checks around
-        it: tensor-parallel loading is refused before anything loads; while the autosplit
-        runs, the load guard refuses a change of device that is not a free cut when a Cache
-        is attached (architecture/dsv41/placement.py); afterwards every compressed layer is
-        checked against the device of the pool it reads.
+        it: tensor-parallel loading and an explicit placement that changes device where it may
+        not are refused before anything loads; while the autosplit runs, the load guard refuses
+        a change of device that is not a free cut when a Cache is attached
+        (architecture/dsv41/placement.py); afterwards every compressed layer is checked against
+        the device of the pool it reads.
         """
-        from .dsv41.placement import TP_REFUSAL
+        from .dsv41.placement import TP_REFUSAL, check_placement
         a = inspect.signature(Model.load_gen).bind(self, *args, **kwargs)
         a.apply_defaults()
         a = a.arguments
@@ -774,6 +782,10 @@ class DeepseekV41Model(Model):
                     f"{chunk}, or lower EXL3_DSV41_PIPELINE_CHUNK")
         if a["tensor_p"]:
             raise NotImplementedError(TP_REFUSAL)
+        # the explicit placement set now, which may have changed since the model was built
+        placement = parse_placement(getattr(self.config.infer_params, "placement", None))
+        if placement is not None:
+            check_placement(placement, self.config)
         self.load_guard.begin()
         try:
             yield from super().load_gen(*args, **kwargs)

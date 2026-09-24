@@ -1,9 +1,15 @@
 from __future__ import annotations
 from typing_extensions import override
 import os
+import re
 import torch
 from ..ext import exllamav3_ext as ext
 from ..model.moe_expert_policy import execution_mode
+from ..model.placement import parse as parse_placement, expert_plan
+
+# The decoder layer a module belongs to, from its key ("model.layers.12.mlp"), for modules
+# that do not carry layer_idx themselves
+_LAYER_KEY = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
@@ -90,11 +96,40 @@ def run_pending_swap_sweeps(infer_params):
 
 class BlockSparseMLP_CPU:
 
+    def placement_plan(self):
+        """(storage, mode, split_k) of this layer under an explicit placement (model/placement.py),
+        or None without one; only the text component is placed"""
+        ip = self.config.infer_params
+        placement = parse_placement(getattr(ip, "placement", None))
+        if placement is None or getattr(ip, "moe_cpu_component", "text") != "text":
+            return None
+        layer_idx = self.layer_idx
+        if layer_idx is None:
+            m = _LAYER_KEY.search(self.key or "")
+            if m is None:
+                raise ValueError(f"placement: cannot tell which decoder layer {self.key} belongs to")
+            layer_idx = int(m.group(1))
+        return expert_plan(placement, layer_idx, self.num_experts)
+
     def cpu_expert_mode(self) -> str:
-        """Execution mode of this layer's RAM-held experts (model/moe_expert_policy.py): "stream"
-        when infer_params.moe_cpu_mode is "stream_only", else "hybrid". Read when the layer
-        registers with the worker"""
+        """Execution mode of this layer's RAM-held experts (model/moe_expert_policy.py): the
+        placement's, else "stream" when infer_params.moe_cpu_mode is "stream_only", else "hybrid".
+        Read when the layer registers with the worker"""
+        plan = self.placement_plan()
+        if plan is not None:
+            return plan[1]
         return execution_mode(getattr(self.config.infer_params, "moe_cpu_mode", "compute"))
+
+    def _cpu_eligible(self, device) -> bool:
+        """Whether the CPU worker can hold this layer's routed experts: a CUDA device, every
+        expert local to the module (not a tensor-parallel shard) and an activation the worker
+        implements. load_cpu_offload / load_cpu_split then probe the weights themselves (mul1
+        codebook, K <= 8, uniform per-expert biases)"""
+        return (
+            device is not None and torch.device(device).type == "cuda" and
+            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
+        )
 
     def _cpu_init_state(self):
         self.cpu_offload = False
@@ -107,6 +142,17 @@ class BlockSparseMLP_CPU:
         skips its GPU load entirely on True."""
         ip = self.config.infer_params
         comp = getattr(ip, "moe_cpu_component", "text")
+        plan = self.placement_plan()
+        if plan is not None:
+            if plan[0] != "ram":
+                return False
+            # The placement asks for this layer. Experts that silently stayed in VRAM would
+            # overfill a device planned without them, so ineligibility is an error here
+            if not self._cpu_eligible(device) or not self.load_cpu_offload(device, **kwargs):
+                raise RuntimeError(f"placement: {self.key} cannot hold its routed experts in system RAM "
+                                   f"(see any message above); use experts=vram for this layer")
+            ip.moe_cpu_offload_assigned[comp] = ip.moe_cpu_offload_assigned.get(comp, 0) + 1
+            return True
         budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
             else getattr(ip, "draft_moe_cpu_offload", 0)
         if budget:
@@ -117,9 +163,7 @@ class BlockSparseMLP_CPU:
         if (
             budget > 0 and
             ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
-            device is not None and torch.device(device).type == "cuda" and
-            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
+            self._cpu_eligible(device)
         ):
             if self.load_cpu_offload(device, **kwargs):
                 ip.moe_cpu_offload_assigned[comp] = ip.moe_cpu_offload_assigned.get(comp, 0) + 1
@@ -132,6 +176,16 @@ class BlockSparseMLP_CPU:
         on the CPU worker): shrinks the module to its GPU slice; the caller's normal load
         then loads that slice."""
         ip = self.config.infer_params
+        plan = self.placement_plan()
+        if plan is not None:
+            if plan[0] != "split" or self.cpu_split_first is not None:
+                return
+            if not (self._cpu_eligible(device) and self.routing_first is None) or \
+                    not self.load_cpu_split(device, plan[2], **kwargs):
+                raise RuntimeError(f"placement: {self.key} cannot hold {plan[2]} of its routed experts in "
+                                   f"system RAM (see any message above); use experts=vram for this layer")
+            ip.moe_cpu_split_assigned = getattr(ip, "moe_cpu_split_assigned", 0) + 1
+            return
         # Registration shrinks the module to its GPU slice, then the normal load below loads
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
         # is its construction-time default)
@@ -155,9 +209,8 @@ class BlockSparseMLP_CPU:
         if (
             0 < split_k < self.num_experts and
             self.cpu_split_first is None and
-            device is not None and torch.device(device).type == "cuda" and
-            self.num_local_experts == self.num_experts and self.routing_first is None and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
+            self.routing_first is None and
+            self._cpu_eligible(device)
         ):
             if self.load_cpu_split(device, split_k, **kwargs):
                 ip.moe_cpu_split_assigned = getattr(ip, "moe_cpu_split_assigned", 0) + 1
@@ -325,8 +378,10 @@ class BlockSparseMLP_CPU:
         # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
         # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
         # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
+        plan = self.placement_plan()
         if (
-            int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
+            (int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 or
+             (plan is not None and plan[0] == "split")) and
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         ):
             return False

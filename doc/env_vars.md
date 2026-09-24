@@ -284,7 +284,9 @@ shared memory; the parent's forward pass never blocks on the CPU. During prefill
 additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
 dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
 thread configuration, and the knobs below for tuning the split. `EXL3_MOE_CPU_MODE=stream_only`
-keeps the experts in system RAM but computes all of them on the GPU instead (see below).
+keeps the experts in system RAM but computes all of them on the GPU instead (see below). To choose
+the layers (not only the first N) and their mode per layer, use an explicit placement
+(`EXL3_PLACEMENT`, under Model loading), which replaces `-mcl`, `-mcs` and `-mcm`.
 
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
@@ -318,10 +320,12 @@ when the first offloaded layer loads. Refusing a value is never a silent fallbac
 
 When it is read: every offloaded layer reads it once, when it registers with the worker during
 `model.load()`, and keeps that mode until it is unloaded; set it before loading (changing the
-attribute afterwards affects the next load). An MTP head shares its model's config and so its
-setting. `model_init` copies the setting to a draft model loaded from its own directory; a
-Python script that builds the draft's `Config` itself sets the draft's attribute (or relies on
-the variable, which every `Config` reads).
+attribute afterwards affects the next load). With an explicit placement (`EXL3_PLACEMENT`) each
+layer's `experts=` decides instead (`stream` is this mode, `cpu` and `split` are `compute`), and
+this setting must stay `compute`. An MTP head shares its model's config and so its setting.
+`model_init` copies the setting to a draft model loaded from its own directory; a Python script
+that builds the draft's `Config` itself sets the draft's attribute (or relies on the variable,
+which every `Config` reads).
 
 Refused at load under `stream_only`, before the worker starts, instead of computing on the CPU:
 
@@ -647,7 +651,9 @@ streamed layer call for a hidden size of 2048 with top-8 routing at 4096-row chu
 
 Measured on DeepSeek-V4.1-Flash on two GPUs, with the experts of 11 layers (12-22) held in RAM
 and every expert those layers select streamed to the second GPU in every call, decode
-included (`EXL3_MOE_CPU_MODE=stream_only`, below), over a 4096-token prefill plus eight
+included: `EXL3_PLACEMENT='0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1'` (below),
+which gives those layers alone the `stream_only` execution of `EXL3_MOE_CPU_MODE` (`-mcl`
+offloads the first layers and cannot express this), over a 4096-token prefill plus eight
 teacher-forced decode steps: two identical runs
 differed by up to 0.59 in actual-token log-probability (p99 0.062, one top-1 change) with
 atomic accumulation, and were bitwise identical with slots, also with 2048-token chunks.
@@ -878,6 +884,83 @@ margin is added on top of the measured transient in that physical check, coverin
 forward keeps live around a module (recurrent test states, gathered embeddings, allocator
 slack). `0` disables the margin.
 
+### `EXL3_PLACEMENT` (default: unset)
+
+Experimental. Default for `Config.infer_params.placement`, which `-placement` / `--placement`
+sets in `model_init`-based scripts: an explicit placement of the text model, for any model in
+layer-split mode. One rule per range of decoder layers gives their GPU and, for MoE layers, where
+the routed experts live:
+
+```
+<layers>=cuda:<n> [experts=vram|stream|cpu|split] [cpu=<k>]
+```
+
+Layers are `7`, `0-11`, `0-3,8-11`, `*` (every layer no other rule lists), `embed` (the modules
+before the first layer) or `head` (after the last); rules are separated by `;` or newlines, `#`
+starts a comment. `experts=vram` (default) keeps the experts in the GPU's memory, `stream` keeps
+them in system RAM and computes them on the layer's GPU only (as `-mcl` with
+`EXL3_MOE_CPU_MODE=stream_only`), `cpu` computes them on the CPU worker (as `-mcl`), and
+`split cpu=<k>` keeps `k` of every layer's routed experts on the worker (as `-mcs k`). The complete
+grammar, the loader's behaviour and worked examples are in [placement.md](placement.md).
+
+No placement: unset, empty, or only whitespace, `;` and `#` comments; `--placement ""` clears a
+set variable; the Python attribute `None` (or `""`). The autosplit and `-mcl` / `-mcs` / `-mcm`
+then decide, as before. A whole value of `none`, `off`, `auto`, `default`, `0` or `false` is
+refused with a `ValueError`, not read as "no placement" (placement.md, "No placement", says why
+and lists every spelling).
+
+When it is read: the variable when a `Config` is created (a malformed value raises a `ValueError`
+there); `--placement` when `model_init` builds the `Config`, overriding the variable; the Python
+attribute (a string or a parsed `Placement`) when `model.load()` starts, or, for
+DeepSeek-V4.1, already when the model object is built and again at load (placement.md,
+"DeepSeek-V4.1"). Set it before loading, and for DeepSeek-V4.1 before `Model.from_config`.
+
+What it does at load: every module loads on the device its rule gives, with the autosplit's
+measuring forward and headroom checks. `-gs` / `use_per_device` / `reserve_per_device` still cap
+each device's memory, but never move a module: a module that does not fit is a `RuntimeError`
+naming the module, its device and the loader's reason (the headroom it needs includes the
+transients of `EXL3_AUTOSPLIT_WORSTCASE`, among them a quantized cache's staging,
+`EXL3_QC_STAGING`). An MoE layer whose rule asks for RAM-held experts but cannot hold them
+(unsupported activation, not mul1, K > 8, mixed per-expert biases) is a `RuntimeError`, not a
+silent fallback to VRAM.
+
+Refused with a `ValueError` before anything loads: together with `-mcl` / `EXL3_MOE_CPU_OFFLOAD`,
+`-mcs` / `EXL3_MOE_CPU_SPLIT`, `-mcm` / `EXL3_MOE_CPU_MODE` other than `compute` or
+`EXL3_MOE_CPU_SPLIT_LAYERS` (all of which it replaces); with a single-device or tensor-parallel
+load; when a rule names a layer the model does not have or a layer is placed by no rule or by
+two; when a device is not visible or the budgets exclude it; and when one GPU holds both `stream`
+layers and `cpu` / `split` layers (one kind of RAM-held experts per GPU). DeepSeek-V4.1 adds a
+rule of its own on where the device may change (placement.md, "DeepSeek-V4.1").
+
+Scope: the text component only. A draft model loaded from its own directory, an MTP head and a
+vision tower load as without it; `model_init` clears the placement of a draft model's config, and
+a script that builds a draft `Config` itself sets `draft_config.infer_params.placement = None`
+(every `Config` reads the variable). `-dmcl` experts are computed by the CPU worker under a
+placement, since `-mcm` is refused next to it.
+
+Cost: none of its own. Each change of device between consecutive modules copies the running
+state once per forward pass, as any split does; the expert modes cost what `-mcl`, `-mcs` and
+`EXL3_MOE_CPU_MODE` cost. Determinism: the same placement gives the same devices on every load,
+and it computes nothing differently from older settings that describe the same layout (on
+DeepSeek-V4.1-Flash, an earlier revision of this code gave 64K-token scores through the placement
+bitwise identical to the same layout set up with model-specific expert settings this code no
+longer has; not repeated on this code).
+
+When to use it: to fix a split independently of free memory, to choose which layers keep their
+experts in system RAM (not only the first N) and how each is computed, or to order the GPUs.
+
+```sh
+python examples/chat.py -m /path/to/model --placement "0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1"
+EXL3_PLACEMENT="*=cuda:0; 50-59=cuda:0 experts=cpu" python eval/perf.py -m /path/to/model
+```
+
+```python
+config = Config.from_directory(model_dir)
+config.infer_params.placement = "0-23=cuda:0; 24-47=cuda:1 experts=split cpu=64"
+model = Model.from_config(config)
+model.load()
+```
+
 ### `EXL3_VISION_PINNED` (default: `0`)
 
 Default for `Config.infer_params.vision_pinned`: store the vision component's linear-layer
@@ -980,8 +1063,9 @@ architecture before any work, saying why.
 DeepSeek-V4.1 loads across several GPUs as a layer split, like every other model: split budgets
 (`-gs` / `use_per_device`, or `reserve_per_device`, or neither, which lets the autosplit use every
 visible device) and the autosplit, which fills the devices in layer order until each budget runs
-out. V4.1 adds one rule about where the device may change. There is nothing to set: no variable,
-no config attribute, no option.
+out, or an explicit placement (`EXL3_PLACEMENT` / `--placement`, [placement.md](placement.md)),
+which names every layer's device. V4.1 adds one rule about where the device may change. It has
+no V4.1 setting: no variable, no config attribute, no option of its own.
 
 Why the rule exists. A V4.1 compressed layer does not keep its own compressed KV. The kv source of
 each group owns one paged pool and every other layer of the group reads it: on
@@ -1006,6 +1090,9 @@ that no layer at or past `c` reads a pool, a top-k selection or candidate blocks
 | 20 | 0-19 | 20-39 |
 
 Every other layer lies inside a kv group. Without a Cache any layer works, at a cost (below).
+An explicit placement must change device at free cuts too, with or without a Cache: one that
+does not is refused when the model object is built ([placement.md](placement.md),
+"DeepSeek-V4.1").
 
 Steering the autosplit. The change of device falls where a budget runs out, so place it with the
 budgets: give each device room for the layers it should hold and their share of the Cache, and
@@ -1039,7 +1126,7 @@ What fails, and when:
 
   When no free cut lies above the change (layers 21-39 on Flash), the second way reads `room for
   layers <k>-39 as well, so that no change of device is left`. Load again with the budgets
-  changed.
+  changed, or with an explicit placement that changes device at a free cut.
 - A Cache built after the load: the load succeeds and prints the note below, and the first cached
   forward of a layer whose pool is on another device raises a `RuntimeError`, e.g.
   `layers.12.attn: the compressed-KV pool it reads (layers.8) is on cuda:0, but this layer is on cuda:1. A Cache needs the layers that share a pool on one device: reload with every change of device at layer 1, 2, 8, 14 or 20 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs")`.
@@ -1064,9 +1151,12 @@ fail at layer 18.
 Other loads: a load on one device (`model.load(device = ...)`, one budget, or a single visible
 device) changes device nowhere and needs nothing. Tensor-parallel loading (`-tp`,
 `tensor_p = True`) is refused before anything loads, with `NotImplementedError: DeepSeek-V4.1:
-tensor-parallel loading is not implemented; load it as a layer split (-gs / use_per_device)`.
-`-mcl` / `-mcs` decide which routed experts stay in system RAM exactly as for every other MoE
-model; they change the sizes above, not the rule.
+tensor-parallel loading is not implemented; load it as a layer split (-gs / use_per_device), or
+with an explicit placement (EXL3_PLACEMENT / --placement)`. `-mcl` / `-mcs` (or the `experts=` of
+an explicit placement) decide which routed experts stay in system RAM exactly as for every other
+MoE model; they change the sizes above, not the rule. With an explicit placement the loader puts
+every layer where the placement says, whatever the budgets would do; placement.md,
+"DeepSeek-V4.1", describes when V4.1 reads it and what it checks at load.
 
 Determinism: where the change of device falls changes no arithmetic of V4.1's own code. As at any
 layer split, which GPU runs a layer can change the results of the kernels on that layer.
@@ -1088,6 +1178,10 @@ model = Model.from_config(config)
 cache = Cache(model, max_num_tokens = 262144)       # attached before the load: a cut kv group fails at once
 model.load(use_per_device = [36, 90])
 ```
+
+The same layout written as an explicit placement fixes the change of device whatever the budgets
+leave room for: `--placement "0-13=cuda:0 experts=split cpu=192; 14-39=cuda:1 experts=split cpu=192"`
+(the placement replaces `-mcs`, so the experts go in its rules).
 
 ### `EXL3_DSV41_NUMERICS` (default: `deepseek:index`)
 
@@ -1394,12 +1488,13 @@ load/unload):
   before the split, and the split before the last layer that writes the cache (a split that
   leaves only the final norm and head on the second GPU gains nothing and is not pipelined).
   Every V4.1 layer owns a sliding-window ring whose shift both halves must agree on, so a first
-  half without a layer cannot be pipelined; an autosplit whose first GPU cannot hold layer 0
-  leaves only the stream expansion there (the embedding is in system RAM);
+  half without a layer cannot be pipelined; an autosplit without a placement whose first GPU
+  cannot hold layer 0 leaves only the stream expansion there (the embedding is in system RAM);
 - no layer before the split with experts in system RAM: both stages would feed the same CPU-MoE
   worker, which is not thread-safe. `-mcl` offloads the first N MoE layers and `-mcs` a share of
-  every layer, so either one makes a split load ineligible; the pipeline applies to a split with
-  every expert in VRAM;
+  every layer, so either one makes a split load ineligible. An explicit placement can keep
+  RAM-held experts past the split only, e.g. `0-13=cuda:0; 14-22=cuda:1 experts=stream;
+  23-39=cuda:1`, which stays eligible;
 - no repeated layer instances (`layer_map`).
 
 With the switch on, every load prints one line: whether it is pipelinable and, if not, why
@@ -1450,8 +1545,8 @@ extra CUDA stream on the first GPU, and one worker thread per sub-chunk.
 
 Performance: measured on DeepSeek-V4.1-Flash split at layer 12 across two GPUs, with the routed
 experts of layers 12-22 held in system RAM and streamed to the second GPU (past the split, so
-eligible; `-mcl` and `-mcs` cannot place experts that way), 4096-token sub-chunks,
-65,024 prompt tokens in four direct `model.prefill` calls of up to 16,384 tokens followed by a
+eligible; `-mcl` and `-mcs` cannot place experts that way), 4096-token sub-chunks, 65,024
+prompt tokens in four direct `model.prefill` calls of up to 16,384 tokens followed by a
 512-token continuation: 82.4 s plain and 67.2 s pipelined (1.23x) with the split crossing as in
 this code (FP32 residual streams) and every GPU arithmetic path fixed to be independent of the
 row count; 54.4 s and 40.6 s (1.34x) in a build with other options on as well, among them

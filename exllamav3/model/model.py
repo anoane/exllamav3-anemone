@@ -416,6 +416,35 @@ class Model(Model_TPMixin, Model_LSMixin):
                 cache.initialized = False
 
 
+    def _resolve_placement(self, device, tensor_p):
+        """
+        The explicit placement of this load (model/placement.py), checked against the model and
+        the load arguments before anything loads, or None. Leaves infer_params.placement parsed
+        """
+        import os
+        from .placement import parse, conflicts
+        from .moe_expert_policy import parse_cpu_mode
+        ip = self.config.infer_params
+        placement = parse(getattr(ip, "placement", None))
+        ip.placement = placement
+        if placement is None:
+            return None
+        # an invalid mode is reported as such, not as a setting the placement replaces
+        parse_cpu_mode(getattr(ip, "moe_cpu_mode", "compute"))
+        bad = conflicts(ip, os.environ)
+        if bad:
+            raise ValueError(f"placement '{placement}' replaces, and cannot be combined with: {', '.join(bad)}")
+        if device is not None or tensor_p:
+            raise ValueError(f"placement '{placement}' needs a layer-split load, not load(device = ...) or tensor_p")
+        # decoder layers only: a negative layer_idx marks a module that belongs to a layer (PLE)
+        placement.layer_map(m.layer_idx for m in self.modules if m.layer_idx is not None and m.layer_idx >= 0)
+        visible = torch.cuda.device_count()
+        missing = [i for i in placement.cuda_indices() if i >= visible]
+        if missing:
+            raise ValueError(f"placement uses cuda:{missing[0]}, but only {visible} CUDA device(s) are visible")
+        return placement
+
+
     def load_gen(
         self,
         device: torch.device | str | int | None = None,
@@ -532,6 +561,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         # shares the config but loads after the main model's worker has already started)
         self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
 
+        # An explicit placement names the device of every decoder layer. It applies to the text
+        # component, whose layers its indices name
+        placement = None
+        if getattr(self, "component", "text") == "text":
+            placement = self._resolve_placement(device, tensor_p)
+
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."
 
@@ -582,6 +617,14 @@ class Model(Model_TPMixin, Model_LSMixin):
                     if x > 0
                 ]
 
+            if placement is not None:
+                # Budgets only cap memory: every device the placement names must have one
+                unusable = [i for i in placement.cuda_indices() if i not in active_devices]
+                if unusable:
+                    raise ValueError(f"placement uses cuda:{unusable[0]}, which the memory budget excludes "
+                                     f"(use_per_device 0 or missing, or reserve_per_device < 0)")
+                active_devices = placement.cuda_indices()
+
             # Split load
             if not tensor_p:
                 yield from self._load_autosplit(
@@ -600,6 +643,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     max_batch_size,
                     self.cache_weakrefs,
                     autosplit_no_forward,
+                    placement = placement,
                 )
                 self.output_device = self.modules[-1].device
 

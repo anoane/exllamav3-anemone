@@ -21,6 +21,12 @@ how to move the change with the split budgets (-gs / use_per_device / reserve_pe
 Without a Cache any cut loads: the stateless path copies the pools, selections and candidate
 blocks a layer on another device reads, whole, in every forward.
 
+An explicit placement (EXL3_PLACEMENT / --placement / config.infer_params.placement,
+model/placement.py) names the device of every layer, and DeepseekV41Model reads it when the model
+object is built and again at load (check_placement): every change of device between its decoder
+layers must be a free cut too, since nothing would provide a pool, a selection or candidate
+blocks on the other device.
+
 This module imports only the standard library at module scope (torch is imported inside
 DSV41LoadGuard.check), so tests and tools that must not import the compiled extension can load
 it by path.
@@ -30,10 +36,12 @@ from __future__ import annotations
 
 # Why DeepseekV41Model.load_gen and DSV41MoE.make_tp_allocation refuse tensor-parallel loading
 TP_REFUSAL = ("DeepSeek-V4.1: tensor-parallel loading is not implemented; load it as a layer "
-              "split (-gs / use_per_device)")
+              "split (-gs / use_per_device), or with an explicit placement (EXL3_PLACEMENT / "
+              "--placement)")
 
 # Where the loading rules are documented, for the messages
 DOC_REF = 'doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs"'
+PLACEMENT_DOC_REF = 'doc/placement.md, "DeepSeek-V4.1"'
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +170,27 @@ def free_cuts(topo) -> list[int]:
     return [c for c in range(1, topo.num_hidden_layers) if not any(crossings(topo, c))]
 
 
+def split_what(topo, cut: int, below = None) -> str:
+    """
+    What a change of device at layer `cut` separates, first match of: the pool of a kv group,
+    a top-k selection, candidate blocks; `below` names the device of the producer.
+    """
+    n = topo.num_hidden_layers
+    on = f", which is on {below}" if below is not None else ""
+    pools, topk, cand = crossings(topo, cut)
+    if pools:
+        src = min(s for s, _ in pools)
+        last = max(i for i in range(n) if topo.kv_source_for(i) == src)
+        return f"layers {src}-{last} share the compressed-KV pool of layers.{src}{on}"
+    if topk:
+        src = min(s for s, _ in topk)
+        readers = format_layer_ranges(i for s, i in topk if s == src)
+        return f"layers {readers} reuse the top-k selection of layers.{src}{on}"
+    src = min(s for s, _ in cand)
+    readers = format_layer_ranges(i for s, i in cand if s == src)
+    return f"layers {readers} mask their index scores to the candidate blocks of layers.{src}{on}"
+
+
 def cut_message(topo, cut: int, below, above, free = None) -> str:
     """
     Why a change of device at layer `cut` (from device `below` to `above`) cannot take a Cache,
@@ -169,21 +198,7 @@ def cut_message(topo, cut: int, below, above, free = None) -> str:
     """
     n = topo.num_hidden_layers
     free = free_cuts(topo) if free is None else list(free)
-    pools, topk, cand = crossings(topo, cut)
-    if pools:
-        src = min(s for s, _ in pools)
-        last = max(i for i in range(n) if topo.kv_source_for(i) == src)
-        what = (f"layers {src}-{last} share the compressed-KV pool of layers.{src}, which is on "
-                f"{below}")
-    elif topk:
-        src = min(s for s, _ in topk)
-        readers = format_layer_ranges(i for s, i in topk if s == src)
-        what = f"layers {readers} reuse the top-k selection of layers.{src}, which is on {below}"
-    else:
-        src = min(s for s, _ in cand)
-        readers = format_layer_ranges(i for s, i in cand if s == src)
-        what = (f"layers {readers} mask their index scores to the candidate blocks of "
-                f"layers.{src}, which is on {below}")
+    what = split_what(topo, cut, below)
     lo = max((c for c in free if c < cut), default = None)
     hi = min((c for c in free if c > cut), default = None)
     moves = []
@@ -198,6 +213,39 @@ def cut_message(topo, cut: int, below, above, free = None) -> str:
         f"attached, a change of device can only fall where no pool, top-k selection or candidate "
         f"list is shared across it: at {format_cuts(free)} on this model. Change the split budgets "
         f"(-gs / use_per_device / reserve_per_device): {', or '.join(moves)} ({DOC_REF})")
+
+
+# ---------------------------------------------------------------------------
+# the explicit placement
+
+def placement_cuts(generic, topo) -> list[int]:
+    """
+    The layers at which an explicit placement (model/placement.py) changes device between
+    decoder layers. Refuses, as the loader does, a placement that names a layer the model does
+    not have or leaves one unplaced.
+    """
+    n = topo.num_hidden_layers
+    rules = generic.layer_map(range(n))
+    return [i for i in range(1, n) if rules[i].device != rules[i - 1].device]
+
+
+def check_placement(generic, topo) -> list[int]:
+    """
+    The changes of device of an explicit placement, after checking that every one is a free cut:
+    nothing provides a pool, a top-k selection or candidate blocks on the other side of any other
+    change. ValueError otherwise, naming the first such change, what it separates and the free
+    cuts.
+    """
+    free = free_cuts(topo)
+    cuts = placement_cuts(generic, topo)
+    for c in cuts:
+        if c not in free:
+            raise ValueError(
+                f"DeepSeek-V4.1: the explicit placement '{generic}' changes device at layer {c}, but "
+                f"{split_what(topo, c)}. On this model a change of device can only fall where no pool, "
+                f"top-k selection or candidate list is shared across it: at {format_cuts(free)} "
+                f"({PLACEMENT_DOC_REF})")
+    return cuts
 
 
 # ---------------------------------------------------------------------------

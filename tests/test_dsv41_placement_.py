@@ -1,9 +1,11 @@
 """
 CPU-only checks for where a layer-split load of DeepSeek-V4.1 may change device
 (architecture/dsv41/placement.py): the crossings of every cut and the free cuts,
-the load guard's refusal of a cut kv group while a Cache is attached -- through
-exllamav3's REAL autosplit loop (Model_LSMixin._load_autosplit) with CUDA stubbed
-out of it -- and the post-load check.
+the explicit placement (EXL3_PLACEMENT) as V4.1 checks it when the model is built
+and at load (every change of device at a free cut), the load guard's refusal of a
+cut kv group while a Cache is attached -- through exllamav3's REAL autosplit loop
+(Model_LSMixin._load_autosplit) with CUDA stubbed out of it -- and the post-load
+check.
 
 No GPU memory is allocated and no kernel runs: devices are torch.device
 objects, module loads are replaced by bookkeeping that raises
@@ -26,6 +28,7 @@ from dsv41_ref import model_dir, skip
 def load_by_path(name, rel):
     spec = importlib.util.spec_from_file_location(name, os.path.join(_HERE, rel))
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod         # dataclasses resolve their module's annotations through it
     spec.loader.exec_module(mod)
     return mod
 
@@ -108,6 +111,30 @@ def part_a(path):
     assert cp.owner == [topo.kv_source_for(i) for i in range(n)]
     assert not cp.owns_pool(0) and cp.owner[0] is None           # sliding: ring only
     print(f"  OK  cache plan: {cp.describe()}")
+
+    # 4. the explicit placement: every change of device between its decoder layers must be a free
+    # cut; the one refused names the change, what it separates and the free cuts
+    G = load_by_path("_generic_placement", "exllamav3/model/placement.py")
+    for text, cuts in (("0-13=cuda:0; 14-22=cuda:1 experts=cpu; 23-39=cuda:1", [14]),
+                       ("0-13=cuda:1; *=cuda:0", [14]), ("0-7=cuda:0; 8-19=cuda:1; 20-39=cuda:2", [8, 20]),
+                       ("0-7=cuda:0; 8-13=cuda:1; 14-39=cuda:0", [8, 14]),
+                       ("*=cuda:0; 12-22=cuda:0 experts=stream", [])):
+        assert P.placement_cuts(G.parse(text), topo) == cuts, text
+        assert P.check_placement(G.parse(text), topo) == cuts, text
+    spec = "0-11=cuda:0; 12-39=cuda:1"
+    e = raises(ValueError, P.check_placement, G.parse(spec), topo)
+    assert str(e) == (
+        f"DeepSeek-V4.1: the explicit placement '{spec}' changes device at layer 12, but layers 8-13 share "
+        f"the compressed-KV pool of layers.8. On this model a change of device can only fall where no "
+        f"pool, top-k selection or candidate list is shared across it: at layer 1, 2, 8, 14 or 20 "
+        f"(doc/placement.md, \"DeepSeek-V4.1\")"), str(e)
+    raises(ValueError, P.check_placement, G.parse("0-7=cuda:0; 8-19=cuda:1; 20-27=cuda:2; 28-39=cuda:3"), topo,
+           match = "changes device at layer 28, but layers 20-39 share")
+    raises(ValueError, P.check_placement, G.parse("0-40=cuda:0"), topo, match = "does not have: 40")
+    raises(ValueError, P.check_placement, G.parse("0-38=cuda:0"), topo, match = "not placed")
+    assert P.split_what(topo, 12) == "layers 8-13 share the compressed-KV pool of layers.8"
+    print("  OK  explicit placement: changes of device at free cuts accepted (also on three devices and "
+          "returning to a device); one inside a kv group refused, naming it and the free cuts")
     return P, topo
 
 
@@ -119,16 +146,20 @@ RESIDENT = 5_222_576_916      # header scan of DeepSeek-V4.1-Flash 3.0 bpw: one 
 CPU_KEEP = 126_492_948        # a CPU-offloaded layer's GPU part, suh/svh included
 
 
-def fake_ip(mcl = 0, mcs = 0):
+def fake_ip(mcl = 0, mcs = 0, placement = None):
     return types.SimpleNamespace(moe_cpu_offload = mcl, moe_cpu_split = mcs,
                                  draft_moe_cpu_offload = 0, moe_cpu_offload_assigned = {},
-                                 moe_cpu_component = "text", vision_pinned = False)
+                                 moe_cpu_component = "text", vision_pinned = False,
+                                 moe_cpu_mode = "compute", placement = placement)
 
 
-def build(path, out = None):
+def build(path, out = None, generic = None):
+    """Config and model; `generic` (an explicit placement, text or parsed) is set before
+    Model.from_config, where V4.1 checks it"""
     from exllamav3 import Config, Model
     with contextlib.redirect_stdout(out if out is not None else io.StringIO()):
         cfg = Config.from_directory(path)
+        cfg.infer_params.placement = generic
         model = Model.from_config(cfg)
     return cfg, model
 
@@ -211,13 +242,15 @@ def part_b(path, P):
     print("  OK  load guard: layers.12 after layers.11 on another device refused with a Cache and "
           "nothing of its MoE loaded; accepted without one; the free cut 14 accepted with one")
 
-    # 5. the real autosplit loop
+    # 5. the real autosplit loop, without and with an explicit placement
     run_autosplit_cases(path, P)
+    run_placement_cases(path)
 
     # 6. tensor parallel is refused before anything loads; every other load goes to upstream
     raises(NotImplementedError, lambda: next(model.load_gen(use_per_device = [63, 91], tensor_p = True)),
            match = "DeepSeek-V4.1: tensor-parallel loading is not implemented; load it as a layer "
-                   "split (-gs / use_per_device)")
+                   "split (-gs / use_per_device), or with an explicit placement (EXL3_PLACEMENT / "
+                   "--placement)")
     raises(NotImplementedError, mlps[3].make_tp_allocation, {}, match = "tensor-parallel")
     assert model.caps["supports_tp"] is False
     assert not model.load_guard.active
@@ -272,6 +305,7 @@ class FakeBlock:
     def __init__(self, sim, mlp):
         self.sim, self.mlp = sim, mlp
         self.key = f"layers.{mlp.layer_idx}"
+        self.layer_idx = mlp.layer_idx
         self.caps = {}
         self.device = None
         self.modules = []
@@ -311,15 +345,18 @@ def _sim_blocksparse_load(sim):
     return load
 
 
-def autosplit(path, budgets_gib, mcl = 0, cache_attached = False):
-    """Run model_ls._load_autosplit over 40 FakeBlocks wrapping the real DSV41MoE objects.
-    Returns (device index per layer, claimed CPU layers) or raises what the loop raised."""
+def autosplit(path, budgets_gib, mcl = 0, cache_attached = False, generic = None):
+    """Run model_ls._load_autosplit over 40 FakeBlocks wrapping the real DSV41MoE objects of a
+    model built with the explicit placement `generic` (a string) if given. Returns (device index
+    per layer, claimed CPU layers) or raises what the loop raised."""
     import torch
     import exllamav3.model.model_ls as model_ls
     from exllamav3.model.model_ls import Model_LSMixin
+    from exllamav3.model.placement import parse
     from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
-    cfg, model = build(path)
-    cfg.infer_params = fake_ip(mcl = mcl)
+    pl = parse(generic)
+    cfg, model = build(path, generic = pl)
+    cfg.infer_params = fake_ip(mcl = mcl, placement = pl)
     mlps = [b.mlp for b in model._blocks()]
     claim_everything(mlps)
     for m in mlps:
@@ -357,7 +394,8 @@ def autosplit(path, budgets_gib, mcl = 0, cache_attached = False):
         with patched(BlockSparseMLP, "load", _sim_blocksparse_load(sim)):
             for _ in FakeModel()._load_autosplit(
                     False, None, [int(b * GIB) for b in budgets_gib], list(range(len(budgets_gib))),
-                    2048, 32, 1, None, False, fake_cfg, sim.blocks, False, 1, {}, True):
+                    2048, 32, 1, None, False, fake_cfg, sim.blocks, False, 1, {}, True,
+                    placement = pl):
                 pass
     finally:
         model.load_guard.end()
@@ -412,6 +450,61 @@ def run_autosplit_cases(path, P):
           "Cache; -gs 63,200 cuts group 8-13 at 12: refused with a Cache, naming the fix, loaded "
           "without one; three devices at 8 and 20 load, 8 and 18 do not; -mcl 11 on 63,91 cuts at "
           "23 (upstream), refused with a Cache")
+
+
+def run_placement_cases(path):
+    """The explicit placement on V4.1: through the real autosplit loop, and its checks when the
+    model is built and at load"""
+    import functools
+    from exllamav3.model.model import Model
+    # every layer lands where the placement says, whatever the budgets would do (the budget alone
+    # would keep every layer on the first device), and the experts=cpu layers are claimed by the
+    # generic mixin path; with a Cache attached too, as every change of device is a free cut
+    spec = "0-13=cuda:0; 14-22=cuda:1 experts=cpu; 23-39=cuda:1"
+    for cache in (False, True):
+        devs, claimed = autosplit(path, [200, 200], generic = spec, cache_attached = cache)
+        assert devs == [0] * 14 + [1] * 26 and claimed == list(range(14, 23)), (devs, claimed)
+    # reversed devices; free cuts on three devices and returning to the first
+    devs, _ = autosplit(path, [200, 70], generic = "0-13=cuda:1; *=cuda:0", cache_attached = True)
+    assert devs == [1] * 14 + [0] * 26, devs
+    devs, _ = autosplit(path, [200, 200, 200], generic = "0-7=cuda:0; 8-19=cuda:1; 20-39=cuda:2",
+                        cache_attached = True)
+    assert devs == [0] * 8 + [1] * 12 + [2] * 20, devs
+    devs, _ = autosplit(path, [200, 200], generic = "0-7=cuda:0; 8-13=cuda:1; 14-39=cuda:0",
+                        cache_attached = True)
+    assert devs == [0] * 8 + [1] * 6 + [0] * 26, devs
+    # a layer that does not fit its device is an error with the loader's reason, not a move
+    e = raises(RuntimeError, autosplit, path, [60, 200], generic = "0-13=cuda:0; *=cuda:1",
+               match = "placement: layers.12 does not fit on cuda:0")
+    assert "sim: cuda:0 budget exhausted at layers.12" in str(e), str(e)
+    # a change of device inside a kv group is refused when the model is built
+    raises(ValueError, build, path, generic = "0-11=cuda:0; 12-39=cuda:1",
+           match = "changes device at layer 12, but layers 8-13 share the compressed-KV pool of layers.8")
+    print("  OK  explicit placement through the real autosplit loop: every layer where the placement "
+          "says (the budget alone would keep them on one device), with and without a Cache; reversed "
+          "devices; free cuts on three devices and back to the first; a layer that does not fit is a "
+          "RuntimeError with the loader's reason; a change inside a kv group refused when the model is built")
+
+    # load_gen checks the placement set at load again: it may have changed since the model was built
+    cfg, model = build(path, generic = "0-13=cuda:1; 14-39=cuda:0")
+    cfg.infer_params.placement = "0-11=cuda:1; 12-39=cuda:0"
+    raises(ValueError, lambda: next(model.load_gen(use_per_device = [90, 90])),
+           match = "changes device at layer 12, but layers 8-13 share")
+    assert not model.load_guard.active
+    seen = []
+    real = Model.load_gen
+    @functools.wraps(real)
+    def fake(self, *a, **kw):
+        seen.append(str(self.config.infer_params.placement))
+        yield from ()
+    with patched(Model, "load_gen", fake):
+        for other in ("0-7=cuda:0; 8-39=cuda:1", "*=cuda:1", None):
+            cfg.infer_params.placement = other
+            for _ in model.load_gen(use_per_device = [90, 90]):
+                pass
+    assert seen == ["0-7=cuda:0; 8-39=cuda:1", "*=cuda:1", "None"], seen
+    print("  OK  load_gen checks the placement set at load: a change of device inside a kv group refused, "
+          "other free cuts, one device or no placement accepted")
 
 
 def run_post_load_check(path):

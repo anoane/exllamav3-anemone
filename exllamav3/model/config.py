@@ -3,6 +3,7 @@ from abc import ABC
 import os, json
 from dataclasses import dataclass
 from .moe_expert_policy import parse_cpu_mode
+from .placement import parse as parse_placement
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
@@ -51,6 +52,12 @@ class InferParams:
         # active expert is streamed to its layer's GPU and computed there, decode included; no
         # CPU expert arithmetic (see moe_expert_policy.py). Read as the layers load
         self.moe_cpu_mode = parse_cpu_mode(os.environ.get("EXL3_MOE_CPU_MODE", "compute"))
+        # Explicit placement (model/placement.py): the device of every decoder layer and where
+        # each MoE layer's routed experts are stored and computed, e.g. "0-11=cuda:0; 12-39=cuda:1
+        # experts=cpu". Replaces moe_cpu_offload / moe_cpu_split / moe_cpu_mode, which must stay
+        # unset with it. A placement string, a parsed Placement or None (the autosplit decides);
+        # read when the text component is built and loaded
+        self.placement = parse_placement(os.environ.get("EXL3_PLACEMENT"))
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then cpu_count/2
         # (see moe_cpu_host.MoeCpuTuning)

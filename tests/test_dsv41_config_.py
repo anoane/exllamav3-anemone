@@ -63,7 +63,8 @@ def load_config_module():
         ("exllamav3", {}),
         ("exllamav3.util", {}),
         ("exllamav3.util.file", {"no_default": no_default}),
-        ("exllamav3.model", {}),
+        # model/placement.py (the explicit placement parser) is torch-free and loads for real
+        ("exllamav3.model", {"__path__": [os.path.join(_HERE, "exllamav3", "model")]}),
         ("exllamav3.model.config", {"Config": _StubConfig}),
         ("exllamav3.model.model", {"Model": _StubModel}),
     ):

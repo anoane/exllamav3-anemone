@@ -1,11 +1,12 @@
 """
 CPU-only tests of the execution mode of RAM-held MoE experts (EXL3_MOE_CPU_MODE, -mcm /
 --moe_cpu_mode, config.infer_params.moe_cpu_mode): parsing, configuration, admission at
-registration, and dispatch. No Torch, CUDA or compiled extension is needed.
+registration, and dispatch; and of the MoE load hooks under an explicit placement
+(EXL3_PLACEMENT). No Torch, CUDA or compiled extension is needed.
 
     python tests/test_moe_expert_policy_.py
 
-moe_expert_policy.py is loaded by path. Everything else runs the real engine source: the
+moe_expert_policy.py and placement.py are loaded by path. Everything else runs the real engine source: the
 methods under test are extracted from moe_cpu_host.py, block_sparse_mlp_cpu.py, config.py and
 model_init.py with ast and executed against fake devices and tensors, with the worker process
 and the GPU kernels mocked. This checks dispatch and admission, not CUDA arithmetic, event
@@ -19,6 +20,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import re
 import sys
 from types import SimpleNamespace as NS
 import unittest
@@ -30,10 +32,17 @@ ROOT = Path(__file__).resolve().parents[1]
 HOST = "exllamav3/model/moe_cpu_host.py"
 MIXIN = "exllamav3/modules/block_sparse_mlp_cpu.py"
 
-spec = importlib.util.spec_from_file_location("_moe_policy_subject", ROOT / "exllamav3/model/moe_expert_policy.py")
-policy = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = policy
-spec.loader.exec_module(policy)
+
+def load(name, rel):
+    spec = importlib.util.spec_from_file_location(name, ROOT / rel)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+policy = load("_moe_policy_subject", "exllamav3/model/moe_expert_policy.py")
+placement = load("_placement_subject", "exllamav3/model/placement.py")
 
 
 class Device:
@@ -87,8 +96,17 @@ def source_node(path, name):
                 if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == name)
 
 
+def module_assignment(path, name):
+    """The value of a module-level assignment in the engine source"""
+    node = next(n for n in ast.parse((ROOT / path).read_text()).body
+                if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == name for t in n.targets))
+    return eval(compile(ast.Expression(node.value), path, "eval"), {"re": re})
+
+
 def execute(nodes, extra = None):
     ns = dict(vars(policy), torch = TORCH, os = os,
+              parse_placement = placement.parse, expert_plan = placement.expert_plan,
+              _LAYER_KEY = module_assignment(MIXIN, "_LAYER_KEY"),
               TUNING = NS(stream_debug = False, stream_fused_t = 8, stream_deterministic = False),
               _split_fused = False, _split_prof = False)
     ns.update(extra or {})
@@ -113,7 +131,10 @@ Host = source_class(HOST, "MoeCpuHost", {
     "submit", "submit_issue", "submit_issue_fused", "_issue_compute", "submit_prefill",
     "_ensure_stream_state", "prefill_worst_case_parts",
 })
-Mixin = source_class(MIXIN, "BlockSparseMLP_CPU", {"cpu_expert_mode", "cpu_split_submit"})
+Mixin = source_class(MIXIN, "BlockSparseMLP_CPU", {
+    "placement_plan", "cpu_expert_mode", "_cpu_eligible", "cpu_maybe_offload_load", "cpu_maybe_split_load",
+    "cpu_split_submit", "can_defer_load",
+})
 
 
 def make_host():
@@ -417,6 +438,130 @@ class MixinTests(unittest.TestCase):
                         and isinstance(n.func, ast.Attribute) and n.func.attr == "register_layer")
             kw = {k.arg: ast.unparse(k.value) for k in call.keywords}
             self.assertEqual((kw.get("mode"), kw.get("device")), ("mode", "self.device"), name)
+
+
+class _Base:
+    def can_defer_load(self):
+        return True
+
+
+class Layer(Mixin, _Base):
+    """A block-sparse MoE layer as the load hooks see it; the worker registration is mocked"""
+
+    def __init__(self, key = "model.layers.12.mlp", layer_idx = None, activation = "silu", gated = True,
+                 num_experts = 64, **ip):
+        ip = dict(dict(moe_cpu_offload = 0, moe_cpu_split = 0, draft_moe_cpu_offload = 0,
+                       moe_cpu_offload_assigned = {}, moe_cpu_component = "text", moe_cpu_mode = "compute",
+                       placement = None), **ip)
+        self.config = NS(infer_params = NS(**ip))
+        self.key, self.layer_idx, self.activation_fn, self.gated = key, layer_idx, activation, gated
+        self.num_experts = self.num_local_experts = num_experts
+        self.routing_first, self.cpu_split_first = None, None
+        self.load_cpu_offload = Mock(return_value = True)
+        self.load_cpu_split = Mock(return_value = True)
+
+
+class PlacementHookTests(unittest.TestCase):
+
+    def test_placement_plan(self):
+        pl = placement.parse("0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-30=cuda:2 experts=split cpu=16; "
+                             "*=cuda:2 experts=cpu")
+        self.assertIsNone(Layer().placement_plan())
+        self.assertEqual(Layer(placement = pl).placement_plan(), ("ram", "stream", 0))
+        self.assertEqual(Layer(placement = str(pl)).placement_plan(), ("ram", "stream", 0))   # a string is parsed
+        # layer_idx when the module carries it, else the layer in its key
+        self.assertEqual(Layer("x", layer_idx = 25, placement = pl).placement_plan(), ("split", "hybrid", 16))
+        self.assertEqual(Layer("model.language_model.layers.3.mlp", placement = pl).placement_plan(),
+                         ("vram", None, 0))
+        self.assertEqual(Layer("model.layers.35.block_sparse_moe", placement = pl).placement_plan(),
+                         ("ram", "hybrid", 0))
+        with self.assertRaisesRegex(ValueError, "which decoder layer"):
+            Layer("mtp.layer.0.mlp", placement = pl).placement_plan()
+        # only the text component is placed (an MTP head or vision tower sharing the config is not)
+        self.assertIsNone(Layer(placement = pl, moe_cpu_component = "mtp").placement_plan())
+        # the placement decides the execution mode, not moe_cpu_mode
+        self.assertEqual(Layer(placement = pl).cpu_expert_mode(), "stream")
+        self.assertEqual(Layer("model.layers.35.mlp", placement = pl).cpu_expert_mode(), "hybrid")
+
+    def test_whole_layer_claims(self):
+        pl = placement.parse("0-11=cuda:0; 12-22=cuda:1 experts=cpu; *=cuda:1 experts=split cpu=16")
+        claimed = []
+        for i in range(40):
+            m = Layer(f"model.layers.{i}.mlp", placement = pl, moe_cpu_offload_assigned = {})
+            if m.cpu_maybe_offload_load("cuda:1"):
+                claimed.append(i)
+                m.load_cpu_offload.assert_called_once_with("cuda:1")
+                self.assertEqual(m.config.infer_params.moe_cpu_offload_assigned, {"text": 1})
+            else:
+                m.load_cpu_offload.assert_not_called()
+        self.assertEqual(claimed, list(range(12, 23)))
+
+    def test_split_claims(self):
+        pl = placement.parse("0-11=cuda:0; *=cuda:1 experts=split cpu=16")
+        m = Layer("model.layers.20.mlp", placement = pl)
+        self.assertFalse(m.cpu_maybe_offload_load("cuda:1"))
+        m.cpu_maybe_split_load("cuda:1")
+        m.load_cpu_split.assert_called_once_with("cuda:1", 16)
+        self.assertEqual(m.config.infer_params.moe_cpu_split_assigned, 1)
+        m = Layer("model.layers.3.mlp", placement = pl)
+        m.cpu_maybe_split_load("cuda:0")
+        m.load_cpu_split.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "must leave between 1 and 15"):
+            Layer("model.layers.20.mlp", placement = pl, num_experts = 16).cpu_maybe_split_load("cuda:1")
+
+    def test_a_placed_layer_that_cannot_offload_is_an_error(self):
+        # ineligible layers fall back to VRAM silently with -mcl / -mcs, never under a placement
+        ram = placement.parse("*=cuda:0 experts=cpu")
+        split = placement.parse("*=cuda:0 experts=split cpu=8")
+        for kwargs, device in ((dict(activation = "relu2"), "cuda:0"),          # gated relu2: unsupported
+                               (dict(), "cpu"),
+                               (dict(), None)):
+            with self.subTest(kwargs = kwargs, device = device):
+                with self.assertRaisesRegex(RuntimeError, "use experts=vram"):
+                    Layer(placement = ram, **kwargs).cpu_maybe_offload_load(device)
+                with self.assertRaisesRegex(RuntimeError, "use experts=vram"):
+                    Layer(placement = split, **kwargs).cpu_maybe_split_load(device)
+        m = Layer(placement = ram)
+        m.load_cpu_offload.return_value = False                          # e.g. not mul1
+        with self.assertRaisesRegex(RuntimeError, "cannot hold its routed experts"):
+            m.cpu_maybe_offload_load("cuda:0")
+        m = Layer(placement = split)
+        m.num_local_experts = 32                                          # a tensor-parallel shard
+        with self.assertRaisesRegex(RuntimeError, "cannot hold 8"):
+            m.cpu_maybe_split_load("cuda:0")
+
+    def test_older_settings_unchanged_without_a_placement(self):
+        claimed = [i for i in range(4) if Layer(f"model.layers.{i}.mlp", moe_cpu_offload = 2,
+                                                moe_cpu_offload_assigned = {"text": min(i, 2)})
+                   .cpu_maybe_offload_load("cuda:0")]
+        self.assertEqual(claimed, [0, 1])
+        # ineligible: no claim, no error
+        self.assertFalse(Layer(activation = "relu2", moe_cpu_offload = 2).cpu_maybe_offload_load("cuda:0"))
+        m = Layer(moe_cpu_split = 16)
+        m.cpu_maybe_split_load("cuda:0")
+        m.load_cpu_split.assert_called_once_with("cuda:0", 16)
+        m = Layer(moe_cpu_split = 16)
+        m.routing_first = 0
+        m.cpu_maybe_split_load("cuda:0")
+        m.load_cpu_split.assert_not_called()
+
+    def test_one_eligibility_helper(self):
+        # the eligible-activation test exists once, in _cpu_eligible, which both claim paths
+        # call (the worker's activation ids in load_cpu_offload / load_cpu_split are a mapping)
+        cls = source_node(MIXIN, "BlockSparseMLP_CPU")
+        methods = {n.name: ast.unparse(n) for n in cls.body if isinstance(n, ast.FunctionDef)}
+        holders = [name for name, text in methods.items() if "self.activation_fn in (" in text]
+        self.assertEqual(holders, ["_cpu_eligible"])
+        for name in ("cpu_maybe_offload_load", "cpu_maybe_split_load"):
+            self.assertEqual(methods[name].count("self._cpu_eligible(device)"), 2, name)
+
+    def test_placed_split_keeps_router_loads_undeferred(self):
+        split = placement.parse("*=cuda:0 experts=split cpu=8")
+        with patch.dict(os.environ, {"EXL3_MOE_CPU_SPLIT_STATS": "stats.json"}):
+            self.assertFalse(Layer(placement = split).can_defer_load())
+            self.assertFalse(Layer(moe_cpu_split = 8).can_defer_load())
+            self.assertTrue(Layer(placement = placement.parse("*=cuda:0 experts=cpu")).can_defer_load())
+        self.assertTrue(Layer(placement = split).can_defer_load())
 
 
 if __name__ == "__main__":

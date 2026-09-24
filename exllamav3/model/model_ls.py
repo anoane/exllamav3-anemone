@@ -18,6 +18,36 @@ from .config import Config
 from abc import ABC, abstractmethod
 
 
+def placement_targets(modules: list, placement) -> list[str]:
+    """
+    Each module's device under an explicit placement (model/placement.py): a decoder layer
+    (layer_idx 0 or more) takes its rule's device, modules before the first layer the embed rule's
+    (else the first layer's), modules after the last layer the head rule's (else the last
+    layer's), and any other module the device of the module before it. A module with a negative
+    layer_idx belongs to a decoder layer without being one (the per-layer embedding modules of
+    PLE models, e.g. Qwen3.8-Flash-Next, sit right before their layer with layer_idx -(i + 1)):
+    it takes the device of the next decoder layer, or the head's when no layer follows it
+    """
+    blocks = [i for i, m in enumerate(modules) if m.layer_idx is not None and m.layer_idx >= 0]
+    rules = placement.layer_map({modules[i].layer_idx for i in blocks})
+    first, last = blocks[0], blocks[-1]
+    out = []
+    for i, m in enumerate(modules):
+        if m.layer_idx is not None and m.layer_idx >= 0:
+            out.append(rules[m.layer_idx].device)
+        elif m.layer_idx is not None:
+            nxt = next((j for j in blocks if j > i), None)
+            out.append(rules[modules[nxt].layer_idx].device if nxt is not None else
+                       placement.head_device() or rules[modules[last].layer_idx].device)
+        elif i < first:
+            out.append(placement.embed_device() or rules[modules[first].layer_idx].device)
+        elif i > last:
+            out.append(placement.head_device() or rules[modules[last].layer_idx].device)
+        else:
+            out.append(out[-1])
+    return out
+
+
 class Model_LSMixin(ABC):
 
     def __init__(self):
@@ -82,8 +112,11 @@ class Model_LSMixin(ABC):
         max_batch_size: int,
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
+        placement = None,
     ):
         current_device_i = 0
+        # An explicit placement names every module's device; without one the split is greedy
+        targets = placement_targets(modules, placement) if placement is not None else None
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
         dummy_state = None
         prev_load_device = None
@@ -149,17 +182,19 @@ class Model_LSMixin(ABC):
                 while True:
                     try:
                         # Select device
-                        load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
+                        home = torch.device(targets[idx]) if targets is not None else \
                             torch.device(active_devices[current_device_i])
+                        load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else home
                         x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
-                            torch.device(active_devices[current_device_i])
+                            home
 
-                        # Set VRAM limit if new device
-                        if load_device != torch.device("cpu") and load_device != prev_load_device:
+                        # Set VRAM limit if new device (a placement may return to a device, whose
+                        # budget is already set)
+                        if load_device != torch.device("cpu") and load_device != prev_load_device and \
+                                load_device.index not in device_budget:
                             prev_load_device = load_device
-                            i = active_devices[current_device_i]
+                            i = load_device.index
                             touched_devices.append(i)
-                            i = active_devices[current_device_i]
                             if reserve_per_device is not None:
                                 device_budget[i] = set_memory_fraction_reserve(reserve_per_device[i], i)
                             elif use_per_device is not None:
@@ -281,8 +316,18 @@ class Model_LSMixin(ABC):
                             fail = True
                             if verbose:
                                 print(f" -- autosplit: {module.key} does not fit on {load_device}: {str(e).splitlines()[0][:200]}")
+                            fail_reason = str(e).split("\n")[0]
                         else:
                             raise
+
+                    # Under a placement a module never moves: out of memory on its device is final
+                    if fail and targets is not None:
+                        module.unload()
+                        free_mem()
+                        raise RuntimeError(
+                            f"placement: {module.key} does not fit on {targets[idx]} with the modules already "
+                            f"placed there ({fail_reason}); move layers to another device, give their experts "
+                            f"experts=stream / cpu / split, or raise that device's budget (placement '{placement}')")
 
                     # Module failed to load with an OoM error, so advance to the next device if possible
                     if fail:
