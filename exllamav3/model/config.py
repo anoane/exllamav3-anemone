@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC
 import os, json
 from dataclasses import dataclass
+from .moe_expert_policy import parse_cpu_mode
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
@@ -44,6 +45,12 @@ class InferParams:
         # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # Experimental: how the experts that moe_cpu_offload, moe_cpu_split and
+        # draft_moe_cpu_offload keep in system RAM are computed. "compute": by the CPU worker,
+        # with the hottest experts of a prefill chunk streamed to the GPU. "stream_only": every
+        # active expert is streamed to its layer's GPU and computed there, decode included; no
+        # CPU expert arithmetic (see moe_expert_policy.py). Read as the layers load
+        self.moe_cpu_mode = parse_cpu_mode(os.environ.get("EXL3_MOE_CPU_MODE", "compute"))
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then cpu_count/2
         # (see moe_cpu_host.MoeCpuTuning)

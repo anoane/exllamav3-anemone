@@ -283,7 +283,8 @@ per model component (main / draft / MTP) owns its own expert weights and a job r
 shared memory; the parent's forward pass never blocks on the CPU. During prefill, hot experts
 additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
 dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
-thread configuration, and the knobs below for tuning the split.
+thread configuration, and the knobs below for tuning the split. `EXL3_MOE_CPU_MODE=stream_only`
+keeps the experts in system RAM but computes all of them on the GPU instead (see below).
 
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
@@ -292,6 +293,105 @@ from the environment at import); for a same-process sweep, mutate fields on the 
 ### `EXL3_MOE_CPU_OFFLOAD` (default: `0`)
 
 Fallback value for when `-mcl` is not set.
+
+### `EXL3_MOE_CPU_MODE` (default: `compute`)
+
+Default for `Config.infer_params.moe_cpu_mode`, which `-mcm` / `--moe_cpu_mode` sets in
+`model_init`-based scripts: how the routed experts that `-mcl`, `-mcs` and `-dmcl` keep in
+system RAM are computed. The weights stay in system RAM either way, owned and staged by the
+worker process; only where the arithmetic runs changes.
+
+- `compute`: the CPU worker computes the experts; during prefill the experts with at least
+  `EXL3_MOE_STREAM_T` assignments in a chunk of at least `EXL3_MOE_STREAM_MIN_ROWS` rows are
+  streamed to the layer's GPU and computed there (the behaviour described at the top of this
+  section).
+- `stream_only`: every expert a call routes at least one row to is streamed from system RAM to
+  the layer's GPU and computed there, in every call, one-token decode included. No expert job is
+  ever submitted to the worker for these layers, so there is no CPU expert arithmetic;
+  `EXL3_MOE_STREAM_T` and `EXL3_MOE_STREAM_MIN_ROWS` do not apply, and the per-device bandwidth
+  probe is skipped. In a `-mcs` split layer only the tail experts a call selects are streamed; a
+  call that selects none of them adds nothing and transfers nothing.
+
+Values: exactly `compute` or `stream_only`. Any other value of the variable raises a `ValueError`
+when the `Config` is created, `-mcm` accepts only these two, and any other Python value raises
+when the first offloaded layer loads. Refusing a value is never a silent fallback.
+
+When it is read: every offloaded layer reads it once, when it registers with the worker during
+`model.load()`, and keeps that mode until it is unloaded; set it before loading (changing the
+attribute afterwards affects the next load). An MTP head shares its model's config and so its
+setting. `model_init` copies the setting to a draft model loaded from its own directory; a
+Python script that builds the draft's `Config` itself sets the draft's attribute (or relies on
+the variable, which every `Config` reads).
+
+Refused at load under `stream_only`, before the worker starts, instead of computing on the CPU:
+
+- an offloaded layer whose packed expert weights do not fit one weight staging slot
+  (`EXL3_MOE_CPU_WSLOT_MB`, default 32 MiB, with `EXL3_MOE_CPU_WSLOTS` at least 1): a
+  `RuntimeError` names both variables;
+- a layer without the packed projection layout or its GPU-side scale tensors (every layer the
+  worker accepts has them; this is a guard);
+- a layer not on a CUDA device.
+
+The worker's eligibility rules (mul1 codebook, K <= 8, uniform per-expert biases, supported
+activation) apply unchanged: an ineligible layer keeps its experts in VRAM, as with `compute`.
+At run time a CPU expert job for a `stream_only` layer, or a call on a GPU other than the one the
+layer loaded on, raises a `RuntimeError`; neither happens on the supported paths.
+
+Memory: no additional weights. The GPU side of the streamed path (per device: the VRAM weight
+ring of `EXL3_MOE_CPU_WSLOTS x EXL3_MOE_CPU_WSLOT_MB`, 64 MiB by default, the reconstruct
+scratch, the fused-tier and batched-reconstruct buffers, and per call the output and slot
+scratch described under `EXL3_MOE_FUSED_DET`) is the one `compute` uses for its streamed
+experts; with `stream_only` every chunk size uses it, and the autosplit's worst-case estimate
+(`EXL3_AUTOSPLIT_WORSTCASE`) counts it also for chunks below `EXL3_MOE_STREAM_MIN_ROWS`.
+
+Performance: every call moves the packed weights of every expert it selects over PCIe. One
+expert of a gated layer is `3 x hidden x intermediate x bits / 8` bytes, e.g. 11.25 MiB at
+hidden 5120, intermediate 2048 and 3 bits. A decoded token selects top-k experts per layer, so
+at top-6 that is 67.5 MiB per offloaded layer per token, about 2.8 ms per layer over a link that
+sustains 25 GB/s, before any compute: decode speed is bounded by the link, where `compute`
+depends on the CPU. Besides the transfer, every call of a `stream_only` layer pays one host
+synchronization (the per-expert counts, from which the host checks that no expert is left for the
+CPU), where `compute` decode needs none; unless `EXL3_MOE_PINNED_ARENA=1`, the worker's stager first
+copies every streamed expert into the pinned staging ring (the 67.5 MiB above, per layer and
+token), so `EXL3_MOE_PINNED_ARENA=1` is recommended with `stream_only`; and a call whose experts
+do not fit one staging slot is serialized through the `EXL3_MOE_CPU_WSLOTS` slots (at 11.25 MiB
+per expert a 32 MiB slot holds two, so a top-6 token's experts pass through the two default
+slots in three batches). Prefill chunks select most experts anyway and amortize the transfer
+over their rows. Measured on DeepSeek-V4.1-Flash on two GPUs with the experts of 11 layers in system
+RAM, 64K-token prefill: 796 tok/s with `stream_only` (and GPU arithmetic independent of the row
+count) against 1040 tok/s with `compute` (default arithmetic). The two runs differ in more than
+this setting, so the figure bounds its cost rather than isolating it; decode was not measured.
+
+Determinism: `stream_only` removes the CPU's arithmetic, whose results depend on the CPU's
+instruction set and thread count, and the split of each chunk between CPU and GPU, which depends
+on the routing counts and the measured link bandwidth. With `EXL3_MOE_FUSED_DET=1` (default) the
+streamed experts' contributions are then summed in routing order, and repeats of the same call
+are bitwise identical for whole-layer offload (`-mcl`). For a `-mcs` split layer that holds only
+with `EXL3_MOE_CPU_SWAP=0` or between swap sweeps: the layer's result is its GPU-resident
+experts' partial sum plus the streamed experts' partial sum, added in FP32, and a sweep moves
+experts between the two. Results still change with the chunk size, the staging-batch partition
+and the GPU type, as described under `EXL3_MOE_FUSED_DET`.
+
+When to use it: when the host CPU is slow relative to the PCIe link, or when results must not
+depend on the CPU (reproducibility checks, comparisons across machines). With a fast CPU and a
+narrow link, `compute` decodes faster.
+
+```sh
+python examples/chat.py -m /path/to/model -mcl 8 -mcm stream_only
+EXL3_MOE_CPU_MODE=stream_only python eval/perf.py -m /path/to/model -mcs 64
+```
+
+```python
+config = Config.from_directory(model_dir)
+config.infer_params.moe_cpu_offload = 8
+config.infer_params.moe_cpu_mode = "stream_only"
+model = Model.from_config(config)
+model.load()
+```
+
+The loader reports each such layer as `-- CPU-offloaded experts (streamed to cuda:1, no CPU
+compute): <key>` (`-- CPU split experts (streamed to cuda:1, no CPU compute, dynamic): ...` for
+`-mcs`).
 
 ### `-mclt` / `--moe_cpu_threads`, `-dmclt` / `--draft_moe_cpu_threads` (CLI, not env)
 
@@ -329,7 +429,8 @@ inversely with the measured pinned→device bandwidth (probed once per device): 
 x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. On
 Windows the driver drops an idle link to Gen1, so the probe keeps traffic on it for at least
 0.5 s and until the rate is steady. Setting this explicitly pins the threshold on every device
-and disables the bandwidth scaling.
+and disables the bandwidth scaling. Not used under `EXL3_MOE_CPU_MODE=stream_only`, which streams
+every active expert.
 
 ### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
@@ -347,7 +448,8 @@ fused temp buffers (concurrency x T x (2 hidden + 2 intermediate) x 2 bytes per 
 ### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
 
 Prefill chunk size floor below which GPU streaming never engages and every expert runs on the
-CPU tail as usual (decode, at 1 row per pass, always stays under this).
+CPU tail as usual (decode, at 1 row per pass, always stays under this). Not used under
+`EXL3_MOE_CPU_MODE=stream_only`, which streams at every row count.
 
 ### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`, max `256`)
 
@@ -545,7 +647,8 @@ streamed layer call for a hidden size of 2048 with top-8 routing at 4096-row chu
 
 Measured on DeepSeek-V4.1-Flash on two GPUs, with the experts of 11 layers (12-22) held in RAM
 and every expert those layers select streamed to the second GPU in every call, decode
-included, over a 4096-token prefill plus eight teacher-forced decode steps: two identical runs
+included (`EXL3_MOE_CPU_MODE=stream_only`, below), over a 4096-token prefill plus eight
+teacher-forced decode steps: two identical runs
 differed by up to 0.59 in actual-token log-probability (p99 0.062, one top-1 change) with
 atomic accumulation, and were bitwise identical with slots, also with 2048-token chunks.
 Prefill time +0.40% (1105 vs 1100 tok/s) and decode +0.65%, two interleaved trials each, a
@@ -562,10 +665,10 @@ row cap takes a different projection path); with the staging-batch partition
 reconstruct groups and so the batch count and padded row count of their GEMMs (on
 DeepSeek-V4.1-Flash, one-expert batches against the default batches differed by p99 0.047, max
 0.22, in actual-token log-probability); between GPU types; on the CPU tail, whose arithmetic is
-its own; and, with `EXL3_MOE_STREAM_T` unset, between processes on links slower than about
-25 GB/s, where the bandwidth probed on a device's first streamed prefill sets the streaming
-threshold and so which experts run on the CPU tail (set `EXL3_MOE_STREAM_T` explicitly for
-reproducibility across processes). `EXL3_MOE_FUSED_DET=0` restores atomic accumulation on the
+its own; and, in the default `compute` mode with `EXL3_MOE_STREAM_T` unset, between processes on
+links slower than about 25 GB/s, where the bandwidth probed on a device's first streamed prefill
+sets the streaming threshold and so which experts run on the CPU tail (set `EXL3_MOE_STREAM_T`
+explicitly for reproducibility across processes; `stream_only` skips the probe). `EXL3_MOE_FUSED_DET=0` restores atomic accumulation on the
 resident and the streamed path alike, for A/B comparisons. `EXL3_MOE_RECON_DET` only matters
 where the batched tier does not write into slot scratch, i.e. with `EXL3_MOE_FUSED_DET=0`: `1`
 accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA recurrent

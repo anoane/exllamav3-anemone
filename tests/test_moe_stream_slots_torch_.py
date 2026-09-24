@@ -50,18 +50,21 @@ class StreamDispatcherTests(unittest.TestCase):
         recon = NS(cap = 4, worst_case_bytes = Mock(side_effect = lambda a, slot_mode: 100000 if slot_mode else 200000))
         spec = dict(hi = 32, ho = 32, topk = 6, num_experts = 4, expert_bytes = 256,
                     proj_dims = {"g": (32, 16, 1), "u": (32, 16, 1), "d": (16, 32, 1)})
-        # 7 rows must take the streamed branch: keep the fake floor below them
-        host = NS(specs = [spec], aux = {0: {}}, cap_rows = 64, stream_min_rows = 4, wslot_size = 1024,
-                  _device_buffers = lambda *a: {},
-                  _stream_fused_t = lambda *a: 0, _stream_recon_layer = lambda *a: recon)
-        with patch.object(torch.cuda, "device", lambda _: nullcontext()):
-            for width, expected in ((32, 100000), (16, 200000), (None, 200000)):
-                fixed, variable = ns[fn.name](host, 0, 7, "cpu", 42, hidden_width = width)
-                self.assertEqual(variable, expected)
-                self.assertGreaterEqual(fixed, helpers.slots.slot_rows_bound(42, 1.1, 4) * 32 * 4)
+        # 7 rows must take the streamed branch: a hybrid layer above its row floor (a fake floor
+        # of 4), and a stream-mode layer, which streams at every row count (the upstream floor 32)
+        for mode, floor, stream_only in (("hybrid", 4, False), ("stream", 32, True)):
+            host = NS(specs = [spec], aux = {0: {}}, cap_rows = 64, stream_min_rows = floor, wslot_size = 1024,
+                      _device_buffers = lambda *a: {}, _stream_only = lambda *a, s = stream_only: s,
+                      _stream_fused_t = lambda *a: 0, _stream_recon_layer = lambda *a: recon)
+            with patch.object(torch.cuda, "device", lambda _: nullcontext()):
+                for width, expected in ((32, 100000), (16, 200000), (None, 200000)):
+                    with self.subTest(mode = mode, width = width):
+                        fixed, variable = ns[fn.name](host, 0, 7, "cpu", 42, hidden_width = width)
+                        self.assertEqual(variable, expected)
+                        self.assertGreaterEqual(fixed, helpers.slots.slot_rows_bound(42, 1.1, 4) * 32 * 4)
 
     def run_case(self, rows, topk, fused_t, recon_enabled, padded, deterministic, batch_size,
-                 mixed = False, weight = 0.375, inexact = False):
+                 mixed = False, weight = 0.375, inexact = False, mode = "hybrid", drop = None):
         cls = next(n for n in ast.parse((ROOT / "exllamav3/model/moe_cpu_host.py").read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == "MoeCpuHost")
         fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_submit_prefill_streamed")
@@ -97,7 +100,7 @@ class StreamDispatcherTests(unittest.TestCase):
         flat, shifted = selected.flatten(), selected.flatten()+1
         counts1 = torch.bincount(shifted, minlength = E+1).tolist()
         neg, counts = counts1[0], counts1[1:]
-        active = [e for e, c in enumerate(counts) if c]
+        active = [e for e, c in enumerate(counts) if c and e != drop]
         dims = {p: (16, nd if p == "d" else 16, 1) for p in ("g", "u", "d")}
         aux = {suffix+"_"+p: [torch.full((16,), factors[e] if p == "d" else 1, dtype = torch.half)
                               for e in range(E)] for suffix in ("suh", "svh") for p in dims}
@@ -114,7 +117,7 @@ class StreamDispatcherTests(unittest.TestCase):
                   _stream_fused_t = lambda *a: fused_t if not padded else 0,
                   _stream_fused_bufs = lambda *a: [None]*4)
         spec = dict(num_experts = E, proj_dims = dims, proj_bytes = (32, 32, 64), expert_bytes = 256,
-                    hi = h, ho = nd, activation = 0, act_limit = 0)
+                    hi = h, ho = nd, activation = 0, act_limit = 0, mode = mode)
 
         seen = dict(scratch = [], gather_out_zero = [])
 
@@ -164,6 +167,14 @@ class StreamDispatcherTests(unittest.TestCase):
         host._act = lambda spec, g, u: u
         with patch.object(torch.cuda, "stream", lambda _: nullcontext()), \
              patch.object(torch.cuda, "current_stream", lambda: stream):
+            if drop is not None:
+                # A stream-mode call whose streamed list misses an expert with assignments would
+                # leave them for the CPU: refused before any launch, staging or worker job
+                host._issue_compute = Mock()
+                with self.assertRaisesRegex(RuntimeError, "would leave assignments for the CPU"):
+                    ns[fn.name](host, 0, y, selected, weights, spec, active, st, counts, flat, shifted, neg)
+                self.assertEqual((seen["scratch"], host.wseq, host._issue_compute.call_count), ([], 0, 0))
+                return None
             out = ns[fn.name](host, 0, y, selected, weights, spec, active, st, counts, flat, shifted, neg)
         if deterministic:
             # Slot mode: every fused launch got the scratch, and nothing reached `out` before the
@@ -217,6 +228,24 @@ class StreamDispatcherTests(unittest.TestCase):
             for batch in (1, 2, 4):
                 with self.subTest(deterministic = deterministic, batch = batch):
                     self.run_case(129, 6, 64, True, False, deterministic, batch, mixed = True)
+
+    def test_stream_mode(self):
+        # A stream-mode layer builds no CPU tail (every selected expert streams) and computes what
+        # the hybrid dispatch computes when nothing is left for the CPU
+        for det in (False, True):
+            for batch in (1, 4):
+                with self.subTest(det = det, batch = batch):
+                    hybrid = self.run_case(129, 6, 64, True, False, det, batch, mixed = True, inexact = True)
+                    stream = self.run_case(129, 6, 64, True, False, det, batch, mixed = True, inexact = True,
+                                           mode = "stream")
+                    if det:
+                        self.assertTrue(torch.equal(hybrid, stream))
+        with patch.object(torch, "nonzero", side_effect = AssertionError("device sync in stream mode")), \
+                patch.object(torch.Tensor, "nonzero", side_effect = AssertionError("device sync in stream mode")):
+            self.run_case(33, 6, 64, True, False, True, 2, mode = "stream")
+        for drop in (0, 3):
+            with self.subTest(drop = drop):
+                self.run_case(33, 6, 64, True, False, True, 2, mode = "stream", drop = drop)
 
     def test_per_expert_path_preserves_fp32_weights(self):
         self.run_case(7, 2, 0, False, False, True, 2, weight = 0.375051)

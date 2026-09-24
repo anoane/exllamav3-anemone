@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
+from .model.moe_expert_policy import CPU_MODES
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
 import yaml
@@ -62,6 +63,7 @@ def add_args(
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
     parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else cpu_count/2)", default = None)
+    parser.add_argument("-mcm", "--moe_cpu_mode", type = str, choices = list(CPU_MODES), help = "Experimental: how the routed experts that --moe_cpu_offload / --moe_cpu_split / --draft_moe_cpu_layers keep in system RAM are computed: compute (CPU worker, hot experts of a prefill chunk streamed to the GPU) or stream_only (every active expert streamed to its layer's GPU and computed there, decode included; no CPU expert arithmetic) (default: EXL3_MOE_CPU_MODE env, else compute)", default = None)
     parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
     parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
     parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
@@ -214,6 +216,8 @@ def init(
         config.infer_params.moe_cpu_split = args.moe_cpu_split
     if getattr(args, "moe_cpu_threads", None) is not None:
         config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if getattr(args, "moe_cpu_mode", None) is not None:
+        config.infer_params.moe_cpu_mode = args.moe_cpu_mode
     if getattr(args, "ngram_ram", False):
         config.infer_params.ngram_stream_from_disk = False
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
@@ -232,6 +236,7 @@ def init(
         draft_config = Config.from_directory(draft_model_dir)
         # Separate config: the draft model's own text component takes the budget
         draft_config.infer_params.moe_cpu_offload = dmcl
+        draft_config.infer_params.moe_cpu_mode = config.infer_params.moe_cpu_mode
         if dmclt is not None:
             draft_config.infer_params.moe_cpu_threads = dmclt
     else:

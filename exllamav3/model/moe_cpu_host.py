@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from ..ext import exllamav3_ext as ext
+from .moe_expert_policy import validate_streaming, streamed_experts
 from .moe_stream_slots import slot_layout, slot_rows_bound
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
@@ -617,6 +618,26 @@ class MoeCpuHost:
         self.layer_blocks = []
         self.batch_recon = TUNING.stream_batch_recon
 
+    def gpu_only(self, layer_idx):
+        """True for a layer registered in stream mode: its experts only ever compute on its GPU"""
+        return self.specs[layer_idx]["mode"] == "stream"
+
+    def _stream_only(self, layer_idx, device):
+        """gpu_only(), for a call on `device`, which must be the layer's registered device: the
+        streamed path reads the layer's GPU-side tensors and per-device buffers there"""
+        spec = self.specs[layer_idx]
+        index = spec["device_index"]
+        if index is not None and torch.device(device).index != index:
+            raise RuntimeError(f"CPU MoE: offloaded layer {layer_idx} was registered on cuda:{index} "
+                               f"but runs on {device}")
+        return spec["mode"] == "stream"
+
+    def _require_cpu_compute(self, layer_idx):
+        """Guard of every CPU expert job: a stream-mode layer never gets one"""
+        if self.specs[layer_idx]["mode"] != "hybrid":
+            raise RuntimeError(f"CPU MoE: CPU expert job for offloaded layer {layer_idx}, whose experts are "
+                               f"registered for GPU-only computation (stream mode)")
+
     def _spawn(self):
         if self.proc is not None:
             return
@@ -693,7 +714,40 @@ class MoeCpuHost:
                   flush = True)
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None):
+                       proj_dims = None, aux = None, device = None, mode = "hybrid"):
+        # The layer's execution mode (moe_expert_policy.py) and CUDA device are fixed here, once
+        # per layer: the forward path only looks them up. A stream-mode layer is admitted before
+        # any worker exists, so one that cannot stream fails the load instead of computing on
+        # the CPU
+        if mode not in ("hybrid", "stream"):
+            raise ValueError(f"CPU MoE: unknown execution mode {mode!r} for {key}")
+        index = None
+        if device is not None:
+            dev = torch.device(device)
+            if dev.type == "cuda":
+                index = dev.index if dev.index is not None else torch.cuda.current_device()
+        stream_spec = dict(proj_dims = proj_dims)
+        if proj_dims is not None:
+            # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
+            # stage function
+            def tb(d):
+                k, n, K = d
+                return (k // 16) * (n // 16) * 16 * K * 2
+            gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
+            ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
+            stream_spec.update(proj_bytes = (gb, ub, db), expert_bytes = gb + ub + db)
+        if mode == "stream":
+            if index is None:
+                raise RuntimeError(f"CPU MoE: stream-only experts of {key} need the CUDA device of their layer")
+            validate_streaming(stream_spec, aux is not None, self.wslot_size, self.num_wslots)
+        if index is not None:
+            # One mode per GPU: a device's streamed-prefill state (bandwidth probe, streaming
+            # threshold) is shared by every offloaded layer on it
+            for k, i in self.by_key.items():
+                s = self.specs[i]
+                if k != key and s["device_index"] == index and s["mode"] != mode:
+                    raise RuntimeError(f"CPU MoE: {key} would be the first {mode}-mode layer on cuda:{index}, "
+                                       f"which already holds {s['mode']}-mode layers")
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -702,6 +756,9 @@ class MoeCpuHost:
             # handed to kernels on device B (illegal memory access on the first  multi-chunk
             # prefill after a cross-device rollback)
             idx = self.by_key[key]
+            if self.specs[idx]["proj_dims"] != proj_dims:
+                raise RuntimeError(f"CPU MoE: {key} changed its expert layout between load attempts")
+            self.specs[idx].update(device_index = index, mode = mode)
             self.live_layers += 1
             if aux is not None:
                 self.aux[idx] = aux
@@ -713,18 +770,10 @@ class MoeCpuHost:
             activation = activation, act_limit = act_limit,
             hi = hi, ho = ho, topk = topk,
             num_experts = len(up_keys),
-            proj_dims = proj_dims,
+            device_index = index,
+            mode = mode,
         )
-        if proj_dims is not None:
-            # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
-            # stage function
-            def tb(d):
-                k, n, K = d
-                return (k // 16) * (n // 16) * 16 * K * 2
-            gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
-            ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
-            spec["proj_bytes"] = (gb, ub, db)
-            spec["expert_bytes"] = gb + ub + db
+        spec.update(stream_spec)
         self.specs.append(spec)
         self.live_layers += 1
         idx = len(self.specs) - 1
@@ -921,6 +970,7 @@ class MoeCpuHost:
         stream; returns the (asynchronously filled) float output tensor. Never synchronizes the
         host with the stream.
         """
+        self._require_cpu_compute(layer_idx)
         # Device guard: the flag kernels launch on the *current* device's current stream, which
         # need not match the layer's device (e.g. a model loaded entirely on cuda:1)
         with torch.cuda.device(y.device):
@@ -958,6 +1008,7 @@ class MoeCpuHost:
         the caller can enqueue its own GPU expert work in between. That work then executes
         concurrently with the worker instead of behind the flag wait.
         """
+        self._require_cpu_compute(layer_idx)
         with torch.cuda.device(y.device):
             spec = self.specs[layer_idx]
             h = y.shape[1]
@@ -988,6 +1039,7 @@ class MoeCpuHost:
         back to the copy path). selected_experts must hold RAW router ids here; translation
         (dynamic map or static tail offset) happens inside the kernel.
         """
+        self._require_cpu_compute(layer_idx)
         rows = y.shape[0]
         spec = self.specs[layer_idx]
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
@@ -1058,6 +1110,7 @@ class MoeCpuHost:
         worker's next compute could overwrite a slot output the deferred readback had not
         fetched yet. Caller holds device guard.
         """
+        self._require_cpu_compute(layer_idx)
         rows = y.shape[0]
         h_ = y.shape[1]
         hi = spec["hi"]
@@ -1175,7 +1228,7 @@ class MoeCpuHost:
             d["w_scratch"] = torch.empty(mx, dtype = torch.half, device = device)
         return d
 
-    def _ensure_stream_state(self, device):
+    def _ensure_stream_state(self, device, gpu_only = False):
         key = torch.device(device).index or 0
         st = self.sstate.get(key)
         if st is not None:
@@ -1197,6 +1250,13 @@ class MoeCpuHost:
             # Batched reconstruct tier state per layer (moe_batch_recon.BatchReconLayer)
             recon = bufs["recon"],
         )
+
+        if gpu_only:
+            # Stream-mode layers stream every active expert whatever its count, so neither the
+            # probe nor the threshold applies (register_layer keeps one mode per device)
+            st["bw"], st["stream_t"] = None, 1
+            self.sstate[key] = st
+            return st
 
         # Probe pinned->device bandwidth once: the break-even assignment count for streaming an
         # expert scales inversely with the link's bandwidth, so a chipset-attached x4 card needs
@@ -1282,16 +1342,18 @@ class MoeCpuHost:
         while the cold tail runs on the CPU, compressed to the rows that still have at least one
         unmasked assignment. Tail jobs are issued before the streamed batches and collected
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
-        path when nothing qualifies.
+        path when nothing qualifies. A stream-mode layer instead streams every active expert of
+        every call, one-token decode included, and never submits a CPU job.
         """
         spec = self.specs[layer_idx]
+        gpu_only = self._stream_only(layer_idx, y.device)
         rows = y.shape[0]
-        if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
+        if ((rows < self.stream_min_rows and not gpu_only) or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
             return self.submit(layer_idx, y, selected_experts, routing_weights)
 
         with torch.cuda.device(y.device):
-            st = self._ensure_stream_state(y.device)
+            st = self._ensure_stream_state(y.device, gpu_only)
             E = spec["num_experts"]
             flat = selected_experts.reshape(-1)
             # Shifted histogram so any -1 sentinels land in bin 0 instead of polluting expert 0.
@@ -1303,12 +1365,16 @@ class MoeCpuHost:
             counts1.scatter_add_(0, shifted, torch.ones_like(shifted))
             counts1_h = counts1.tolist()
             neg, counts_h = counts1_h[0], counts1_h[1:]
-            streamed = [e for e in range(E) if counts_h[e] >= st["stream_t"]]
+            streamed = streamed_experts(counts_h, st["stream_t"], gpu_only)
             if TUNING.stream_debug:
                 n_str = sum(counts_h[e] for e in streamed)
                 print(f" -- stream L{layer_idx}: rows {rows}, streamed experts "
                       f"{len(streamed)}/{E}, assignments {n_str}/{sum(counts_h)}")
             if not streamed:
+                if gpu_only:
+                    # A split layer's rows may all have picked GPU-resident experts: its RAM
+                    # experts contribute zero, and no worker job is needed
+                    return torch.zeros_like(y, dtype = torch.float)
                 return self.submit(layer_idx, y, selected_experts, routing_weights)
             return self._submit_prefill_streamed(
                 layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
@@ -1362,11 +1428,12 @@ class MoeCpuHost:
         device buffers are allocated for real here (_device_buffers) so the load accounts for
         them"""
         spec = self.specs[layer_idx]
+        gpu_only = self._stream_only(layer_idx, device)
         h, hi = spec["ho"], spec["hi"]
         A = assignments
         # Plain CPU path: the fp32 output and the readback staging
         fixed = rows * h * 4 + min(self.cap_rows, rows) * h * 4
-        if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
+        if ((rows < self.stream_min_rows and not gpu_only) or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
             return fixed, 0
         aux = self.aux[layer_idx]
@@ -1413,6 +1480,13 @@ class MoeCpuHost:
         if deterministic and (rows > 0x7fffffff or h > 0x7fffffff
                               or rows * min(topk, 32) > 0x7fffffff):
             raise ValueError("Streamed MoE gather dimensions exceed the native int32 range")
+        # A stream-mode layer streams every expert with an assignment (streamed_experts with
+        # gpu_only), so no row is left for the CPU. Checked here on the host, from the counts the
+        # caller already read, before any work is issued: the CPU-tail mask below would cost
+        # every decoded token a second device synchronization per layer
+        stream_mode = spec["mode"] == "stream"
+        if stream_mode and sum(counts_h[e] for e in streamed) != sum(counts_h):
+            raise RuntimeError(f"CPU MoE: stream-only layer {layer_idx} would leave assignments for the CPU")
         # One spare row: the batched reconstruct tier's padding sink (never read back)
         out_ext = torch.zeros((rows + 1, h), dtype = torch.float, device = y.device)
         out = out_ext[:rows]
@@ -1433,20 +1507,21 @@ class MoeCpuHost:
         # Issue only; the waits and readbacks come after the streamed batches are enqueued.
         # The streamed table is built host-side and indexed with the shifted ids (entry 0 is the
         # -1 sentinel, always False), replacing the index_put/clamp/compare/and kernel chain
-        table = np.zeros(E + 1, dtype = np.bool_)
-        for e in streamed:
-            table[e + 1] = True
-        smask1 = torch.from_numpy(table).to(y.device, non_blocking = True)
-        is_streamed = smask1.index_select(0, shifted)
-        sel_tail = flat.masked_fill(is_streamed, -1).view(rows, topk)
-        tidx = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
-        n_tail = tidx.shape[0]
         tail_jobs = None
-        if n_tail:
-            out_t = torch.empty((n_tail, h), dtype = torch.float, device = y.device)
-            tail_jobs, rtmp = self._issue_compute(
-                layer_idx, y.index_select(0, tidx), sel_tail.index_select(0, tidx),
-                routing_weights.index_select(0, tidx), spec, out_t, h)
+        if not stream_mode:
+            table = np.zeros(E + 1, dtype = np.bool_)
+            for e in streamed:
+                table[e + 1] = True
+            smask1 = torch.from_numpy(table).to(y.device, non_blocking = True)
+            is_streamed = smask1.index_select(0, shifted)
+            sel_tail = flat.masked_fill(is_streamed, -1).view(rows, topk)
+            tidx = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
+            n_tail = tidx.shape[0]
+            if n_tail:
+                out_t = torch.empty((n_tail, h), dtype = torch.float, device = y.device)
+                tail_jobs, rtmp = self._issue_compute(
+                    layer_idx, y.index_select(0, tidx), sel_tail.index_select(0, tidx),
+                    routing_weights.index_select(0, tidx), spec, out_t, h)
 
         aux = self.aux[layer_idx]
         pd = spec["proj_dims"]

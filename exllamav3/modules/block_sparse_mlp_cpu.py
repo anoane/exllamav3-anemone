@@ -3,6 +3,7 @@ from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
+from ..model.moe_expert_policy import execution_mode
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
@@ -88,6 +89,12 @@ def run_pending_swap_sweeps(infer_params):
 
 
 class BlockSparseMLP_CPU:
+
+    def cpu_expert_mode(self) -> str:
+        """Execution mode of this layer's RAM-held experts (model/moe_expert_policy.py): "stream"
+        when infer_params.moe_cpu_mode is "stream_only", else "hybrid". Read when the layer
+        registers with the worker"""
+        return execution_mode(getattr(self.config.infer_params, "moe_cpu_mode", "compute"))
 
     def _cpu_init_state(self):
         self.cpu_offload = False
@@ -220,12 +227,13 @@ class BlockSparseMLP_CPU:
         """Hand the tail experts' share of the routed sum to the worker. Returns
         (cpu_partial, cpu_pending): decode-size batches use the two-phase issue/collect so
         the flag waits land AFTER the caller's GPU expert work (cpu_split_combine collects);
-        big prefill batches take the single-phase streamed path, which overlaps internally.
+        big prefill batches take the single-phase streamed path, which overlaps internally,
+        and so does every batch of a stream-mode layer, one-token decode included.
         Expert ids ship in the worker's local range with -1 sentinels for GPU-resident
         picks."""
         if self._split_map is not None:
             self._split_swap_tick()
-        if bsz < self.cpu_host.stream_min_rows:
+        if bsz < self.cpu_host.stream_min_rows and not self.cpu_host.gpu_only(self.cpu_layer_idx):
             # Fused fast path: one kernel does the map translate + staging writes straight
             # into the pinned slot, skipping the whole activation payload (and, downstream,
             # the worker compute and the readback) when no CPU expert was selected. Replaces
@@ -271,12 +279,13 @@ class BlockSparseMLP_CPU:
         batches are issued only, and cpu_split_combine collects them, so GPU work the caller
         enqueues in between (the shared expert) runs while the worker computes instead of
         behind the flag wait. Prefill-size batches take the streamed path, which overlaps
-        internally. The autosplit measuring forward only observes VRAM allocation, which the
-        CPU compute cannot affect, so it skips the (slow, full-chunk) host pass and just
-        allocates the output."""
+        internally, and so does every batch of a stream-mode layer, one-token decode included
+        (its experts never compute on the CPU). The autosplit measuring forward only observes
+        VRAM allocation, which the CPU compute cannot affect, so it skips the (slow, full-chunk)
+        host pass and just allocates the output."""
         if params.get("autosplit_measure"):
             return torch.zeros_like(y, dtype = torch.float).reshape(shape), None
-        if y.shape[0] < self.cpu_host.stream_min_rows:
+        if y.shape[0] < self.cpu_host.stream_min_rows and not self.cpu_host.gpu_only(self.cpu_layer_idx):
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, selected_experts, routing_weights)
         return self.cpu_host.submit_prefill(
@@ -332,6 +341,7 @@ class BlockSparseMLP_CPU:
         side effects when the layer is ineligible (non-mul1 codebook, K > 8, or mixed per-expert
         biases), in which case the caller falls back to the normal path.
         """
+        mode = self.cpu_expert_mode()
         stc = self.config.stc
         cpu = torch.device("cpu")
         experts = self.gates + self.ups + self.downs
@@ -440,9 +450,14 @@ class BlockSparseMLP_CPU:
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
+            device = self.device,
+            mode = mode,
         )
         self.cpu_offload = True
-        print(f" -- CPU-offloaded experts (worker): {self.key}")
+        if mode == "stream":
+            print(f" -- CPU-offloaded experts (streamed to {self.device}, no CPU compute): {self.key}")
+        else:
+            print(f" -- CPU-offloaded experts (worker): {self.key}")
         return True
 
 
@@ -456,6 +471,7 @@ class BlockSparseMLP_CPU:
         expert compute instead of serializing a whole layer. Registration only. The caller
         proceeds with the normal load, which now loads just the GPU slice.
         """
+        mode = self.cpu_expert_mode()
         stc = self.config.stc
         cpu = torch.device("cpu")
         first = self.num_experts - split_k
@@ -568,6 +584,8 @@ class BlockSparseMLP_CPU:
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
+            device = self.device,
+            mode = mode,
         )
 
         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never
@@ -584,8 +602,9 @@ class BlockSparseMLP_CPU:
         self.routing_first = 0
         self.routing_last = first
         self.cpu_split_first = first
-        mode = "dynamic" if self._split_dynamic else "static"
-        print(f" -- CPU split experts (worker, {mode}): {self.key} "
+        where = f"streamed to {self.device}, no CPU compute" if mode == "stream" else "worker"
+        swap = "dynamic" if self._split_dynamic else "static"
+        print(f" -- CPU split experts ({where}, {swap}): {self.key} "
               f"[{first}..{self.num_experts}) of {self.num_experts}")
         return True
 
