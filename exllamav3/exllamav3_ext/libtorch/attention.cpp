@@ -871,8 +871,9 @@ void BC_Attention::run
     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // With the native graph disabled (EXL3_HGEMM_FIXED_ROWS) every run is eager
+    if (s.graph->disabled || s.runs == 0)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
         s.runs = 1;

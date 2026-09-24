@@ -598,6 +598,101 @@ launches of that projection at 2048 / 4096 rows took 0.174 / 0.311 ms without it
 Those "without" numbers come from an extension built without the policy, before this setting
 existed; `0` leaves cuBLAS as that build did. Decode-shaped calls were not timed.
 
+### `EXL3_HGEMM_FIXED_ROWS` (default: `0`)
+
+Fixed row geometry for the native cuBLAS GEMMs, so that a row's result does not depend on how many
+other rows share the call. cuBLAS chooses its kernel, and with it how the K reduction is split
+and in what order the partial sums are added, from the whole problem: M, N, K, alignment and
+strides. The same input row can therefore come out different in the last bits in a 4096-row call
+than in a 2048-row or a one-row call, and `torch.matmul` behaves the same way. With `128`, every
+call instead runs as a series of identical `[128, K] x [K, N]` GEMMs: the input rows are copied
+into a packed 128-row scratch tile (the last tile zero-padded), cuBLAS multiplies the tile, and
+the valid rows are copied to the output. For a given GPU, K and N, each output row then depends
+only on its own input row: not on M, on where the row sits in the call, on the input's alignment
+or the output's row stride, or on the other matrices of a batched call.
+
+What it covers, every call that reaches the native GEMM (`exllamav3_ext/hgemm.cu`):
+
+- `hgemm`: FP16 linears whose output dtype differs from the input (e.g. FP16 in, FP32 out), the
+  cuBLAS fallback of the router scores, the FP16 gate projection of the native attention block,
+  the indexer projections of MLA and DeepSeek-V4 attention, the DeepSeek-V4 compressor, the
+  per-expert reconstruct path of streamed CPU-offload experts, and convolutions lowered to a
+  GEMM.
+- FP16 linears with FP16 input, weight and output: by default these take `torch.matmul` (Python
+  `LinearFP16`) or `at::matmul` (the eager path of the native `BC_LinearFP16`); with this setting
+  they take the fixed-row GEMM too. Other operand types (FP32, BF16) keep the matmul.
+- `hgemm_recon`: the prefill path of EXL3 linears (`reconstruct_hgemm`, above 144 rows) and the
+  per-expert MoE reconstruct path. The FP16-partial kernel of `EXL3_HGEMM_F16ACC` is bypassed
+  whatever that variable says: the tiles always run on cuBLAS with FP32 accumulation, and
+  `hgemm_f16acc_status()` reports `0` on every device.
+- `hgemm_batched`: the batched MoE reconstruct tier, now one matrix at a time through the same
+  tiles.
+
+It does not change any other kernel: the EXL3 GEMV and small-batch GEMM kernels (the direct
+quantized path at 144 rows or fewer), the fused MoE kernels, the int8 router projection,
+attention, norms and the element-wise kernels keep their own dispatch, and several of them also
+depend on the row count. On its own it therefore does not make a model's output independent of
+the chunk size (on DeepSeek-V4.1-Flash, 4096- and 2048-token chunked prefills still differed with
+it, p99 0.31 in actual-token log-probability); it removes one source of that dependence.
+
+Native CUDA graphs: the per-call scratch tiles are ordinary PyTorch allocations, and the
+engine's own graph wrapper (the internal CUDA graphs that the native attention, MLA, MLP,
+block-sparse MLP, GatedDeltaNet / Mamba2 and DeepSeek-V4 attention blocks capture for decode)
+records a raw stream capture without an allocator pool that would keep them alive for replay.
+With this setting every native graph is therefore disabled and those blocks run eagerly on every
+call; `Graph::capture_begin` refuses a disabled graph with a `RuntimeError` before any capture
+starts, so a block without the eager fallback fails loudly instead of replaying freed memory.
+Graphs captured from Python with `torch.cuda.graph` are unaffected (the scratch comes from their
+pool). With the setting off, graph behaviour is unchanged.
+
+Values: unset or `0`, the default dispatch; `128`, fixed rows. Anything else, including an
+empty value, raises a `ValueError` when `exllamav3` is imported (`exllamav3.model.math_policy`),
+and the native side refuses the same values with a `RuntimeError` on first use.
+
+When it is read: once in Python, when `exllamav3` is imported, and once in the extension, on the
+first GEMM or native block construction. Set it before importing `exllamav3`; changing it later
+does not reach the Python side and can leave the two sides disagreeing. `ext.hgemm_fixed_rows()`
+returns the native value.
+
+Requirements and refusals: the input and weight of a fixed-row GEMM must be packed (contiguous);
+a strided input raises `hgemm: fixed-row GEMM requires packed inputs` instead of being read
+wrongly. Outputs may be strided views, and may have more rows than the product (reusable output
+buffers): only the product's rows are written.
+
+Memory: two scratch tiles per call, `128 x K` FP16 and `128 x N` in the output dtype, whatever M:
+e.g. 1.25 MiB and 320 KiB (640 KiB for FP32 output) for K = 5120, N = 1280. They come from the
+caching allocator and are released after the call. No other allocation.
+
+Performance: a GEMM of M rows becomes `ceil(M / 128)` cuBLAS calls of a size that uses a large
+GPU poorly, plus two copies per tile. Measured on the first attention projection of
+DeepSeek-V4.1-Flash (4096 x 5120 x 1280, FP16), with the diagnostic form of this tiling: about
+2.6x the default time on an sm_80 GPU and 3.1x on an sm_120 GPU. Decode additionally loses the
+native CUDA graphs, i.e. pays the launch overhead of every kernel of every native block per
+token; that cost was not measured separately and grows with the number of small kernels a model
+launches. This is not a speed setting.
+
+Determinism: what it guarantees is stated above (per GPU, K and N). Results differ from the
+default dispatch, between GPU types, and from exact arithmetic (FP32 accumulation, one rounding to
+the output dtype). Within the covered GEMMs, `tests/test_hgemm_fixed_rows_.py` checks bitwise that
+1 to 4096-row calls, strided outputs with spare rows, and batched calls reproduce the rows of a
+4096-row call, on each visible GPU.
+
+When to use it: to take GEMM shape effects out of a comparison (e.g. when bisecting why two chunk
+sizes disagree), or as part of a row-count-independent arithmetic profile. Keep it unset for
+normal inference.
+
+```sh
+EXL3_HGEMM_FIXED_ROWS=128 python eval/ppl.py -m /path/to/model
+```
+
+```python
+import os
+os.environ["EXL3_HGEMM_FIXED_ROWS"] = "128"     # before importing exllamav3
+from exllamav3 import Config, Model
+from exllamav3.ext import exllamav3_ext as ext
+assert ext.hgemm_fixed_rows() == 128
+```
+
 ### `EXL3_MOE_COOP_KSPLIT` (default: unset)
 
 Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over

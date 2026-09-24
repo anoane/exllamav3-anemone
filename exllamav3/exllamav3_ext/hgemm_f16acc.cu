@@ -553,15 +553,17 @@ void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c)
     else f16acc::launch<false>(a, b, c, stream);
 }
 
-// 1 = fp16-accumulate kernel active on this device, 0 = cuBLAS (probe result or env override)
+// 1 = fp16-accumulate kernel active on this device, 0 = cuBLAS (probe result or env override;
+// always 0 with EXL3_HGEMM_FIXED_ROWS, whose tiles run on cuBLAS)
 int hgemm_f16acc_status(int device)
 {
+    if (hgemm_fixed_rows()) return 0;
     return f16acc::enabled(device) ? 1 : 0;
 }
 
 // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
 {
-    if (hgemm_f16acc_try(a, b, c)) return;
+    if (!hgemm_fixed_rows() && hgemm_f16acc_try(a, b, c)) return;
     hgemm(a, b, c);
 }

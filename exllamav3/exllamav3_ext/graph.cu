@@ -1,6 +1,7 @@
 #include <Python.h>
 #include <cstring>
 #include "graph.cuh"
+#include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 //#include <torch/extension.h>
@@ -15,7 +16,11 @@ Graph::Graph()
 {
     ready = false;
     ready_to_record = false;
-    disabled = false;
+    // EXL3_HGEMM_FIXED_ROWS: the fixed-row GEMM allocates ATen scratch on every call, and this
+    // wrapper's raw stream capture owns no allocator pool that would keep that scratch alive for
+    // replay. Every native block checks `disabled` and then runs eagerly. Graphs captured through
+    // torch.cuda.graph manage their own memory pool and are unaffected
+    disabled = hgemm_fixed_rows() != 0;
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
@@ -29,6 +34,9 @@ Graph::~Graph()
 
 cudaStream_t Graph::capture_begin()
 {
+    // A block that misses the eager fallback fails here, before a capture stream exists: failing
+    // inside the capture would also leave the stream in an invalid capture state
+    TORCH_CHECK(!disabled, "Graph: native graph capture is disabled under EXL3_HGEMM_FIXED_ROWS");
     #ifdef GRAPHDEBUG
         printf("Begin graph capture\n");
     #endif

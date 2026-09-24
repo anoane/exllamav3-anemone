@@ -4,6 +4,7 @@ from torch import nn
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import to2
 from ...util import first_not_none
+from ...model.math_policy import HGEMM_FIXED_ROWS
 
 class LinearFP16:
 
@@ -90,7 +91,11 @@ class LinearFP16:
             from ...util.tensor import g_tensor_cache
             weight = g_tensor_cache.get_bucketed(x.device, pinned.numel(), pinned.dtype, "fp16_pin_stage").view(pinned.shape)
             weight.copy_(pinned, non_blocking = True)
-        if dtype == x.dtype:
+        if HGEMM_FIXED_ROWS and x.dtype == torch.half and weight.dtype == torch.half:
+            # EXL3_HGEMM_FIXED_ROWS: FP16 operands take the native GEMM in fixed 128-row tiles,
+            # like BC_LinearFP16; torch.matmul chooses its algorithm by row count
+            ext.hgemm(x, weight, y)
+        elif dtype == x.dtype:
             torch.matmul(x, weight, out = y)
         else:
             ext.hgemm(x, weight, y)

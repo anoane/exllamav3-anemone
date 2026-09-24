@@ -10,7 +10,10 @@
 
 void BC_LinearFP16::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
 {
-    if (x.dtype() == y.dtype() && !graph)
+    // EXL3_HGEMM_FIXED_ROWS: FP16 operands take the fixed-row GEMM (as LinearFP16 does in Python);
+    // torch's matmul picks its algorithm by row count
+    bool fixed_rows = hgemm_fixed_rows() && x.dtype() == at::kHalf && weight.dtype() == at::kHalf;
+    if (x.dtype() == y.dtype() && !graph && !fixed_rows)
         at::matmul_out(y, x, weight);
     else
         hgemm_gr(x, weight, y, graph);

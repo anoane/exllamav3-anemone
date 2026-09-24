@@ -2,12 +2,15 @@
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAStream.h>
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include <limits>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 
 /*
 
@@ -17,6 +20,21 @@ Row-major matmul using cuBLAS, a @ b -> c
 */
 
 using bfloat16 = __nv_bfloat16;
+
+// EXL3_HGEMM_FIXED_ROWS=128 runs every GEMM in this file as a sequence of 128-row cuBLAS calls
+// and bypasses the fp16-accumulator kernel (hgemm_f16acc.cu); 0 or unset keeps the default
+// dispatch, any other value is an error. Read once, on first use
+int hgemm_fixed_rows()
+{
+    static const int rows = []()
+    {
+        const char* value = std::getenv("EXL3_HGEMM_FIXED_ROWS");
+        if (!value || !std::strcmp(value, "0")) return 0;
+        TORCH_CHECK(!std::strcmp(value, "128"), "EXL3_HGEMM_FIXED_ROWS must be 0 or 128");
+        return 128;
+    }();
+    return rows;
+}
 
 // EXL3_HGEMM_FP32_REDUCTION: 1 (default) keeps the intermediate reductions of every cuBLAS GEMM
 // in this file in fp32 (require_fp32_reductions, below); 0 leaves the handle's math mode as it is,
@@ -57,7 +75,8 @@ static void hgemm_gemmex_impl
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool allow_fixed_rows = true
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
@@ -79,12 +98,46 @@ static void hgemm_gemmex_impl
     const half* a_ptr = (const half*) a.data_ptr();
     const half* b_ptr = (const half*) b.data_ptr();
 
-    int size_k = a.size(-1);
-    int size_m = a.numel() / size_k;
-    int size_n = b.size(-1);
+    const int64_t k64 = a.size(-1);
+    TORCH_CHECK(k64 > 0, "hgemm: positive reduction dimension required");
+    const int64_t m64 = a.numel() / k64;
+    const int64_t n64 = b.size(-1);
+    const auto int_limit = std::numeric_limits<int>::max();
+    TORCH_CHECK(k64 <= int_limit && m64 <= int_limit && n64 <= int_limit, "hgemm: dimension exceeds int32");
+    int size_k = k64, size_m = m64, size_n = n64;
     int64_t c_stride_m = c.stride(-2);
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
+
+    if (allow_fixed_rows && hgemm_fixed_rows())
+    {
+        // Fixed row geometry: cuBLAS chooses its algorithm, including how the K reduction is
+        // split, from the whole problem shape, so one input row can come out differently in a
+        // 4096-row call than in a 2048-row one. Here every call is a series of identical
+        // [128, K] x [K, N] GEMMs on a packed, zero-padded scratch tile, whatever M, the input
+        // alignment or the output stride, so each output row depends only on its own input row
+        // (for a given GPU, K and N). Not a guarantee across GPU types or of exact arithmetic.
+        // Scratch is two tiles whatever M; allocations, copies and GEMMs use the given stream
+        TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "hgemm: fixed-row GEMM requires packed inputs");
+        // Reconstruct callers may pass a reusable output buffer with more rows than the
+        // product; only the leading M rows are written
+        TORCH_CHECK(c.numel() >= (int64_t) size_m * size_n, "hgemm: output too small for fixed-row GEMM");
+        c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream, a.get_device()));
+        const int rows = hgemm_fixed_rows();
+        auto input = a.view({size_m, size_k});
+        auto output = c.as_strided({size_m, size_n}, {c_stride_m, 1});
+        auto a_tile = at::empty({rows, size_k}, a.options());
+        auto c_tile = at::empty({rows, size_n}, c.options());
+        for (int64_t begin = 0; begin < size_m; begin += rows)
+        {
+            const int count = std::min<int64_t>(rows, size_m - begin);
+            a_tile.narrow(0, 0, count).copy_(input.narrow(0, begin, count));
+            if (count < rows) a_tile.narrow(0, count, rows - count).zero_();
+            hgemm_gemmex_impl(a_tile, b, c_tile, stream, false);
+            output.narrow(0, begin, count).copy_(c_tile.narrow(0, 0, count));
+        }
+        return;
+    }
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
@@ -153,7 +206,7 @@ void hgemm_batched
 )
 {
     // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS
-    if (hgemm_f16acc_try(a, w, c)) return;
+    if (!hgemm_fixed_rows() && hgemm_f16acc_try(a, w, c)) return;
 
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -177,6 +230,15 @@ void hgemm_batched
     int size_k = a.size(2);
     int size_n = w.size(2);
     if (!batch || !size_m || !size_n || !size_k) return;
+
+    if (hgemm_fixed_rows())
+    {
+        // Fixed row geometry: one matrix at a time through the same 128-row tiles, so a
+        // matrix's result does not depend on how many others share the batch
+        for (int i = 0; i < batch; ++i)
+            hgemm_gemmex_impl(a[i], w[i], c[i], stream);
+        return;
+    }
 
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas_handle, stream);

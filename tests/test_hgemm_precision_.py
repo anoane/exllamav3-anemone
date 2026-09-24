@@ -4,8 +4,9 @@
 kernel (EXL3_HGEMM_F16ACC) is active on the device, which has its own error contract and is
 covered by test_hgemm_f16acc.py; those two entry points are checked here only on devices where
 cuBLAS is selected, and test_cublas_coverage_of_batched_and_recon reports the other devices as a
-skip. Run with EXL3_HGEMM_F16ACC=0 to cover them on every device. The tests do not
-promise bitwise equality between different matrix shapes or GPU types.
+skip. Run with EXL3_HGEMM_F16ACC=0 to cover them on every device, or with EXL3_HGEMM_FIXED_ROWS=128
+to check the same contract through the fixed 128-row tiles (which always use cuBLAS). The tests do
+not promise bitwise equality between different matrix shapes or GPU types.
 
 EXL3_HGEMM_FP32_REDUCTION (the policy's switch) is checked in child processes that import the
 compiled extension and need no GPU: read once, default 1, only 0 and 1 accepted. A child that
@@ -28,8 +29,9 @@ class GemmPrecision(unittest.TestCase):
         cls.ext = exllamav3_ext
         cls.devices = list(range(torch.cuda.device_count()))
         cls.cublas_devices = [d for d in cls.devices if cls.ext.hgemm_f16acc_status(d) == 0]
-        if os.environ.get("EXL3_HGEMM_F16ACC") == "0" and cls.cublas_devices != cls.devices:
-            raise AssertionError("EXL3_HGEMM_F16ACC=0 did not select cuBLAS on every device")
+        for name, value in (("EXL3_HGEMM_F16ACC", "0"), ("EXL3_HGEMM_FIXED_ROWS", "128")):
+            if os.environ.get(name) == value and cls.cublas_devices != cls.devices:
+                raise AssertionError(f"{name}={value} did not select cuBLAS on every device")
 
     def entry_points(self, device):
         fns = [self.ext.hgemm]
