@@ -6,6 +6,7 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
+from ...model.math_policy import STABLE_ARITHMETIC
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
@@ -54,6 +55,15 @@ class LinearEXL3:
             from ...model.config import NullConfig
             config = NullConfig()
         self.config = config
+        if STABLE_ARITHMETIC:
+            # Every call reconstructs the weights in the original basis (see forward), which needs
+            # the reconstruct path and 128-aligned dims; refused here, at load, not mid-forward
+            if config.infer_params.no_reconstruct:
+                raise ValueError(f"{key}: EXL3_STABLE_ARITHMETIC=1 reconstructs EXL3 weights at every row count, "
+                                 f"but infer_params.no_reconstruct is set")
+            if in_features % 128 or out_features % 128:
+                raise ValueError(f"{key}: EXL3_STABLE_ARITHMETIC=1 needs 128-aligned dims for original-basis "
+                                 f"reconstruction, got {in_features} x {out_features}")
         self.transformers_fix = transformers_fix
         self.key = key
 
@@ -134,7 +144,8 @@ class LinearEXL3:
         # and break CUDA-graph address stability)
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
 
-        reconstruct = params.get("reconstruct")
+        # EXL3_STABLE_ARITHMETIC: no row-count threshold, every call takes the reconstruct path
+        reconstruct = STABLE_ARITHMETIC or params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
@@ -185,8 +196,10 @@ class LinearEXL3:
             )
 
         # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
-        # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
-        use_fused = self._fused_reconstruct and rows >= 1024
+        # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes.
+        # EXL3_STABLE_ARITHMETIC keeps the original basis at every row count: moving the
+        # Hadamard transforms across an FP16 rounding changes the result
+        use_fused = self._fused_reconstruct and (STABLE_ARITHMETIC or rows >= 1024)
 
         if use_fused:
             xh = x

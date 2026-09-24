@@ -4,7 +4,8 @@ dispatch that follows it, and the eager fallback of the native graph wrapper.
 
 The CPU classes (a source check of every native graph capture, the LinearFP16 dispatch) run
 anywhere, without the compiled extension. The GPU classes need a process started with the
-variable set, because it is read once (at import in Python, on first use natively):
+variable set (or EXL3_STABLE_ARITHMETIC=1, which implies it), because it is read once (at import
+in Python, on first use natively):
 
     EXL3_HGEMM_FIXED_ROWS=128 python -m pytest tests/test_hgemm_fixed_rows_.py
     EXL3_HGEMM_FIXED_ROWS=128 EXL3_TEST_MODEL=/path/to/exl3/model python -m pytest tests/test_hgemm_fixed_rows_.py
@@ -15,6 +16,7 @@ here claims equality with the default dispatch or between GPU types.
 """
 import ast
 import gc
+import importlib.util
 import os
 import re
 import unittest
@@ -26,7 +28,13 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = ROOT / "exllamav3" / "exllamav3_ext"
-FIXED_ROWS = os.environ.get("EXL3_HGEMM_FIXED_ROWS") == "128"
+# The policy as the engine reads it (math_policy.py is torch-free and loads by path):
+# EXL3_HGEMM_FIXED_ROWS=128, or implied by EXL3_STABLE_ARITHMETIC=1
+_spec = importlib.util.spec_from_file_location("_math_policy", ROOT / "exllamav3/model/math_policy.py")
+_policy = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_policy)
+FIXED_ROWS = _policy.hgemm_fixed_rows() == 128
+NEEDS = "needs CUDA and fixed-row GEMMs (EXL3_HGEMM_FIXED_ROWS=128 or EXL3_STABLE_ARITHMETIC=1)"
 
 
 def function_bodies(text):
@@ -130,7 +138,7 @@ class LinearFP16DispatchTests(unittest.TestCase):
             self.assertEqual(self.run_forward(fixed_rows, 7, torch.half, torch.float), 1)
 
 
-@unittest.skipUnless(torch.cuda.is_available() and FIXED_ROWS, "needs CUDA and EXL3_HGEMM_FIXED_ROWS=128")
+@unittest.skipUnless(torch.cuda.is_available() and FIXED_ROWS, NEEDS)
 class FixedRowGemmTests(unittest.TestCase):
 
     @classmethod
@@ -196,7 +204,7 @@ class FixedRowGemmTests(unittest.TestCase):
                     self.assertTrue(bool((c == 24 * multiplier).all()))
 
 
-@unittest.skipUnless(torch.cuda.is_available() and FIXED_ROWS, "needs CUDA and EXL3_HGEMM_FIXED_ROWS=128")
+@unittest.skipUnless(torch.cuda.is_available() and FIXED_ROWS, NEEDS)
 class EagerNativeBlockTests(unittest.TestCase):
     """Decode through the native blocks with their graphs disabled: runs, and matches the
     teacher-forced no-cache forward to kernel precision (the two paths use different kernels)"""

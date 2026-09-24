@@ -109,6 +109,7 @@ def execute(nodes, extra = None):
               _LAYER_KEY = module_assignment(MIXIN, "_LAYER_KEY"),
               TUNING = NS(stream_debug = False, stream_fused_t = 8, stream_deterministic = False,
                           fused_prefill = False),
+              STABLE_ARITHMETIC = False,
               _split_fused = False, _split_prof = False)
     ns.update(extra or {})
     tree = ast.fix_missing_locations(ast.Module(body = nodes, type_ignores = []))

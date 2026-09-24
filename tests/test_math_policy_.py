@@ -14,7 +14,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / "exllamav3" / "model" / "math_policy.py"
-POLICY_VARS = ("EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL", "EXL3_MOE_FUSED_DET")
+POLICY_VARS = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL", "EXL3_MOE_FUSED_DET",
+               "EXL3_NO_FUSED_RECONSTRUCT")
 
 
 def load(environ):
@@ -78,6 +79,51 @@ class FusedPrefillTests(unittest.TestCase):
         policy = load({})
         with self.assertRaisesRegex(ValueError, "EXL3_MOE_FUSED_DET=0"):
             policy.fused_prefill_enabled({"EXL3_MOE_FUSED_PREFILL": "1", "EXL3_MOE_FUSED_DET": "0"})
+
+
+class StableArithmeticTests(unittest.TestCase):
+
+    def test_off_by_default(self):
+        for environ in ({}, {"EXL3_STABLE_ARITHMETIC": "0"}):
+            module = load(environ)
+            self.assertEqual((module.STABLE_ARITHMETIC, module.HGEMM_FIXED_ROWS, module.FUSED_PREFILL), (False, 0, False))
+
+    def test_one_variable_implies_the_others(self):
+        # Unset, or set to the implied value: both accepted (drivers that set all three still work)
+        for extra in ({}, {"EXL3_HGEMM_FIXED_ROWS": "128"}, {"EXL3_MOE_FUSED_PREFILL": "1"},
+                      {"EXL3_HGEMM_FIXED_ROWS": "128", "EXL3_MOE_FUSED_PREFILL": "1", "EXL3_MOE_FUSED_DET": "1"},
+                      {"EXL3_NO_FUSED_RECONSTRUCT": "0"}):
+            with self.subTest(extra = extra):
+                module = load({"EXL3_STABLE_ARITHMETIC": "1", **extra})
+                self.assertEqual((module.STABLE_ARITHMETIC, module.HGEMM_FIXED_ROWS, module.FUSED_PREFILL), (True, 128, True))
+
+    def test_other_values_refused(self):
+        policy = load({})
+        for value in ("", "2", "true", "yes", " 1"):
+            with self.subTest(value = value), self.assertRaisesRegex(ValueError, "EXL3_STABLE_ARITHMETIC must be 0 or 1"):
+                policy.stable_arithmetic_enabled({"EXL3_STABLE_ARITHMETIC": value})
+
+    def test_contradictions_refused_by_every_reader(self):
+        policy = load({})
+        for extra, message in (({"EXL3_HGEMM_FIXED_ROWS": "0"}, "implies EXL3_HGEMM_FIXED_ROWS=128"),
+                               ({"EXL3_MOE_FUSED_PREFILL": "0"}, "implies EXL3_MOE_FUSED_PREFILL=1"),
+                               ({"EXL3_MOE_FUSED_DET": "0"}, "EXL3_MOE_FUSED_DET=0"),
+                               ({"EXL3_NO_FUSED_RECONSTRUCT": "1"}, "EXL3_NO_FUSED_RECONSTRUCT"),
+                               ({"EXL3_NO_FUSED_RECONSTRUCT": ""}, "EXL3_NO_FUSED_RECONSTRUCT")):
+            environ = {"EXL3_STABLE_ARITHMETIC": "1", **extra}
+            for reader in (policy.stable_arithmetic_enabled, policy.hgemm_fixed_rows, policy.fused_prefill_enabled):
+                with self.subTest(extra = extra, reader = reader.__name__), self.assertRaisesRegex(ValueError, message):
+                    reader(environ)
+
+    def test_only_the_variable_in_a_fresh_process(self):
+        # The import-time constants when EXL3_STABLE_ARITHMETIC=1 is the only policy variable set
+        code = ("import importlib.util as u; s = u.spec_from_file_location('p', %r); m = u.module_from_spec(s); "
+                "s.loader.exec_module(m); print(m.STABLE_ARITHMETIC, m.HGEMM_FIXED_ROWS, m.FUSED_PREFILL)" % str(PATH))
+        environ = {k: v for k, v in os.environ.items() if k not in POLICY_VARS}
+        environ["EXL3_STABLE_ARITHMETIC"] = "1"
+        r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split(), ["True", "128", "True"])
 
 
 if __name__ == "__main__":

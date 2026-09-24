@@ -7,6 +7,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
+#include "stable_arithmetic.h"
 #include <limits>
 #include <cstdlib>
 #include <cstring>
@@ -23,13 +24,19 @@ using bfloat16 = __nv_bfloat16;
 
 // EXL3_HGEMM_FIXED_ROWS=128 runs every GEMM in this file as a sequence of 128-row cuBLAS calls
 // and bypasses the fp16-accumulator kernel (hgemm_f16acc.cu); 0 or unset keeps the default
-// dispatch, any other value is an error. Read once, on first use
+// dispatch, any other value is an error. EXL3_STABLE_ARITHMETIC=1 implies 128 (an explicit 0 is
+// an error). Read once, on first use
 int hgemm_fixed_rows()
 {
     static const int rows = []()
     {
         const char* value = std::getenv("EXL3_HGEMM_FIXED_ROWS");
-        if (!value || !std::strcmp(value, "0")) return 0;
+        if (!value || !std::strcmp(value, "0"))
+        {
+            TORCH_CHECK(!(value && stable_arithmetic()),
+                        "EXL3_STABLE_ARITHMETIC=1 implies EXL3_HGEMM_FIXED_ROWS=128, but it is set to 0");
+            return stable_arithmetic() ? 128 : 0;
+        }
         TORCH_CHECK(!std::strcmp(value, "128"), "EXL3_HGEMM_FIXED_ROWS must be 0 or 128");
         return 128;
     }();

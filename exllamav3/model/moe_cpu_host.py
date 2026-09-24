@@ -8,7 +8,7 @@ import torch
 from ..ext import exllamav3_ext as ext
 from .moe_expert_policy import validate_streaming, streamed_experts
 from .moe_stream_slots import slot_layout, slot_rows_bound
-from .math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT
+from .math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
@@ -729,6 +729,14 @@ class MoeCpuHost:
         # the CPU
         if mode not in ("hybrid", "stream"):
             raise ValueError(f"CPU MoE: unknown execution mode {mode!r} for {key}")
+        if STABLE_ARITHMETIC and mode != "stream":
+            # The CPU worker's arithmetic depends on the host and on how rows split between CPU
+            # and GPU; refused before the worker starts
+            raise RuntimeError(f"CPU MoE: EXL3_STABLE_ARITHMETIC=1 computes every expert on the GPU, but "
+                               f"{key}'s experts would be computed by the CPU worker; use -mcm stream_only "
+                               f"(EXL3_MOE_CPU_MODE=stream_only) or experts=stream in a placement. Next to a "
+                               f"placement, which refuses -mcm and does not cover -dmcl layers (an MTP head or "
+                               f"a draft model), keep those layers' experts in VRAM")
         index = None
         if device is not None:
             dev = torch.device(device)

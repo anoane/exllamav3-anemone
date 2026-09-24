@@ -11,6 +11,7 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
+from ..model.math_policy import STABLE_ARITHMETIC
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
@@ -273,10 +274,11 @@ class MLP(Module):
     ) -> torch.Tensor:
 
         # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
-        # the third invocation on
+        # the third invocation on. EXL3_STABLE_ARITHMETIC keeps decode on the linears below, the
+        # arithmetic prefill uses
         bsz, q_len, _ = x.shape
         if (
-            self.bc is not None and bsz == 1 and q_len == 1 and
+            not STABLE_ARITHMETIC and self.bc is not None and bsz == 1 and q_len == 1 and
             x.dtype == torch.float16 and x.is_contiguous()
         ):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
@@ -745,12 +747,14 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                # EXL3_STABLE_ARITHMETIC: every row count takes the separate gate/up linears, the
+                # arithmetic of prefill, instead of the small-batch fused kernel or the grouped GEMM
+                if not STABLE_ARITHMETIC and self.bc is not None and bsz * q_len <= MAX_BSZN:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))
 
-                elif self.multi_gu[s] is None or bsz * q_len > 32:
+                elif STABLE_ARITHMETIC or self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u

@@ -10,6 +10,7 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#include "stable_arithmetic.h"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -197,6 +198,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("hgemm_fixed_rows", &hgemm_fixed_rows, "hgemm_fixed_rows");
     m.def("hgemm_fp32_reduction", &hgemm_fp32_reduction, "hgemm_fp32_reduction");
+    m.def("stable_arithmetic", &stable_arithmetic, "stable_arithmetic");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");

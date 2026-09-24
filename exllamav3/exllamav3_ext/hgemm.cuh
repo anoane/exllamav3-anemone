@@ -3,8 +3,9 @@
 #include <ATen/Tensor.h>
 #include "graph.cuh"
 
-// EXL3_HGEMM_FIXED_ROWS: 128 when the GEMMs of hgemm.cu run as fixed 128-row cuBLAS tiles, else
-// 0. Read once, on first use; the native Graph wrapper and BC_LinearFP16 consult it too
+// EXL3_HGEMM_FIXED_ROWS: 128 when the GEMMs of hgemm.cu run as fixed 128-row cuBLAS tiles (also
+// implied by EXL3_STABLE_ARITHMETIC), else 0. Read once, on first use; the native Graph wrapper and
+// BC_LinearFP16 consult it too
 int hgemm_fixed_rows();
 
 // EXL3_HGEMM_FP32_REDUCTION: 1 (default) when the cuBLAS GEMMs of hgemm.cu disallow reduced-precision

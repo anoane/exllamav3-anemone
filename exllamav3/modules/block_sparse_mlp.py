@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
-from ..model.math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT
+from ..model.math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
@@ -1021,8 +1021,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # always fall through to the exl3_moe/dense path first, capping this tier's reach at
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
-        # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py).
+        # EXL3_STABLE_ARITHMETIC sends every row count to the fused path below instead, whose
+        # arithmetic prefill uses too
+        bszn_eligible = not STABLE_ARITHMETIC and self.bc is not None and bsz <= MAX_BSZN
 
         # Routing
         if self.router_pre_norm:
@@ -1087,6 +1089,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Torch/C++/fused path
         elif (
+            STABLE_ARITHMETIC or
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
             not (self.support_quant_paths or bszn_eligible)
@@ -1409,7 +1412,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
-                if bsz > 32:
+                # EXL3_STABLE_ARITHMETIC: the gate projection as its own linear at every row count
+                if STABLE_ARITHMETIC or bsz > 32:
                     z = self.shared_gate.forward(x, params)
                     ext.add_sigmoid_gate(y, z, final_hidden_states)
                 else:

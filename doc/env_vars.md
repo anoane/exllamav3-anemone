@@ -361,9 +361,9 @@ token), so `EXL3_MOE_PINNED_ARENA=1` is recommended with `stream_only`; and a ca
 do not fit one staging slot is serialized through the `EXL3_MOE_CPU_WSLOTS` slots (at 11.25 MiB
 per expert a 32 MiB slot holds two, so a top-6 token's experts pass through the two default
 slots in three batches). Prefill chunks select most experts anyway and amortize the transfer
-over their rows. Measured on DeepSeek-V4.1-Flash on two GPUs with the experts of 11 layers in system
-RAM, 64K-token prefill: 796 tok/s with `stream_only` (and GPU arithmetic independent of the row
-count) against 1040 tok/s with `compute` (default arithmetic). The two runs differ in more than
+over their rows. Measured on DeepSeek-V4.1-Flash on two GPUs with the experts of 11 layers in
+system RAM, 64K-token prefill: 796 tok/s with `stream_only` (and `EXL3_STABLE_ARITHMETIC=1`)
+against 1040 tok/s with `compute` (default arithmetic). The two runs differ in more than
 this setting, so the figure bounds its cost rather than isolating it; decode was not measured.
 
 Determinism: `stream_only` removes the CPU's arithmetic, whose results depend on the CPU's
@@ -378,7 +378,8 @@ and the GPU type, as described under `EXL3_MOE_FUSED_DET`.
 
 When to use it: when the host CPU is slow relative to the PCIe link, or when results must not
 depend on the CPU (reproducibility checks, comparisons across machines). With a fast CPU and a
-narrow link, `compute` decodes faster.
+narrow link, `compute` decodes faster. `EXL3_STABLE_ARITHMETIC=1` requires it for every
+offloaded layer (refused at load otherwise).
 
 ```sh
 python examples/chat.py -m /path/to/model -mcl 8 -mcm stream_only
@@ -650,6 +651,7 @@ pool). With the setting off, graph behaviour is unchanged.
 Values: unset or `0`, the default dispatch; `128`, fixed rows. Anything else, including an
 empty value, raises a `ValueError` when `exllamav3` is imported (`exllamav3.model.math_policy`),
 and the native side refuses the same values with a `RuntimeError` on first use.
+`EXL3_STABLE_ARITHMETIC=1` implies `128`; an explicit `0` with it is refused.
 
 When it is read: once in Python, when `exllamav3` is imported, and once in the extension, on the
 first GEMM or native block construction. Set it before importing `exllamav3`; changing it later
@@ -680,8 +682,8 @@ the output dtype). Within the covered GEMMs, `tests/test_hgemm_fixed_rows_.py` c
 4096-row call, on each visible GPU.
 
 When to use it: to take GEMM shape effects out of a comparison (e.g. when bisecting why two chunk
-sizes disagree), or as part of a row-count-independent arithmetic profile. Keep it unset for
-normal inference.
+sizes disagree), or as part of the row-count-independent profile `EXL3_STABLE_ARITHMETIC`, which
+sets it. Keep it unset for normal inference.
 
 ```sh
 EXL3_HGEMM_FIXED_ROWS=128 python eval/ppl.py -m /path/to/model
@@ -807,7 +809,8 @@ stripe height, and no longer limit the tier.
 
 Values: `0` (default) or `1`. Anything else raises a `ValueError` when `exllamav3` is imported,
 as does `1` together with `EXL3_MOE_FUSED_DET=0` (the setting exists for reproducible arithmetic,
-which atomic accumulation would undo). Read once, at import; set it before importing `exllamav3`.
+which atomic accumulation would undo). `EXL3_STABLE_ARITHMETIC=1` implies `1`; an explicit `0`
+with it is refused. Read once, at import; set it before importing `exllamav3`.
 `MoeCpuTuning.fused_prefill` holds the streamed tier's copy.
 
 Refused, never a silent fallback to the reconstruct tiers:
@@ -863,8 +866,8 @@ DeepSeek-V4.1-Flash experts (17 to 1025 input rows, 16/64/256-row buffers, both 
 tiles, two GPU types) and whole-model scores over 4,104 predictions were bitwise equal between
 striped and full-height buffers, measured together with the other row-count-independent changes.
 
-When to use it: as part of a row-count-independent arithmetic profile, or to take the tier
-boundaries out of a comparison. Keep it off for throughput.
+When to use it: as part of the row-count-independent profile `EXL3_STABLE_ARITHMETIC`, which
+sets it, or to take the tier boundaries out of a comparison. Keep it off for throughput.
 
 ```sh
 EXL3_MOE_FUSED_PREFILL=1 python eval/ppl.py -m /path/to/moe/model
@@ -1017,6 +1020,110 @@ read.
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
+
+## Reproducible arithmetic
+
+### `EXL3_STABLE_ARITHMETIC` (default: `0`)
+
+Opt-in arithmetic profile for results that do not depend on how many rows a call processes. With
+the default dispatch the same token can get slightly different logits depending on the prefill
+chunk size, on whether it was decoded one token at a time or prefilled, or on how much of a prompt
+was reused from the cache, because several operations switch kernels, algorithms or numeric
+formulations by row count: cuBLAS picks its reduction per problem shape, EXL3 linears use direct
+quantized kernels up to 144 rows and rotate the Hadamard transforms across an FP16 rounding below
+1024 rows, MLPs and MoE layers have separate small-batch decode kernels, and routed experts move
+between the fused kernel and the reconstruct tiers with their row count. The differences are
+last-bit rounding, but they can flip a near-tie (a top-k selection, a greedy token) and then grow.
+With `1` each operation below takes one arithmetic path at every row count, the one prefill uses:
+
+- `EXL3_HGEMM_FIXED_ROWS=128` is implied: native GEMMs in fixed 128-row cuBLAS tiles, FP16
+  linears through them, native CUDA graphs disabled (see that entry).
+- `EXL3_MOE_FUSED_PREFILL=1` is implied: every routed expert of a fused-path call through the
+  fused kernel, in row stripes (see that entry).
+- EXL3 linears dispatched through `LinearEXL3.forward` reconstruct their weights at every row
+  count, decode included, instead of using the direct quantized kernels up to 144 rows, and always
+  in the original basis (Hadamard transforms folded into the weights) instead of the rotated
+  basis below 1024 rows. Projections that native blocks or grouped kernels run themselves are not
+  among them (see what it does not cover, below).
+- MLPs and gated MLPs, shared experts included, run their separate linears at every row count:
+  no native single-token or small-batch block (`run_bsz1`, `run_bszN`) and no grouped gate/up
+  GEMM for up to 32 rows.
+- Block-sparse MoE layers send every row count, decode included, to the fused routed-expert path
+  instead of the 1-8-row decode kernels, and apply a shared-expert gate as its own linear instead
+  of the fused gate projection used up to 32 rows.
+- Experts held in system RAM must be computed on the GPU: offloaded layers must register in
+  stream mode (`-mcm stream_only` / `EXL3_MOE_CPU_MODE=stream_only`, or `experts=stream` in a
+  placement). The CPU worker's arithmetic depends on the host and on how rows split between CPU and
+  GPU. With an explicit placement `-mcm` is refused, so the RAM-held experts of layers the
+  placement does not cover (`-dmcl`: an MTP head or a draft model) stay CPU-computed and are
+  refused under the profile: with a placement, keep those experts in VRAM.
+
+Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported. It
+may be combined with `EXL3_HGEMM_FIXED_ROWS` and `EXL3_MOE_FUSED_PREFILL` left unset or set to
+the implied values (`128`, `1`), so scripts that set all three keep working.
+
+When it is read: once in Python, when `exllamav3` is imported (the constants of
+`exllamav3.model.math_policy`, which the modules above import), and once in the extension, on
+first use (`ext.stable_arithmetic()`, `ext.hgemm_fixed_rows()`). Set it in the environment of the
+process, before importing `exllamav3`. There is deliberately no command-line flag or `Config`
+attribute: a switch applied after the import would change the native side and not the frozen
+Python constants, and give a silently mixed profile.
+
+Refused, as an error rather than a partial profile:
+
+- at import, a value other than `0`/`1`, `EXL3_HGEMM_FIXED_ROWS=0`, `EXL3_MOE_FUSED_PREFILL=0`,
+  `EXL3_MOE_FUSED_DET=0` (atomic expert accumulation) or `EXL3_NO_FUSED_RECONSTRUCT` set to
+  anything but `0` (rotated-basis reconstruction), each with a `ValueError` naming the variable;
+- at load, an EXL3 linear with `infer_params.no_reconstruct` set or dims that are not multiples
+  of 128, an offloaded MoE layer whose experts would be computed by the CPU worker (before the
+  worker starts; this includes `-dmcl` layers next to an explicit placement), and everything
+  `EXL3_MOE_FUSED_PREFILL` refuses.
+
+What it does not cover: operations not listed above keep their row-count-dependent dispatch,
+among them the attention kernels of most architectures (prefill and decode kernels differ); the
+projections inside the native decode blocks (attention and MLA with `EXL3_BC_ATTN` /
+`EXL3_BC_MLA`, GatedDeltaNet / KDA with `EXL3_BC_GDN`, Mamba2), which run their EXL3 projections
+through the direct quantized kernels themselves, and the grouped q/k/v(/z) `exl3_mgemm` that
+attention, sliding-window attention and GatedDeltaNet use for calls of up to 32 rows, so on
+those architectures decode and prefill projections still differ; the GatedDeltaNet / KDA prefill
+path (its token-major convolution rounds the projection to BF16 only
+for calls of up to 32 rows), the n-gram embedding (PLE) projections (`at::matmul` in 1024-row
+slabs inside the extension), DeepSeek-V4's native attention block and hyper-connection head,
+tensor parallelism, and the CPU. Results also still differ between GPU types. The profile has
+only been validated end to end on DeepSeek-V4.1-Flash.
+
+Memory: the fixed-row GEMM tiles (two tiles per GEMM call), no reconstruct-tier slabs. Decoding
+through the reconstruct path allocates each linear's dequantized weights per call (`in x out`
+FP16, in slices of at most 32768 columns), the same transient every long prefill already
+allocates and the autosplit already measures.
+
+Performance: slower, in prefill and much more in decode. Every decoded token reconstructs the
+weights of every EXL3 linear that `LinearEXL3.forward` dispatches and runs the MoE layers through
+the prefill kernels, without native CUDA graphs; prefill pays the fixed-row GEMM tiles (2.6x-3.1x on
+a large projection, see `EXL3_HGEMM_FIXED_ROWS`) and fused-only experts. On DeepSeek-V4.1-Flash on
+two GPUs with the experts of 11 layers in system RAM, a 64K-token scoring pass ran at 796 tok/s with
+the complete profile (experts streamed) against 1040 tok/s with the default arithmetic (experts
+computed by the CPU), so the two runs differ in more than this setting; decode speed was not
+measured. Use it for validation and reproducibility work, not for serving.
+
+Determinism: within the operations above, a row's result no longer depends on the row count of
+the call, on the chunk boundaries or on decode versus prefill (for a given GPU type, model and
+placement). Combined with `EXL3_MOE_FUSED_DET` (on by default), identical calls are also bitwise
+repeatable. Whether a whole model becomes chunk-size invariant depends on every operation it uses
+being covered, see above.
+
+```sh
+EXL3_STABLE_ARITHMETIC=1 python eval/ppl.py -m /path/to/model
+EXL3_STABLE_ARITHMETIC=1 python examples/chat.py -m /path/to/moe/model -mcl 8 -mcm stream_only
+```
+
+```python
+import os
+os.environ["EXL3_STABLE_ARITHMETIC"] = "1"      # before importing exllamav3
+from exllamav3 import Config, Model
+from exllamav3.ext import exllamav3_ext as ext
+assert ext.stable_arithmetic() and ext.hgemm_fixed_rows() == 128
+```
 
 ## Model loading
 
@@ -1766,8 +1873,9 @@ the layers divide the work between the GPUs and on how much of each half the hos
 waiting.
 
 Determinism: each sub-chunk runs the same layers with the same inputs as a plain prefill in
-sub-chunk-sized calls, only overlapped; with arithmetic independent of the row count, the six
-pipelined/plain continuation pairs over that 65K-token prefix were bitwise equal. Against a
+sub-chunk-sized calls, only overlapped; with arithmetic independent of the row count
+(`EXL3_STABLE_ARITHMETIC=1`), the six pipelined/plain continuation pairs over that 65K-token prefix
+were bitwise equal. Against a
 plain prefill of the whole call, results differ the way any change of chunk size does.
 
 When to use it: long prompts on a two-GPU split whose first half holds no CPU-offloaded
