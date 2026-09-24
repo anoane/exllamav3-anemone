@@ -444,6 +444,54 @@ unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x us
 128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
 each 32-term FP16 partial into FP32.
 
+### `EXL3_HGEMM_FP32_REDUCTION` (default: `1`)
+
+Whether the cuBLAS GEMMs of `hgemm.cu` must keep their intermediate reductions in fp32. They
+accumulate in fp32 (`CUBLAS_COMPUTE_32F`) for both fp16 and fp32 outputs, but with an fp16 output
+cuBLAS may pick a split-K algorithm that reduces its partial sums in fp16, the output type: one
+rounding per split, and partial sums beyond the fp16 range overflow even when the result is small.
+
+Values:
+
+- `1` (default): every call through `hgemm.cu` sets
+  `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` on PyTorch's cuBLAS handle for the duration
+  of the call, OR-ed into the handle's math mode, and restores the previous mode right after the
+  launch, also when the GEMM fails, so the setting never leaks to other users of the handle.
+  Tensor cores (and TF32 settings) stay enabled.
+- `0`: the handle's math mode is left as it is, so cuBLAS may reduce through the output type, as
+  it did before this setting existed. For comparisons only.
+- Anything else, an empty value included, is refused at the first call that reads it, with a
+  `RuntimeError`: `EXL3_HGEMM_FP32_REDUCTION must be 0 or 1`.
+
+When it is read: once per process, by the first GEMM through `hgemm.cu` (or the first
+`exllamav3_ext.hgemm_fp32_reduction()` call, which returns the value in use); changing the
+variable afterwards has no effect, so an A/B comparison runs the two values in separate processes.
+
+Which calls this reaches: every cuBLAS GEMM with an fp16 output that goes through `hgemm.cu`,
+i.e. the cuBLAS path of `hgemm_recon` (the prefill of EXL3 linears above 144 rows, including the
+fp16-output prefill projections of GatedDeltaNet / KDA) and of `hgemm_batched` (the batched MoE
+reconstruct tier), the per-expert reconstruct path of streamed CPU-offload experts, the cuBLAS
+fallback of the router scores, the fp16 gate projection of the native attention block, the
+indexer projections of MLA / DSA and DeepSeek-V4 attention, the DeepSeek-V4 compressor,
+convolutions lowered to a GEMM, and the native `BC_LinearFP16` while it runs inside a native CUDA
+graph. Eager fp16 -> fp16 linears (Python `LinearFP16`, and the eager path of the native
+`BC_LinearFP16`) do not reach it: they call `torch.matmul` / `at::matmul`, which follow PyTorch's
+own `torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction` (default `True`), so the
+same `BC_LinearFP16` layer may reduce differently eagerly and under a native graph. Calls with an
+fp32 output should be unaffected by the flag's definition (a reduction may not use a type narrower
+than the compute type, fp32 here); no fp32-output call was measured. The FP16-partial kernel of
+`EXL3_HGEMM_F16ACC` (above) is not cuBLAS: this setting does not touch it, and it keeps its own
+contract.
+
+Whether a call's bits change depends on the algorithm cuBLAS picks for the GPU and the shape. On
+the first attention projection of DeepSeek-V4.1-Flash (2048 x 5120 -> 1280, fp16), 2,927 of
+10,240 sampled outputs (the first eight rows) disagreed with the FP64 product rounded once to
+fp16 without this policy and 214 with it on an sm_80 GPU; on an sm_120 GPU nothing changed. Ten
+launches of that projection at 2048 / 4096 rows took 0.174 / 0.311 ms without it and 0.161 /
+0.310 ms with it on the sm_80 GPU, 0.082 / 0.140 ms and 0.076 / 0.141 ms on the sm_120 GPU.
+Those "without" numbers come from an extension built without the policy, before this setting
+existed; `0` leaves cuBLAS as that build did. Decode-shaped calls were not timed.
+
 ### `EXL3_MOE_COOP_KSPLIT` (default: unset)
 
 Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over

@@ -6,15 +6,51 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 
 /*
 
 Row-major matmul using cuBLAS, a @ b -> c
-- if c is float16, operation is float16 @ float16 -> float16 (float16 accumulate)
+- if c is float16, operation is float16 @ float16 -> float16 (float32 accumulate)
 - if c is float32, operation is float16 @ float16 -> float32 (float32 accumulate)
 */
 
 using bfloat16 = __nv_bfloat16;
+
+// EXL3_HGEMM_FP32_REDUCTION: 1 (default) keeps the intermediate reductions of every cuBLAS GEMM
+// in this file in fp32 (require_fp32_reductions, below); 0 leaves the handle's math mode as it is,
+// so cuBLAS may reduce through an fp16 output type; any other value is an error. Read once, on
+// first use
+int hgemm_fp32_reduction()
+{
+    static const int on = []()
+    {
+        const char* value = std::getenv("EXL3_HGEMM_FP32_REDUCTION");
+        if (!value || !std::strcmp(value, "1")) return 1;
+        TORCH_CHECK(!std::strcmp(value, "0"), "EXL3_HGEMM_FP32_REDUCTION must be 0 or 1");
+        return 0;
+    }();
+    return on;
+}
+
+// COMPUTE_32F alone does not prohibit split-K reductions through an fp16 output
+// type. Keep intermediate reductions in the promised accumulator precision.
+// The handle belongs to PyTorch's thread-local pool: restore its previous mode
+// after launch, including when GEMM returns an error, rather than leaking policy
+// into another user of the handle. This does not disable tensor cores. Returns
+// the previous mode; with EXL3_HGEMM_FP32_REDUCTION=0 the mode is left unchanged
+// (the caller's restore sets the same mode again)
+static cublasMath_t require_fp32_reductions(cublasHandle_t handle)
+{
+    cublasMath_t previous;
+    cublas_check(cublasGetMathMode(handle, &previous));
+    if (!hgemm_fp32_reduction()) return previous;
+    auto required = static_cast<cublasMath_t>(
+        static_cast<int>(previous) | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+    cublas_check(cublasSetMathMode(handle, required));
+    return previous;
+}
 
 static void hgemm_gemmex_impl
 (
@@ -62,6 +98,7 @@ static void hgemm_gemmex_impl
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
+    const auto previous_math = require_fp32_reductions(cublas_handle);
     auto r = cublasGemmEx
     (
         cublas_handle,
@@ -73,7 +110,9 @@ static void hgemm_gemmex_impl
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
+    const auto restore_status = cublasSetMathMode(cublas_handle, previous_math);
     cublas_check(r);
+    cublas_check(restore_status);
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -149,6 +188,7 @@ void hgemm_batched
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
+    const auto previous_math = require_fp32_reductions(cublas_handle);
     auto r = cublasGemmStridedBatchedEx
     (
         cublas_handle,
@@ -161,6 +201,8 @@ void hgemm_batched
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
+    const auto restore_status = cublasSetMathMode(cublas_handle, previous_math);
     cublas_check(r);
+    cublas_check(restore_status);
     cuda_check(cudaPeekAtLastError());
 }

@@ -3,6 +3,10 @@
 #include <ATen/Tensor.h>
 #include "graph.cuh"
 
+// EXL3_HGEMM_FP32_REDUCTION: 1 (default) when the cuBLAS GEMMs of hgemm.cu disallow reduced-precision
+// (fp16) intermediate reductions, 0 when cuBLAS may use them. Read once, on first use
+int hgemm_fp32_reduction();
+
 void hgemm_gr
 (
     at::Tensor a,
