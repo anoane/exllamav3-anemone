@@ -1,0 +1,125 @@
+ExLlamaV3 is MIT licensed, Copyright (c) 2025 Turboderp. See LICENSE.
+
+The DeepSeek-V4.1-Flash support contains code adapted from three other projects,
+listed below with their licenses. Paths are relative to the repository root.
+
+
+vLLM (https://github.com/vllm-project/vllm)
+-------------------------------------------
+
+Licensed under the Apache License, Version 2.0. Copyright contributors to the
+vLLM project. The license terms are in LICENSE-APACHE-2.0. The package license
+expression includes both MIT and Apache-2.0 because the MIT engine and the
+Apache-derived portions are distributed together; this does not relicense the
+rest of the engine.
+
+Modified for exllamav3: framework module construction, checkpoint key names,
+source-owned paged pools, chunked recurrent state, tiled index selection,
+file-backed engram gathering, delayed hyper-connections and device copies.
+The following files contain portions derived from these vLLM modules:
+
+  exllamav3/architecture/deepseek_v41.py
+  exllamav3/modules/dsv41.py
+    vllm/models/deepseek_v4_1/attention.py
+
+  exllamav3/architecture/dsv41/compressor.py
+  exllamav3/modules/dsv41.py
+    vllm/models/deepseek_v4_1/compressor.py
+
+  exllamav3/architecture/dsv41/engram.py
+  exllamav3/modules/dsv41_engram.py
+  tests/dsv41_ref/engram_hash.py
+  tests/dsv41_ref/engram_gate.py
+  tests/dsv41_ref/engram_forward.py
+    vllm/models/deepseek_v4_1/common/engram.py
+
+  exllamav3/modules/dsv41_block.py
+    vllm/models/deepseek_v4_1/nvidia/model.py
+    vllm/models/deepseek_v4_1/amd/model.py
+    vllm/model_executor/kernels/mhc/torch.py
+
+  tests/test_dsv41_mhc_.py
+    vllm/model_executor/kernels/mhc/torch.py
+
+  exllamav3/architecture/dsv41/candidates.py
+  tests/test_dsv41_select_.py
+    vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
+
+The vLLM source these were compared against is the one in the container image
+vllm/vllm-openai:deepseekv41-flash-0909, whose vLLM build reports the version
+0.1.dev20904+g179dd0fa9, a revision the public vllm-project/vllm repository
+does not contain. The files are therefore identified by their SHA256 digests
+in that image, which record the exact source reviewed without asserting a
+revision:
+
+  vllm/models/deepseek_v4_1/attention.py
+    ef13a8503b54172a63cca6932e2ee5a6d5d6ced81445949067f01b3f61ab6e5e
+  vllm/models/deepseek_v4_1/compressor.py
+    ed66374bb9e4c8c0201383d3fef811e061fd14f3cb0cb9db74bcb740f5a59009
+  vllm/models/deepseek_v4_1/common/engram.py
+    41c5bdf25cf8337088247be768e3d43fa41e6358397800f8b602ebf1ede69480
+  vllm/models/deepseek_v4_1/nvidia/model.py
+    530ed24c8fd2e9daeb5c3d340ef52246618786f19eace8ec217c8d3bdf271110
+  vllm/models/deepseek_v4_1/amd/model.py
+    b7f6050aa929a174a9dc850f345faf6be687f96169fd02861fea877c0beaf5e8
+
+The local copy of common/engram.py that the port was first compared against
+(SHA256 04d532f1b4560323f7773d3bd1a36121f1322edd644edf8553d39e57d201c3a3)
+is this file plus a third-party engram-on-disk patch, the DSV41_ENGRAM_DISK
+hooks of the project listed under "Engram-on-disk reader" below. The portions
+derived here (compute_hash_multipliers, EngramLayout, NgramHashState) lie
+outside those hooks and are the same in both copies.
+
+The mHC and candidate-block kernel modules named above were not part of the
+local copy, so no digest is given for them.
+
+
+DeepSeek-V4.1-Flash reference inference code
+--------------------------------------------
+
+DeepSeek-AI published DeepSeek-V4.1-Flash together with reference inference
+code (model.py, engram.py, kernel.py). Copyright (c) 2023 DeepSeek. The MIT
+terms that accompany it are in LICENSE-DEEPSEEK and at
+https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/LICENSE.
+
+exllamav3/architecture/dsv41/engram_torch.py adapts that reference's n-gram
+hashing and compressed token map to a bounded lookback window.
+exllamav3/architecture/dsv41/engram.py and tests/dsv41_ref/engram_hash.py
+carry parts of its engram.py through vLLM's port listed above: the hash
+multipliers (compute_hash_multipliers), the prime bucket layout
+(EngramLayout) and the n-gram hash (NgramHashState).
+
+These tests transcribe parts of the reference as oracles and name the
+transcribed functions in their descriptions:
+
+  tests/test_dsv41_select_.py
+  tests/test_dsv41_engram_ref_.py
+  tests/test_dsv41_engram_gpu_.py
+  tests/test_dsv41_engram_fwd_gpu_.py
+  tests/test_dsv41_qkv_front_gpu_.py
+
+The other V4.1 files describe the reference semantics they follow in their
+module descriptions.
+
+
+Engram-on-disk reader (https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark)
+---------------------------------------------------------------------------------------
+
+Licensed under the MIT License. Copyright (c) 2026 Tech2wild (Tony DeAngelo,
+https://github.com/tonyd2wild). The license terms are in LICENSE-TECH2WILD.
+
+  tests/dsv41_ref/engram_tables.py
+    patch/engram_helper.py (DiskEngramTable._open and _read_rows)
+      commit 8fda87b2a0c3b4db097380c2d55af9f842828938
+      SHA256 f97e085c0f308df25e058cf55484ffc4357f91489cb921174911c116cf9128ec
+
+EngramTable._fd and EngramTable._pread_rows adapt its threaded row reader: one
+os.preadv per row with a short-read loop, POSIX_FADV_RANDOM on the descriptor,
+and the rows split into chunks submitted to a thread pool (32 threads and 16
+rows per task by default), read inline when a batch fits in one chunk.
+Modified for exllamav3: numpy buffers, one cached descriptor per shard file,
+the row and file named in the short-read error, and constructor arguments in
+place of environment variables. It reached this project through
+https://github.com/sfxnz/DeepSeek-V4.1-Flash-EXL3-vLLM-2x-DGX-Spark at
+460ac89c7df1eea4db8a731f1feb807f1584f359 (docker/patch/engram_disk.py), which
+carries the same reader with renamed identifiers and credits its origin.
