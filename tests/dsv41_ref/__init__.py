@@ -21,6 +21,7 @@ and skips):
                          engram.py, kernel.py)
 """
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -28,17 +29,23 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def load_package_file(relative: str, name: str):
+def load_package_file(relative: str, name: str, package: str | None = None):
     """
     Execute one exllamav3 source file by path, without importing the exllamav3 package, whose
-    __init__ loads the compiled extension. Only for files that import nothing from the package
-    at module scope. The module is cached in sys.modules under `name`.
+    __init__ loads the compiled extension. The module is cached in sys.modules under `name`.
+
+    A dotted `name` already makes the file's relative imports resolve inside its parent, a
+    stand-in package the caller has put in sys.modules together with every module those
+    imports name. `package` sets the file's package explicitly; only an undotted `name` needs
+    it (a file loaded under an undotted name with no `package` can import nothing relative).
     """
     mod = sys.modules.get(name)
     if mod is not None:
         return mod
     spec = importlib.util.spec_from_file_location(name, os.path.join(REPO_ROOT, relative))
     mod = importlib.util.module_from_spec(spec)
+    if package is not None:
+        mod.__package__ = package
     sys.modules[name] = mod
     try:
         spec.loader.exec_module(mod)
@@ -56,3 +63,22 @@ def model_dir() -> str | None:
 def skip(test: str, reason: str):
     """Report a skipped script-style test."""
     print(f"  --  {test}: {reason}, skipped", flush = True)
+
+
+@contextlib.contextmanager
+def ablate(value: str, registry = None):
+    """
+    Run the block with the ablations `value` active (EXL3_DSV41_ABLATE's syntax, "" for none),
+    then restore the previous setting. The engine reads the variable once, so the negative
+    controls switch the parsed set through the registry's test-only set_ablations()
+    (modules/dsv41_ablation.py), never the environment. `registry` is the dsv41_ablation module
+    to switch: by default the package's own; a test that loads the V4.1 modules by path under a
+    stand-in package passes the copy those modules import.
+    """
+    if registry is None:
+        from exllamav3.modules import dsv41_ablation as registry
+    previous = registry.set_ablations(value)
+    try:
+        yield
+    finally:
+        registry.set_ablations(previous)
