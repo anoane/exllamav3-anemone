@@ -507,7 +507,7 @@ k >= 4096 or k >= 2048 with 32 or more (token, expert) slots. Testing knob only.
 
 ### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
 
-Bit-reproducible MoE prefill. By default the fused MoE kernel adds each expert's weighted
+Bit-reproducible MoE prefill. Without it the fused MoE kernel adds each expert's weighted
 output into the token row with float atomics, in whatever order the expert groups finish, and
 the batched reconstruct tier accumulates its padded slab with one atomic `index_add_`;
 together these are the only sources of run-to-run nondeterminism on the GPU prefill path
@@ -519,13 +519,59 @@ tier's down-projection GEMMs write straight into their slots, and one `exl3_moe_
 layer sums each token's slots in k order with the routing weights. Identical runs are then
 bit-identical (verified on all three models), and since the GEMM outputs are written once
 and read once either way it costs nothing measurable: Qwen3.8 6198/6219 vs 6164/6178 tok/s,
-lfm2.5 25.9k vs 26.2k, Qwen3-30B-A3B 7304 vs ~7100 (atomic). The remaining atomic user is
-the streamed CPU-offload tier's fused-kernel call. `EXL3_MOE_RECON_DET` only matters where
-the batched tier cannot write into the slot scratch (the streamed tier, or the switch off):
-`1` accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA
-recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice partial dot
-products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
-models is reproducible as well.
+lfm2.5 25.9k vs 26.2k, Qwen3-30B-A3B 7304 vs ~7100 (atomic).
+
+The same switch covers CPU-offloaded layers (`-mcl`, `-mcs`) whose experts are streamed to the
+GPU for a prefill chunk (see `EXL3_MOE_STREAM_T` and `EXL3_MOE_STREAM_MIN_ROWS`). Every
+streamed assignment gets its own fp32 slot in one call-local scratch, whichever tier computes
+it: the fused kernel and the per-expert path store weighted outputs (the per-expert path keeps
+its fp32 routing weights), the batched reconstruct tier stores unweighted outputs that the
+gather weights, as on the resident path. One `exl3_moe_gather` after the last staging batch
+sums each token's slots in routing order, so neither the order in which experts finish nor
+how they are packed into staging batches (`EXL3_MOE_STREAM_BATCH_EXPERTS`,
+`EXL3_MOE_CPU_WSLOT_MB`) changes the order of the accumulation. Reconstruct groups keep their
+padded slabs; padding rows are never gathered, and when the packed down-projection width
+differs from the hidden size the group writes a temporary slab that is cropped into the slots.
+The native gather table holds 32 routes, so top-k above 32 is reduced in fixed groups of 32
+routes (an order that does not depend on the batching either). Memory per layer call:
+`slots x hidden x 4` bytes of scratch, where `slots` is the number of streamed assignments plus
+the reconstruct padding (bounded by `EXL3_MOE_RECON_PAD` and the group size), plus 18 bytes per
+routed assignment for the index tables (26 with top-k above 32) and 24 bytes per expert. The
+autosplit worst case of every offloaded layer includes all of it and the cropping slab, so an
+`-mcl` / `-mcs` load may place its layers differently than without the slots, and a manual
+split (`-gs`) that fit before may need the extra room: on a device with no resident MoE layer
+(e.g. every MoE layer offloaded) the prefill peak grows by the scratch, up to about 295 MB per
+streamed layer call for a hidden size of 2048 with top-8 routing at 4096-row chunks.
+
+Measured on DeepSeek-V4.1-Flash on two GPUs, with the experts of 11 layers (12-22) held in RAM
+and every expert those layers select streamed to the second GPU in every call, decode
+included, over a 4096-token prefill plus eight teacher-forced decode steps: two identical runs
+differed by up to 0.59 in actual-token log-probability (p99 0.062, one top-1 change) with
+atomic accumulation, and were bitwise identical with slots, also with 2048-token chunks.
+Prefill time +0.40% (1105 vs 1100 tok/s) and decode +0.65%, two interleaved trials each, a
+difference of the order of their noise. Allocated peaks were unchanged in that layout, where
+the resident MoE layers of the same device already allocate a slot scratch of the same size.
+In the default mode, an explicit `EXL3_MOE_STREAM_T=1` streams every selected expert of a
+prefill chunk of at least `EXL3_MOE_STREAM_MIN_ROWS` rows; calls with fewer rows (decode) never
+reach the streamed path, so the decode figure above applies only where decode streams too.
+
+The switch orders the accumulation, nothing else. Results still differ between chunk sizes;
+between tiers (an expert whose row count crosses `EXL3_MOE_STREAM_FUSED_T` or the reconstruct
+row cap takes a different projection path); with the staging-batch partition
+(`EXL3_MOE_STREAM_BATCH_EXPERTS`, `EXL3_MOE_CPU_WSLOT_MB`), which decides the batched
+reconstruct groups and so the batch count and padded row count of their GEMMs (on
+DeepSeek-V4.1-Flash, one-expert batches against the default batches differed by p99 0.047, max
+0.22, in actual-token log-probability); between GPU types; on the CPU tail, whose arithmetic is
+its own; and, with `EXL3_MOE_STREAM_T` unset, between processes on links slower than about
+25 GB/s, where the bandwidth probed on a device's first streamed prefill sets the streaming
+threshold and so which experts run on the CPU tail (set `EXL3_MOE_STREAM_T` explicitly for
+reproducibility across processes). `EXL3_MOE_FUSED_DET=0` restores atomic accumulation on the
+resident and the streamed path alike, for A/B comparisons. `EXL3_MOE_RECON_DET` only matters
+where the batched tier does not write into slot scratch, i.e. with `EXL3_MOE_FUSED_DET=0`: `1`
+accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA recurrent
+decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice partial dot products in a
+fixed order unconditionally (no switch, no cost), so greedy decode on those models is
+reproducible as well.
 
 ### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
 

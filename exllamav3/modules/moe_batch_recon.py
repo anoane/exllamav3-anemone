@@ -45,8 +45,8 @@ RECON_MAX_ROWS = int(os.environ.get("EXL3_MOE_RECON_MAX_ROWS", 0))
 # Give up on adding a smaller expert to a group once padded rows would exceed this multiple of
 # the real rows: a group of very uneven experts wastes GEMM work on zeros.
 PAD_MAX = float(os.environ.get("EXL3_MOE_RECON_PAD", 1.1))
-# Accumulation when the tier is not writing into the layer's slot scratch (the streamed CPU
-# tier, and the GPU path with EXL3_MOE_FUSED_DET=0): one index_add_ per expert (bit-
+# Accumulation when the tier is not writing into a slot scratch (EXL3_MOE_FUSED_DET=0, on the
+# GPU-resident path and on the streamed CPU-offload path alike): one index_add_ per expert (bit-
 # reproducible, up to B launches per group) or a single atomic index_add_ over the padded slab.
 # Follows EXL3_MOE_FUSED_DET unless EXL3_MOE_RECON_DET is set explicitly
 DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", os.environ.get("EXL3_MOE_FUSED_DET", "0")) != "0"
@@ -299,7 +299,8 @@ class BatchReconLayer:
         ho = out_ext.shape[1]
         if DETERMINISTIC:
             # One index_add_ per expert (unique indices per launch, so bit-reproducible; up to B
-            # launches per group). The GPU path uses slot mode instead
+            # launches per group). With EXL3_MOE_FUSED_DET=1 both the resident and the streamed
+            # path use slot mode instead
             d2[:, :ho].mul_(w.float().unsqueeze(1))
             for b, c in enumerate(counts):
                 r0 = b * cmax

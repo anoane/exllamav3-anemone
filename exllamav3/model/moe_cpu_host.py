@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from ..ext import exllamav3_ext as ext
+from .moe_stream_slots import slot_layout, slot_rows_bound
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
@@ -124,6 +125,10 @@ class MoeCpuTuning:
         # projection and run through padded bmm. EXL3_MOE_STREAM_BATCH_RECON=0 restores the
         # per-expert loop
         self.stream_batch_recon = os.environ.get("EXL3_MOE_STREAM_BATCH_RECON", "1") != "0"
+        # Match GPU-resident experts: keep per-assignment fp32 contributions and reduce
+        # once, in routing order. Atomic adds across streamed experts are not repeatable.
+        # The existing explicit opt-out also selects the legacy streamed atomic path.
+        self.stream_deterministic = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
@@ -1349,7 +1354,7 @@ class MoeCpuHost:
             st["fused_bufs"][key] = fbufs
         return fbufs
 
-    def prefill_worst_case_parts(self, layer_idx, rows, device, assignments):
+    def prefill_worst_case_parts(self, layer_idx, rows, device, assignments, *, hidden_width = None):
         """Autosplit worst case for one layer's prefill on `device` with `assignments` routed
         rows on CPU-resident experts, as (fixed, variable) bytes: the outputs and lists that
         live for the whole call, and the larger of one batched-reconstruct group and the
@@ -1378,7 +1383,21 @@ class MoeCpuHost:
             recon = self._stream_recon_layer(bufs, layer_idx, spec, aux, device)
         r = min(rows, A)
         per_expert = r * (hi * 2 + n * 2 * (2 if gated else 1) + h * 4)
-        batched = recon.worst_case_bytes(A, slot_mode = False) if recon is not None else 0
+        slot_mode = TUNING.stream_deterministic
+        if slot_mode:
+            slots = A
+            if recon is not None:
+                from ..modules.moe_batch_recon import PAD_MAX
+                slots = slot_rows_bound(A, PAD_MAX, recon.cap)
+            # Contributions, inverse permutation (+ arange during construction), gather
+            # weights, and three per-expert tables. These coexist with the tier scratch.
+            index_bytes = 26 if spec["topk"] > 32 else 18
+            fixed += slots * h * 4 + rows * spec["topk"] * index_bytes + spec["num_experts"] * 24
+        # Padded down widths need a temporary slab before cropping into the slot scratch.
+        # spec.ho is the PACKED width, not necessarily the logical model width.
+        # Without the caller's logical width, budget the cropped temporary conservatively.
+        direct_slots = slot_mode and pd["d"][1] == hidden_width
+        batched = recon.worst_case_bytes(A, slot_mode = direct_slots) if recon is not None else 0
         return fixed, max(per_expert, batched)
 
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
@@ -1388,6 +1407,12 @@ class MoeCpuHost:
         h = y.shape[1]
         E = spec["num_experts"]
         topk = selected_experts.shape[1]
+        deterministic = TUNING.stream_deterministic
+        # The native gather uses int32 launch dimensions, but int64 slot addresses.
+        # Reject an unrepresentable launch before starting workers/DMA for this call.
+        if deterministic and (rows > 0x7fffffff or h > 0x7fffffff
+                              or rows * min(topk, 32) > 0x7fffffff):
+            raise ValueError("Streamed MoE gather dimensions exceed the native int32 range")
         # One spare row: the batched reconstruct tier's padding sink (never read back)
         out_ext = torch.zeros((rows + 1, h), dtype = torch.float, device = y.device)
         out = out_ext[:rows]
@@ -1445,8 +1470,26 @@ class MoeCpuHost:
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
             fbufs = self._stream_fused_bufs(st, spec, y.device)
 
+        # Plan the same tier/group partition used by execution. All counts are already on
+        # the host; no per-expert GPU readbacks or extra copy-stream barriers are needed.
+        batches = []
         for i0 in range(0, len(streamed), per_slot):
             batch = streamed[i0:i0 + per_slot]
+            heavy = [e for e in batch if not (fused_t and counts_h[e] <= fused_t)]
+            grouped = [e for e in heavy if recon is not None and counts_h[e] <= recon.max_rows]
+            singles = set(heavy).difference(grouped)
+            groups = plan_groups(grouped, lambda e: counts_h[e], recon.cap) if grouped else []
+            batches.append((batch, groups, singles))
+        scratch = None
+        if deterministic:
+            slot_base, slot_kind, nslots = slot_layout(counts_h, batches)
+            scratch = torch.empty((nslots, h), dtype = torch.float, device = y.device)
+            inv_order = torch.empty_like(order)
+            inv_order.scatter_(0, order, torch.arange(order.numel(), device = y.device))
+            gather_tables = torch.tensor([offs[:-1], slot_base, slot_kind], dtype = torch.long) \
+                .to(y.device, non_blocking = True)
+
+        for batch, groups, single_ids in batches:
             ws = self.next_wslot
             self.next_wslot = (self.next_wslot + 1) % self.num_wslots
             self.wseq += 1
@@ -1542,6 +1585,9 @@ class MoeCpuHost:
                     # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
                     for i in (0, 1, 2):
                         tbl[i] = tbl[i + 3]
+                if deterministic:
+                    # Reuse the descriptor transfer; local expert ids map to global slots.
+                    tbl.append([slot_base[e] for e in batch])
                 tblt = torch.tensor(tbl, dtype = torch.int64).to(y.device, non_blocking = True)
                 ec = torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0],
                                   dtype = torch.long).to(y.device, non_blocking = True)
@@ -1566,23 +1612,13 @@ class MoeCpuHost:
                         tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                         tblt[6], tblt[7], tblt[8],
                         False, True, False, True, False, True,
-                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                        float(spec["act_limit"] or 0.0), n_act,
+                        scratch, tblt[9] if deterministic else None, lo, hi, mt
                     )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
             # group; see moe_batch_recon.py) when eligible, else per expert
-            heavy = [(bi, e) for bi, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]
-            if recon is not None:
-                # Experts above the batched tier's row cap stay on the per-expert loop (large
-                # slabs pad and stream more than they save in launches)
-                single = [(bi, e) for bi, e in heavy if counts_h[e] > recon.max_rows]
-                heavy = [(bi, e) for bi, e in heavy if counts_h[e] <= recon.max_rows]
-            else:
-                # No batched tier (EXL3_MOE_STREAM_BATCH_RECON=0 or biased experts): every
-                # heavy expert runs on the per-expert loop below
-                single = heavy
-                heavy = []
-            if heavy:
+            if groups:
                 if recon_ctx is None:
                     # Padding sources / sinks: a zero input row, an output sink row (out is a
                     # view of the first `rows` rows of out_ext) and sentinel entries after the
@@ -1598,20 +1634,27 @@ class MoeCpuHost:
                     )
                 y_ext, tok_ext, w_ext = recon_ctx
                 base = vslot.data_ptr()
-                slot_of = {e: bi for bi, e in heavy}
-                for grp in plan_groups([e for _, e in heavy], lambda e: counts_h[e], recon.cap):
+                slot_of = {e: bi for bi, e in enumerate(batch)}
+                for grp in groups:
                     # Trellis addresses inside the VRAM slot, per projection
                     bb = [base + slot_of[e] * exp_b for e in grp]
+                    slab = None
+                    if deterministic:
+                        start = slot_base[grp[0]]
+                        size = len(grp) * max(counts_h[e] for e in grp)
+                        target = scratch[start : start + size]
+                        slab = target if pd["d"][1] == h else torch.empty(
+                            (size, pd["d"][1]), dtype = torch.float, device = y.device)
                     recon.run_group(
                         y_ext, out_ext, tok_ext, w_ext,
                         grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
-                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
-                heavy = []
-            single_ids = {e for _, e in single} if recon is not None else None
+                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]),
+                        out_slab = slab)
+                    if deterministic and pd["d"][1] != h:
+                        target.copy_(slab[:, :h])
+                    del slab
             for bi, e, idx, wseg in per_e:
-                if fused_t and counts_h[e] <= fused_t:
-                    continue
-                if single_ids is not None and e not in single_ids:
+                if e not in single_ids:
                     continue
                 boff = (bi * exp_b) // 2
                 xg = y.index_select(0, idx)
@@ -1639,8 +1682,33 @@ class MoeCpuHost:
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
                                      st["w_scratch"])
-                out.index_add_(0, idx, dy[:, :h].float() * we)
+                contribution = dy[:, :h].float() * we
+                if deterministic:
+                    # Keep the per-expert path's original weight precision (which need not
+                    # be fp16). Its slots are already weighted, like fused-kernel slots.
+                    scratch[slot_base[e] : slot_base[e] + counts_h[e]].copy_(contribution)
+                else:
+                    out.index_add_(0, idx, contribution)
+                # Do not retain the previous expert's slabs while allocating the next
+                # expert (or reconstruct group); autosplit budgets one tier at a time.
+                del contribution, xg, uy, a, dy, we
+                if gated:
+                    del gy
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
+
+        if deterministic and rows and nslots:
+            # One reduction over ALL streamed batches, not one sum per staging slot.
+            # Expert scheduling and slot reuse cannot change this routing top-k order.
+            # Scratch is call-local and only used on the compute stream; wconsumed still
+            # releases weights as soon as their projection kernels have finished.
+            gather_weights = weight_sorted.half()
+            # The native shared-memory table holds 32 routes. Wider top-k uses fixed
+            # 32-route groups (still independent of expert batching) without a new ABI.
+            for k0 in range(0, topk, 32):
+                ids = flat if topk <= 32 else flat.view(rows, topk)[:, k0 : k0 + 32].contiguous().view(-1)
+                inv = inv_order if topk <= 32 else inv_order.view(rows, topk)[:, k0 : k0 + 32].contiguous().view(-1)
+                ext.exl3_moe_gather(out, scratch, ids, inv, gather_tables[0],
+                                    gather_tables[1], gather_tables[2], gather_weights)
 
         # Collect the CPU tail (by now usually complete) and merge
         if tail_jobs:

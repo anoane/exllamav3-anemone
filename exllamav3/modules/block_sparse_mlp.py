@@ -911,7 +911,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             total = 0
             for a in (A * i // 4 for i in range(5)):
                 gf, gv = self.prefill_worst_case_parts(rows, a)
-                cf, cv = host.prefill_worst_case_parts(self.cpu_layer_idx, rows, self.device, A - a)
+                cf, cv = host.prefill_worst_case_parts(
+                    self.cpu_layer_idx, rows, self.device, A - a, hidden_width = self.expert_size)
                 total = max(total, gf + cf + max(gv, cv))
         else:
             total = sum(self.prefill_worst_case_parts(rows, A))
