@@ -1,10 +1,13 @@
 """DeepSeek-V4.1 cached attention vs the stateless path, on real single-layer weights, each GPU.
 
-    PYTHONPATH=$PWD python3 tests/test_dsv41_cached_gpu_.py [checkpoint-dir] [--quick]
+    PYTHONPATH=$PWD python3 tests/test_dsv41_cached_gpu_.py [checkpoint-dir] [--quick] [--numerics S]
 
 (checkpoint-dir defaults to $DSV41_MODEL_DIR; the DeepSeek-oracle part of the candidate check,
 the comparison with DeepSeek's select_candidate_blocks, needs DSV41_DEEPSEEK_REF and is skipped
-without it; the rest of that check runs either way.)
+without it; the rest of that check runs either way.) --numerics sets config.dsv41_numerics for
+the run: 'precise' by default, the setting the gates below were measured with; the model's
+default, deepseek:index, rounds the index query and keys identically on both paths, and the
+selection checks read the rounded values.
 
 Loads single attention layers 2 (rate-2 kv + index source), 3 (its consumer), 8 (rate-2
 source), 12 (consumer of 8), 20 (rate-1 kv + index + candidate source) and 24 (index source
@@ -714,6 +717,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs = "?", default = model_dir())
     ap.add_argument("--quick", action = "store_true", help = "T=700 only, cuda:0 only")
+    ap.add_argument("--numerics", default = "precise", help = "config.dsv41_numerics for the run")
     args = ap.parse_args()
     if not args.path:
         skip("V4.1 cached vs stateless on GPUs", "no checkpoint (pass a directory or set DSV41_MODEL_DIR)")
@@ -728,6 +732,8 @@ def main():
     devs = [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
     print("  devices: " + " | ".join(f"{d} {torch.cuda.get_device_name(d)}" for d in devs))
     cfg = Config.from_directory(args.path)
+    cfg.dsv41_numerics = args.numerics
+    print(f"  numerics: {cfg.dsv41_numerics}")
     model = Model.from_config(cfg)
     assert model.recurrent_state_cls is DSV41State, model.recurrent_state_cls
     A = [b.attn for b in model.modules[model.first_block_idx: model.first_block_idx + cfg.num_hidden_layers]]

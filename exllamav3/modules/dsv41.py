@@ -55,6 +55,8 @@ from ..constants import PAGE_SIZE
 from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
 from .dsv41_select import select_topk, INT32_LIMIT
 from .dsv41_ablation import ablated
+from . import dsv41_rounding as rounding
+from ..architecture.dsv41 import numerics as dsv41_numerics
 from .dsv41_cached import emission_range, entry_rows, rope_positions, CompressCarry, ring_update
 
 
@@ -337,6 +339,10 @@ class DSV41Attention(DSV4Attention):
       that reads a pool, a selection or candidate blocks sits on the device of
       their producer: the load guard (architecture/dsv41/placement.py) refuses
       a layer split that would separate them while a Cache is attached.
+
+    Both paths apply the attention numerics (config.dsv41_numerics, architecture/dsv41/
+    numerics.py), read on every call: the index query and keys are rounded after RoPE, the
+    window KV after the projection front, and compressed entries before they are stored.
     """
 
     def __init__(
@@ -510,6 +516,14 @@ class DSV41Attention(DSV4Attention):
     def tp_export(self, plan, producer):
         raise NotImplementedError("Tensor-parallel loading is not supported for DeepSeek-V4.1 attention")
 
+    def _numerics(self) -> dsv41_numerics.Numerics:
+        """
+        The attention numerics (config.dsv41_numerics, validated when it is set), read on every
+        call so that one loaded model can switch between settings. A config without the
+        attribute gets the default.
+        """
+        return dsv41_numerics.parse(getattr(self.config, "dsv41_numerics", None))
+
     def _project_qkv(self, x, params, position):
         """
         V4's projection front WITHOUT the per-head q norm.
@@ -545,7 +559,12 @@ class DSV41Attention(DSV4Attention):
             int(RopeStyle.GPTJ), 1.0, None, None,
             self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
         )
-        return q_res, q, kv.view(bsz, seq, self.head_dim)
+        kv = kv.view(bsz, seq, self.head_dim)
+        policy = self._numerics()
+        if policy.window:
+            # a new tensor: never round a projection output or scratch someone else reads
+            kv = rounding.round_window_(policy, kv.clone(), rd)
+        return q_res, q, kv
 
     def expected_keys(self) -> list[str]:
         """Tensor stems this layer's V4.1-specific pieces materialise."""
@@ -638,12 +657,16 @@ class DSV41Attention(DSV4Attention):
             tab = self._entry_table(params, first_group, n, dev)
             rot = latent[:, hd - rd:].half().view(1, n, 1, rd).contiguous()
             _ext_rope(rot, tab)
-            pool_c[:n].copy_(latent[:, :hd - rd].half())
+            nope = latent[:, :hd - rd].half().contiguous()
+            policy = self._numerics()
+            nope, rot = rounding.round_compressed_(policy, nope, rot)
+            pool_c[:n].copy_(nope)
             pool_r[:n].copy_(rot.view(n, rd))
             if pool_idx is not None:
                 k = self.indexer.produce_k(latent, params)
                 k = k.half().view(1, n, 1, self.index_head_dim).contiguous()
                 _ext_rope(k[..., -rd:], tab)
+                rounding.round_index_(policy, k)
                 pool_idx[:n].copy_(k.view(n, self.index_head_dim))
 
         pools = SourcePools(pool_c, pool_r, pool_idx, n, m, first_group)
@@ -844,6 +867,7 @@ class DSV41Attention(DSV4Attention):
         H, D, rd = self.index_n_heads, self.index_head_dim, self.rope_head_dim
         q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, H, D).contiguous()
         _ext_rope(q_idx[..., -rd:], self._range_table(params, True, pos0, seq, 1, q_idx.device))
+        rounding.round_index_(self._numerics(), q_idx)
         # D^-0.5 * H^-0.5 = 2^-6 here: an exact rescale, identical to scaling in-kernel. The
         # scoring kernel reads (seq, H) contiguous: never hand it a padded projection
         wts = self.idx_weights.forward(x, params)[0]
@@ -1027,10 +1051,12 @@ class DSV41Attention(DSV4Attention):
         tab = self._entry_table(params, e0, n, dev)
         # index K first: it is derived from the PRE-RoPE latent
         k = None
+        policy = self._numerics()
         if kl.pool_idx is not None:
             k = self.indexer.produce_k(latent, params)
             k = k.half().view(1, n, 1, self.index_head_dim).contiguous()
             _ext_rope(k[..., -rd:], tab)
+            rounding.round_index_(policy, k)
         lat16 = latent.half()
         # clone, never .contiguous(): at n == 1 the (1, rd) tail slice already counts as
         # contiguous, so .contiguous() would return a view and the in-place rope would rotate
@@ -1039,6 +1065,11 @@ class DSV41Attention(DSV4Attention):
         _ext_rope(rot, tab)
 
         rows = entry_rows(bt_row, torch.arange(e0, e0 + n, device = dev), kl.epp)
+        if policy.compressed:
+            # defined on the FP16 pool: DeepseekV41Config refuses the compressed part for a
+            # packed (quantized) pool when the Cache is built and when the setting changes
+            nope, _ = rounding.round_compressed_(policy, lat16[:, :hd - rd].contiguous(), rot)
+            lat16 = torch.cat([nope, lat16[:, hd - rd:]], dim = 1)
         if kl.quant:
             stage = torch.cat([lat16[:, :hd - rd], rot.view(n, rd)], dim = 1).contiguous()
             ext.dsv4_pool_quant_scatter(

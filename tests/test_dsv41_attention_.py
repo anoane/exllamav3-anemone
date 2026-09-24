@@ -161,6 +161,10 @@ def _install_stubs():
     _pkg(f"{_P}.ext", exllamav3_ext = None)
     _pkg(f"{_P}.constants", PAGE_SIZE = 256)
     load_package_file("exllamav3/util/device_copy.py", f"{_P}.util.device_copy")
+    # the attention numerics and their rounding kernels are the real files
+    load_package_file("exllamav3/architecture/dsv41/numerics.py", f"{_P}.architecture.dsv41.numerics",
+                      f"{_P}.architecture.dsv41")
+    load_package_file("exllamav3/modules/dsv41_rounding.py", f"{_P}.modules.dsv41_rounding", f"{_P}.modules")
     # the pooling math, the selection and the cached-path helpers are the real files
     load_package_file("exllamav3/architecture/dsv41/compressor.py", f"{_P}.architecture.dsv41.compressor")
     load_package_file("exllamav3/architecture/dsv41/candidates.py", f"{_P}.architecture.dsv41.candidates")
@@ -196,8 +200,9 @@ def main(path = None):
     kvs, ixs = set(t["kv_source_layer_ids"]), set(t["index_source_layer_ids"])
     cand = t["candidate_source_layer_id"]
     assert len(ratios) >= t["num_hidden_layers"], "compress_ratios shorter than the model"
+    # 'precise' for the exact pool checks; the numerics section below switches it per pass
     config = types.SimpleNamespace(candidate_source_layer_id = cand, candidate_block_size = 8,
-                                   candidate_topk_blocks = 2048)
+                                   candidate_topk_blocks = 2048, dsv41_numerics = "precise")
 
     def kv_src(i):
         return max((s for s in kvs if s <= i), default = None) if ratios[i] else None
@@ -428,6 +433,9 @@ def main(path = None):
     finally:
         dsv41.select_topk = real
 
+    check_numerics(dsv41, config, layers, inv)
+    check_numerics_fallback(config, layers, inv)
+
     gs = ", ".join(f"{{{v[0]}-{v[-1]}}}" for v in groups.values())
     print(f"  OK  attention topology: {len(layers)} layers, kv groups {gs}; "
           f"{len(kvs)} compressors, {len(ixs)} indexers, "
@@ -435,6 +443,263 @@ def main(path = None):
           f"and a stateless batch refused; pool ownership and "
           f"cache classes; pool rope at (first + i) * m (old positions fail); cached store keeps "
           f"the latent and derives K pre-RoPE; candidates routed; head weights unpadded")
+
+
+def check_numerics(dsv41, config, layers, inv):
+    """
+    config.dsv41_numerics, read on every pass: each setting rounds exactly its parts of the
+    values 'precise' stores (index keys, compressed entries), on the stateless and the cached
+    store path, and the index query that reaches the selection. The default (no attribute)
+    is deepseek:index.
+    """
+    R = sys.modules[f"{_P}.modules.dsv41_rounding"]
+    NM = sys.modules[f"{_P}.architecture.dsv41.numerics"]
+    torch.manual_seed(1)
+    x = (torch.randn(1, 37, 5120) * 0.5).half()
+    settings = ("deepseek:index", "deepseek", "vllm", "vllm:window", "deepseek:compressed")
+    for L in (2, 20):
+        a = layers[L]
+        a.inv_freq_compress = inv
+        config.dsv41_numerics = "precise"
+        base = a.publish_pools(x, {}, 0)
+        n = base.entries
+        latent, _ = a.compressor.forward(x[0], {}, 0)
+        m = a.compress_ratio
+        epp, P_ = 256 // m, 8
+        bt = torch.randperm(P_).int().unsqueeze(0)
+        e0, cnt = 3 * epp - 2, 5
+
+        def stored():
+            kl = types.SimpleNamespace(
+                pool_c = torch.zeros(P_, epp, 448, dtype = torch.half), pool_r = torch.zeros(P_, epp, 64, dtype = torch.half),
+                pool_idx = torch.zeros(P_, epp, 128, dtype = torch.half), epp = epp, D_c = 448, D_r = 64, D_i = 128,
+                quant = False)
+            a._store_entries(latent[:cnt].half().clone(), e0, kl, bt, e0 * m, cnt * m, {})
+            rows = sys.modules[f"{_P}.modules.dsv41_cached"].entry_rows(bt, torch.arange(e0, e0 + cnt), epp)
+            return (kl.pool_c.view(-1, 448)[rows], kl.pool_r.view(-1, 64)[rows], kl.pool_idx.view(-1, 128)[rows])
+        base_s = stored()
+
+        for setting in settings:
+            config.dsv41_numerics = setting
+            pol = NM.parse(setting)
+            got = a.publish_pools(x, {}, 0)
+            want_c, want_r = R.round_compressed_(pol, base.pool_c[:n].clone(), base.pool_r[:n].clone())
+            want_i = R.round_index_(pol, base.pool_idx[:n].clone())
+            assert torch.equal(got.pool_c[:n], want_c) and torch.equal(got.pool_r[:n], want_r), \
+                f"L{L} {setting}: stateless compressed entries"
+            assert torch.equal(got.pool_idx[:n], want_i), f"L{L} {setting}: stateless index keys"
+            c, r, i = stored()
+            want_c, want_r = R.round_compressed_(pol, base_s[0].clone(), base_s[1].clone())
+            assert torch.equal(c, want_c) and torch.equal(r, want_r), f"L{L} {setting}: cached compressed entries"
+            assert torch.equal(i, R.round_index_(pol, base_s[2].clone())), f"L{L} {setting}: cached index keys"
+            changed = [not torch.equal(t, b) for t, b in zip((c, r, i), base_s)]
+            assert changed == [pol.compressed, pol.compressed, pol.index], (L, setting, changed)
+
+    # the index query: rounded before it reaches the selection, and only under the index part
+    qs = {}
+    def fake_select(q, w, pool, **kw):
+        qs[config.dsv41_numerics] = q.clone()
+        return sel.SelectResult(torch.zeros(q.shape[0], 512, dtype = torch.int32), 512,
+                                torch.zeros(q.shape[0], 2048, dtype = torch.int32) if kw["want_cand"] else None)
+    sel = sys.modules[f"{_P}.modules.dsv41_select"]
+    real = dsv41.select_topk
+    dsv41.select_topk = fake_select
+    try:
+        xq = (torch.randn(1, 5, 5120) * 0.5).half()
+        q_res = torch.randn(1, 5, 1280).half()
+        pool = torch.zeros(700, 128, dtype = torch.half)
+        for setting in ("precise", "deepseek:index", "vllm:window,compressed"):
+            config.dsv41_numerics = setting
+            layers[20]._indexer_topk(xq, {}, q_res, pool, 700, 695)
+    finally:
+        dsv41.select_topk = real
+    assert torch.equal(qs["deepseek:index"], R.mxfp4_(qs["precise"].clone())), "index query not MXFP4-rounded"
+    assert not torch.equal(qs["deepseek:index"], qs["precise"])
+    assert torch.equal(qs["vllm:window,compressed"], qs["precise"]), "index query rounded outside the index part"
+
+    # no attribute: the default
+    del config.dsv41_numerics
+    assert str(layers[2]._numerics()) == NM.DEFAULT == "deepseek:index"
+    config.dsv41_numerics = "precise"
+    print(f"  OK  attention numerics: {', '.join(settings)} round exactly their parts of the stored index "
+          f"keys and compressed entries (stateless and cached store) and of the index query; switched "
+          f"per pass; default {NM.DEFAULT}")
+
+
+def check_numerics_fallback(config, layers, inv):
+    """
+    An operand the rounding cannot hold does not stop the forward. With a latent holding a NoPE
+    value that fp8_ds_mla carries past FP16 (row 1) and a NaN in a RoPE lane (row 3, and so its
+    whole index key), and an index query past MXFP4's FP16 limit: on the stateless and the
+    cached store path and for the index query, each setting stores its rounding of the values
+    'precise' stores, the blocks it cannot round keep exactly those values, the count grows by
+    the number of such blocks, and one warning is printed. Under the strict switch the same
+    calls raise the refusal's error, and the cached path leaves the pool untouched.
+    """
+    import contextlib, io
+    R = sys.modules[f"{_P}.modules.dsv41_rounding"]
+    NM = sys.modules[f"{_P}.architecture.dsv41.numerics"]
+    sel = sys.modules[f"{_P}.modules.dsv41_select"]
+    dc = sys.modules[f"{_P}.modules.dsv41_cached"]
+    ibits = lambda t: t.view(torch.int16)
+    previous = R.set_strict(False)
+    R.reset_fallbacks()
+    torch.manual_seed(2)
+    x = (torch.randn(1, 37, 5120) * 0.5).half()
+    # blocks kept per setting: compressed NoPE / compressed RoPE / index keys
+    kept = {"precise": (0, 0, 0), "deepseek:index": (0, 0, 4), "deepseek": (0, 1, 4), "vllm": (1, 2, 4)}
+    out = io.StringIO()
+    n_checks = 0
+    try:
+        with contextlib.redirect_stdout(out):
+            for L in (2, 20):
+                a = layers[L]
+                a.inv_freq_compress = inv
+                m = a.compress_ratio
+                real = a.compressor.forward
+
+                def poisoned(*args, **kw):
+                    latent, first = real(*args, **kw)
+                    latent = latent.clone()
+                    latent[1, 10] = 64000.0
+                    latent[3, 470] = float("nan")
+                    return latent, first
+
+                a.compressor.forward = poisoned
+                try:
+                    latent, _ = a.compressor.forward(x[0], {}, 0)
+                    epp, P_ = 256 // m, 8
+                    bt = torch.randperm(P_).int().unsqueeze(0)
+                    e0 = 3 * epp - 2
+
+                    def stored():
+                        kl = types.SimpleNamespace(
+                            pool_c = torch.zeros(P_, epp, 448, dtype = torch.half),
+                            pool_r = torch.zeros(P_, epp, 64, dtype = torch.half),
+                            pool_idx = torch.zeros(P_, epp, 128, dtype = torch.half),
+                            epp = epp, D_c = 448, D_r = 64, D_i = 128, quant = False)
+                        a._store_entries(latent[:5].half().clone(), e0, kl, bt, e0 * m, 5 * m, {})
+                        rows = dc.entry_rows(bt, torch.arange(e0, e0 + 5), epp)
+                        return (kl.pool_c.view(-1, 448)[rows], kl.pool_r.view(-1, 64)[rows],
+                                kl.pool_idx.view(-1, 128)[rows]), kl
+
+                    config.dsv41_numerics = "precise"
+                    base = a.publish_pools(x, {}, 0)
+                    n = base.entries
+                    base = (base.pool_c[:n].clone(), base.pool_r[:n].clone(), base.pool_idx[:n].clone())
+                    base_s, _ = stored()
+                    assert base[2][3].isnan().all() and base[1][3].isnan().sum() == 2, "the poison did not reach the entries"
+                    for setting, (kc, kr, ki) in kept.items():
+                        config.dsv41_numerics = setting
+                        pol = NM.parse(setting)
+                        c0 = R.fallback_count()
+                        got = a.publish_pools(x, {}, 0)
+                        c1 = R.fallback_count()
+                        got = (got.pool_c[:n], got.pool_r[:n], got.pool_idx[:n])
+                        got_s, _ = stored()
+                        c2 = R.fallback_count()
+                        assert c1 - c0 == c2 - c1 == kc + kr + ki, (L, setting, c1 - c0, c2 - c1)
+                        for path, g, b in (("stateless", got, base), ("cached", got_s, base_s)):
+                            want_c, want_r = R.round_compressed_(pol, b[0].clone(), b[1].clone())
+                            want_i = R.round_index_(pol, b[2].clone())
+                            for name, gt, wt in (("compressed NoPE", g[0], want_c), ("compressed RoPE", g[1], want_r),
+                                                 ("index keys", g[2], want_i)):
+                                assert torch.equal(ibits(gt), ibits(wt)), f"L{L} {setting} {path}: {name}"
+                            # the blocks that cannot be rounded hold exactly what precise stores
+                            if kc:
+                                assert torch.equal(ibits(g[0][1, :64]), ibits(b[0][1, :64])), (L, setting, path)
+                            if kr:
+                                lanes = slice(22, 24) if pol.contract == "vllm" else slice(16, 32)
+                                assert torch.equal(ibits(g[1][3, lanes]), ibits(b[1][3, lanes])), (L, setting, path)
+                            if ki:
+                                assert torch.equal(ibits(g[2][3]), ibits(b[2][3])), (L, setting, path)
+                            n_checks += 1
+
+                    # strict: the refusal's errors, and the cached store writes nothing
+                    R.set_strict(True)
+                    for setting, why in (("vllm", "dsv41 numerics: rounded value overflows the operand dtype"),
+                                         ("deepseek", "dsv41 numerics: nonfinite operand")):
+                        config.dsv41_numerics = setting
+                        try:
+                            a.publish_pools(x, {}, 0)
+                        except ValueError as e:
+                            assert str(e) == why, (L, setting, str(e))
+                        else:
+                            raise AssertionError(f"L{L} {setting}: strict publish_pools did not refuse")
+                        try:
+                            stored()
+                        except ValueError as e:
+                            assert str(e) == "dsv41 numerics: nonfinite operand", (L, setting, str(e))
+                        else:
+                            raise AssertionError(f"L{L} {setting}: strict cached store did not refuse")
+                    kl = types.SimpleNamespace(
+                        pool_c = torch.zeros(P_, epp, 448, dtype = torch.half), pool_r = torch.zeros(P_, epp, 64, dtype = torch.half),
+                        pool_idx = torch.zeros(P_, epp, 128, dtype = torch.half), epp = epp, D_c = 448, D_r = 64, D_i = 128,
+                        quant = False)
+                    try:
+                        a._store_entries(latent[:5].half().clone(), e0, kl, bt, e0 * m, 5 * m, {})
+                    except ValueError:
+                        pass
+                    assert not (kl.pool_c.any() or kl.pool_r.any() or kl.pool_idx.any()), \
+                        f"L{L}: a refused cached store wrote the pool"
+                    R.set_strict(False)
+                finally:
+                    del a.compressor.forward
+
+            # the index query: one block past MXFP4's FP16 limit
+            qs = {}
+            def fake_select(q, w, pool, **kw):
+                qs[str(config.dsv41_numerics)] = q.clone()
+                return sel.SelectResult(torch.zeros(q.shape[0], 512, dtype = torch.int32), 512,
+                                        torch.zeros(q.shape[0], 2048, dtype = torch.int32) if kw["want_cand"] else None)
+            a = layers[20]
+            real_q = a.idx_wq_b.forward
+            def poisoned_q(*args, **kw):
+                q = real_q(*args, **kw).clone()
+                q[0, 2, 3 * 128 + 40] = 60000.0              # head 3, lane 40: a NoPE lane, not rotated
+                return q
+            a.idx_wq_b.forward = poisoned_q
+            real_sel = dsv41_mod().select_topk
+            dsv41_mod().select_topk = fake_select
+            try:
+                xq = (torch.randn(1, 5, 5120) * 0.5).half()
+                q_res = torch.randn(1, 5, 1280).half()
+                pool = torch.zeros(700, 128, dtype = torch.half)
+                for setting in ("precise", "deepseek:index"):
+                    config.dsv41_numerics = setting
+                    c0 = R.fallback_count()
+                    a._indexer_topk(xq, {}, q_res, pool, 700, 695)
+                    assert R.fallback_count() - c0 == (setting != "precise"), (setting, R.fallback_count() - c0)
+                qp, qr = qs["precise"], qs["deepseek:index"]
+                assert qp[2, 3, 40] == 60000.0
+                assert torch.equal(ibits(qr), ibits(R.mxfp4_(qp.clone()))), "index query"
+                assert torch.equal(ibits(qr[2, 3, 32:64]), ibits(qp[2, 3, 32:64])), "the kept query block"
+                assert not torch.equal(qr, qp), "the other blocks of the query were not rounded"
+                R.set_strict(True)
+                try:
+                    a._indexer_topk(xq, {}, q_res, pool, 700, 695)
+                except ValueError as e:
+                    assert str(e) == "dsv41 numerics: rounded value overflows the operand dtype", str(e)
+                else:
+                    raise AssertionError("strict index query did not refuse")
+            finally:
+                R.set_strict(False)
+                dsv41_mod().select_topk = real_sel
+                del a.idx_wq_b.forward
+    finally:
+        R.set_strict(previous)
+        config.dsv41_numerics = "precise"
+    warnings = [l for l in out.getvalue().splitlines() if "!! DSV41 numerics:" in l]
+    assert len(warnings) == 1, f"expected one warning, got {warnings}"
+    R.reset_fallbacks()
+    print(f"  OK  numerics fallback: an overflowing or nonfinite operand keeps its blocks as precise "
+          f"stores them, the rest rounded as usual ({n_checks} store checks, stateless and cached, "
+          f"and the index query), counted per block, one warning; the strict switch raises the "
+          f"refusal's errors and the cached store writes nothing")
+
+
+def dsv41_mod():
+    return sys.modules[f"{_P}.modules.dsv41"]
 
 
 def test_attention():

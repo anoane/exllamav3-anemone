@@ -888,6 +888,232 @@ cache = Cache(model, max_num_tokens = 262144)       # attached before the load: 
 model.load(use_per_device = [36, 90])
 ```
 
+### `EXL3_DSV41_NUMERICS` (default: `deepseek:index`)
+
+How DeepSeek-V4.1's attention rounds three operands that DeepSeek's reference inference code
+rounds on purpose, the way the model was trained: the lightning indexer's query and key vectors,
+the sliding-window KV, and the compressed KV. The indexer's top-512 selection and its candidate
+blocks are discrete choices over up to a million positions, so these roundings change which
+entries each query attends to, not only the last bits of its scores.
+
+Python: `config.dsv41_numerics` on the `DeepseekV41Config`. The variable is read once, when the
+config is built (`Config.from_directory`), and gives the attribute its starting value; after
+that only the attribute counts. The attention layers read the attribute on every forward pass,
+so one loaded model can be switched between settings (see Cache consistency below). Assigning
+parses and validates the value: an invalid one raises `ValueError` and leaves the setting
+unchanged, and `None` or `""` restores the default. Reading it returns the parsed setting, whose
+`str()` is the canonical spelling (`"vllm:index,compressed"`, not `"vllm:compressed, index"`).
+
+Settings. A contract, optionally restricted to some of its parts:
+
+| Contract | `index`: index Q and K (post-RoPE) | `window`: sliding-window KV | `compressed`: compressed KV |
+|---|---|---|---|
+| `precise` | FP16 | FP16 | FP16 |
+| `deepseek` | MXFP4: E2M1 values, one E8M0 (power-of-two) scale per 32 lanes, as DeepSeek's `fp4_act_quant` | FP8 E4M3, one E8M0 scale per 32 lanes, RoPE lanes included, as `act_quant(scale_fmt = "ue8m0")` | E2M1 values, one E4M3 scale per 16 lanes, RoPE lanes included, as `fp4_act_quant(scale_dtype = float8_e4m3fn)` |
+| `vllm` | MXFP4, as `deepseek` | `fp8_ds_mla`: the 448 NoPE lanes E4M3 with one power-of-two scale per 64 lanes, the 64 RoPE lanes BF16 | `fp8_ds_mla`, as the window |
+
+Syntax: `precise`, `deepseek` or `vllm`, optionally followed by `:` and a comma-separated list of
+parts from `index`, `window` and `compressed`. A contract without a part list applies all
+three parts; `precise` takes no parts. Names are case-insensitive and whitespace around them is
+ignored. Examples: `deepseek:index` (the default), `deepseek` (= `deepseek:index,window,compressed`),
+`vllm:window,compressed`, `deepseek:compressed`. Refused, with a `ValueError` when the config is
+built (variable) or on assignment (attribute): any other contract name, `precise:<parts>`, an
+empty part list (`vllm:`) and unknown parts (`deepseek:index,kv`).
+
+Each rounding is computed from the FP16 (or FP32) operand, and the rounded values are widened
+back into the operand and stored in the FP16 cache: a setting reproduces a contract's values,
+not its memory savings. The kernels are checked bit for bit against independent scalar
+transcriptions of DeepSeek's `kernel.py` and of the `fp8_ds_mla` rounding, on every lattice tie
+(each midpoint of the E2M1 and E4M3 lattices, at a block scale of 1), scale boundary and
+saturation case, and give the same bits on the CPU and on every GPU
+(`tests/test_dsv41_numerics_.py`, `tests/test_dsv41_numerics_gpu_.py`). The `fp8_ds_mla` scale is
+the exact one, the smallest power of two with 448 times it at or above the 64-lane peak; vLLM's
+kernels compute it in FP32 with an approximate log2 on BF16 operands, which can keep the next
+lower power of two for peaks a few ulps above a power of two times 448 (a negligible difference,
+but not bit for bit vLLM's).
+
+Overflow and nonfinite operands. Some values FP16 holds round past its range: in FP16, a
+magnitude of 57,344 or more under MXFP4 (it rounds to 65,536), 63,488 or more under the FP8
+roundings, and 65,408 or more under BF16 (the `vllm` RoPE lanes). A block whose rounding would
+store such a value (a block is the lanes that share one scale: 32 under MXFP4 and the `deepseek`
+FP8, 16 under E2M1, 64 under `fp8_ds_mla`, and a single lane under BF16), and a block whose
+operand is not finite, is stored unrounded instead: it keeps exactly the values `precise` stores,
+every other block is rounded as usual, and the forward goes on. The choice is made on the GPU,
+with no host synchronization. Each device counts these blocks, and the first nonzero count
+prints one warning per process:
+
+```
+ !! DSV41 numerics: 3 block(s) kept unrounded so far, because rounding them would store a value FP16 cannot hold or their operand is not finite; ...
+```
+
+The count is read back without waiting for the GPU: a copy into pinned host memory, read only
+once it has landed, at most every 0.25 s per GPU (`POLL_SECONDS` in `modules/dsv41_rounding.py`),
+so the warning comes one or two looks late, normally within a second of the first such block;
+a count that no look has read when the interpreter exits (blocks kept by the process's last
+rounding calls) is reported then, from an `atexit` handler that reads each device's count once.
+`exllamav3.modules.dsv41_rounding.fallback_count()` returns the total over every device; it
+waits for the GPUs, so it is for diagnostics, not for a serving loop. With
+`EXL3_DSV41_NUMERICS_STRICT=1` such an operand raises `ValueError` instead (below). The E2M1
+rounding of the `deepseek` compressed part never overflows: as in DeepSeek's kernel its E4M3
+scale saturates at 448, so a 16-lane block whose peak exceeds 6 x 448 = 2,688 is clamped to
++-2,688; only a nonfinite operand keeps one of its blocks unrounded. On finite operands whose
+rounded values fit, the default and the strict switch (below) store the same bits.
+
+For maintainers: the fallback exists so that one extreme activation cannot abort a long
+generation. The blocks it keeps hold the `precise` values, a valid FP16 state for every later
+forward, for prefix reuse and for rewinds; only the rounding of those blocks is lost. The count
+lives in `modules/dsv41_rounding.py` (one int64 per device, its pinned host copy and an event,
+and the `atexit` handler above) for the life of the process, and the engine never resets it.
+The default path must stay free of host reads, and the default and strict paths bitwise equal
+on finite operands whose rounded values fit: `tests/test_dsv41_numerics_.py` checks both on the
+CPU (the host reads on meta operands), `tests/test_dsv41_numerics_gpu_.py` on every GPU under
+`torch.cuda.set_sync_debug_mode("error")`. If the warning appears, rerun with
+`EXL3_DSV41_NUMERICS_STRICT=1` to stop at the first rounding call that meets such a value, with
+its traceback.
+
+Why the default is `deepseek:index`. On DeepSeek-V4.1-Flash (EXL3, 3.0 bpw), teacher-forced over
+one long real text and scored at every position, the MXFP4 rounding of the index operands alone
+gave the lowest error of the settings compared:
+
+- negative log-likelihood of the real text, which needs no reference: lowest at 64K (0.249963
+  against 0.250939 for `precise`) and 128K (0.256422 against 0.256955), tied on the first 364K
+  predictions (0.294591 against 0.294598), and 0.1% higher over all 1,048,559 (0.321319 against
+  0.320997);
+- against two captures of vLLM's V4.1 path running the same checkpoint (FP8 KV, MXFP4 index): fewer
+  confident flips than `precise` at every length (per 100K reference-confident positions: 150
+  against 161 at 64K, 180 against 189 at 128K, 212 against 228 at 364K, 253 against 270 at 1M;
+  `vllm`, which adds FP8 KV, is within 1-2 of it at 64K, 128K and 364K) and the fewest certain
+  misses of the numerics settings at every length (7.6 per 100K at 64K, against 8.4 for `precise`,
+  10.7 for `vllm` and 19.1 for `deepseek`; 1.6 against 2.9 for `precise` at 1M);
+- against a released-precision baseline (the original checkpoint served by a hosted provider,
+  its top-5 log-probabilities at 65,535 positions of the first 64K tokens of the same text): the
+  top-1 token agreed at 98.07% of positions for `deepseek:index`, 98.04% for `precise`, 98.03%
+  for `vllm` and 97.99% for `deepseek` (98.00-98.06% for the vLLM captures), against 98.89%
+  between two identical requests to the provider; the top-5 KL divergence was 0.0176, 0.0176,
+  0.0171 and 0.0179 against the provider's own 0.0059. The settings are within about 0.08
+  points of each other there; the gap to the provider is the 3.0-bpw quantization, which none
+  of them removes.
+
+The rounding matters at near-ties of the top-512 cut: at one position of the 1M run the two
+reference captures give the actual next token 93% and 96%, `deepseek:index` 97% and `precise`
+0.06%, and exact replays trace the difference to the layer-2 index selections of the rows
+256-512 tokens earlier.
+
+Rounding the KV as well (`deepseek`, `vllm`, or only their `window`/`compressed` parts) raised
+the negative log-likelihood at every length measured (64K: 0.251180 `vllm`, 0.251389
+`vllm:window,compressed`, 0.251634 `deepseek:window,compressed`, 0.252312 `deepseek`). The
+reference in these comparisons is itself an FP8/MXFP4 engine on the same 3-bit weights; the
+ranking might differ against an FP8 reference captured with DeepSeek's official numerics path
+on B200/B300 GPUs; no reference captured with that path was available.
+
+Interactions and refusals:
+
+- Quantized cache (`-cq`): rounding compressed entries is defined on the FP16 pool, while a
+  quantized V4.1 pool stores the entries' NoPE part in the cache-quant format. A setting with the
+  `compressed` part is therefore refused when a Cache with quantized pools is built
+  (`Cache(model, layer_type = CacheLayer_quant, ...)`), and assigning such a setting is refused
+  while a quantized Cache built for a model of this config exists (call
+  `cache.detach_from_model()` and drop the Cache first). `index` and `window` combine with `-cq`
+  freely. Both are configuration-time errors: neither refusal happens inside a forward pass (the
+  operand checks above do). The error suggests the setting without its `compressed` part, or
+  the default when no other part is left.
+- The setting applies to the cached (generation) path and to the stateless path alike.
+
+Relation to other settings. `-cq` is the one setting that overlaps: it stores the compressed
+pool's NoPE lanes (`pool_c`) packed in exllamav3's cache-quant format, and those are exactly the
+values the `compressed` part rounds, so the two would define the same stored values in two
+different ways; the combination is refused, both ways, as above. `-cq 8` is exllamav3's own
+storage format, neither vLLM's `fp8_ds_mla` nor DeepSeek's FP8. Under `-cq` the index keys
+(`pool_idx`), the compressed RoPE lanes (`pool_r`) and the sliding-window ring stay FP16, so the
+`index` and `window` parts are independent of it. No other setting rounds these operands: the
+`EXL3_DSA_*`, `EXL3_BC_DSA` and `EXL3_QC_*` variables choose kernels, graphs or cache staging, or
+add bounds checks, and leave the values alone.
+
+Cache consistency: entries already in a Cache keep the rounding they were stored with. Change
+the setting between sequences, and do not let the generator reuse cached prefixes that were
+stored under another setting (use a fresh Cache and Generator after switching).
+
+Performance: the roundings are elementwise torch operations. With `deepseek:index`, per forward:
+the index query of each index source that selects (8 layers on V4.1-Flash, once more than 512
+compressed entries are visible) and the index keys each kv source stores (4 layers): under the
+default about 10-11 rounding calls per decoded token (the 8 index queries, and the index keys
+that layer 20 stores every token and layers 2, 8 and 14 every second token). The `window` part
+adds one call per layer and decoded token under `deepseek` (40 on V4.1-Flash) and two under
+`vllm` (NoPE and RoPE lanes, 80); the `compressed` part two per stored entry. No call waits for
+the GPU: the overflow check adds a few elementwise kernels and a device-side add to the count,
+and, until the warning has been printed, at most every 0.25 s per GPU an event query and one
+8-byte copy of the count. Under `EXL3_DSV41_NUMERICS_STRICT=1` every call reads its checks back
+to the host once, which waits for the GPU. Measured on a decode-sized index query (32 heads x 128
+lanes, FP16), on the RTX PRO 6000 and on the CMP 170HX, in two runs: with the GPU idle a call
+costs 0.14-0.20 ms of host time under either policy; with GPU work queued ahead of it, a default
+call returns in 0.23-0.29 ms, while a strict call waits for the queue (2.8-2.9 ms on the RTX PRO
+6000 and 8.0 ms on the CMP 170HX in that test). The effect on decode speed has not been measured
+on an otherwise idle host.
+Prefill of 64K tokens (single runs, measured while every call still read its checks back to the
+host): under the stable-arithmetic profile, in the same setup, 796 tok/s for `deepseek:index`
+against 798 for `precise` (and 792 for `vllm`, 794 for `deepseek`, which also round the window
+KV of all 40 layers, against 793 for `deepseek:index` in their setup); in the serving setup
+(routed experts in system RAM, ordinary arithmetic) 1007 against 1040, about 3% slower.
+
+Memory: nothing persistent but the count (8 bytes per device, and 8 pinned bytes on the host
+per GPU). A rounding call works on FP32 copies of the operand's blocks, one slice of 65,536
+blocks at a time, and rounds each slice in place; under `EXL3_DSV41_NUMERICS_STRICT=1` the
+slices go into one buffer of the operand's size instead, copied into the operand once every
+slice has passed its checks. Measured on the CPU, the index query of a 4096-token prefill chunk
+(32 MiB in FP16) needs about 90 MiB of transient memory under MXFP4 (about 120 MiB under the
+strict switch), one of a 2048-token chunk about 90 MiB (about 100), and a decode step's under
+1 MiB; the autosplit's measuring forward rounds a chunk as well, so it sees this.
+
+Determinism: the kernels are deterministic, and each rounds, or keeps, blocks of 16, 32 or 64
+lanes inside one entry or head (single lanes under BF16), so the result does not depend on chunk
+size or batch composition. Different settings give different model outputs by design.
+
+When to use which: keep the default. `precise` removes all rounding (for comparisons with FP16
+arithmetic or with engines that do not round). The full `deepseek` or `vllm` contracts, and the
+part lists, reproduce another engine's attention numerics for experiments and A/B comparisons.
+
+```sh
+EXL3_DSV41_NUMERICS=precise python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+```
+
+```python
+config = Config.from_directory(model_dir)          # EXL3_DSV41_NUMERICS, if set, is read here
+config.dsv41_numerics = "vllm:index,window"         # validated now
+model = Model.from_config(config)
+...
+for setting in ("precise", "deepseek:index"):       # one loaded model, two settings
+    config.dsv41_numerics = setting
+    ...                                             # run each setting on a fresh Cache
+```
+
+### `EXL3_DSV41_NUMERICS_STRICT` (default: `0`)
+
+For debugging the attention numerics (`EXL3_DSV41_NUMERICS`, above). By default a block whose
+rounding would store a value FP16 cannot hold, or whose operand is not finite, is stored
+unrounded, counted and reported once. With this switch on (any value other than `0` or empty),
+the rounding raises `ValueError` inside the forward pass instead, with the operand unchanged:
+`dsv41 numerics: nonfinite operand`, or `dsv41 numerics: rounded value overflows the operand
+dtype`. The error stops the forward, and the generator's batch, at the call that met the value,
+which is what the switch is for: finding where such a value comes from. Under a two-part contract
+(`vllm` window or compressed entries, `deepseek` compressed entries) the first half may already
+be rounded when the second is refused; every caller rounds a copy that it drops on the error, and
+the cached path refuses before it writes the pool. The switch changes neither `-cq` refusal
+(Interactions and refusals, above): those are configuration-time errors under either policy.
+
+Cost: every rounding call reads its checks back to the host once, which waits for the GPU (under
+`deepseek:index` about 10-11 times per decoded token, 40 more with the `deepseek` window part, 80
+with `vllm`'s), and an operand of more than 65,536 blocks is rounded into a buffer of its own
+size (see Memory above). On finite operands whose rounded values fit, both modes give the same
+bits.
+
+Read once, at the first rounding call of the process; set it before loading the model. Tests
+switch it with `exllamav3.modules.dsv41_rounding.set_strict()`, which returns the previous
+setting.
+
+```sh
+EXL3_DSV41_NUMERICS_STRICT=1 python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+```
+
 ### `EXL3_DSV41_ENGRAM_PREFETCH` (default: `1`)
 
 DeepSeek-V4.1's engram layers (layers 1 and 14 on Flash) add a gated embedding of each position's

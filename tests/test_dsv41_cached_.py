@@ -144,6 +144,7 @@ def test_cache(cfg, model):
     # quantized Cache request: k_bits reaches the source pools
     lt, kw = A[2].cache_layer_type(CacheLayer_quant, {"k_bits": 6, "v_bits": 6})
     assert lt is CacheLayer_dsv41 and kw == {"k_bits": 6, "v_bits": 6}, (lt, kw)
+    check_numerics_vs_packed_pools(cfg, model)
 
     # a consumer owns no pool: it is never asked for a cache layer class
     assert not any(A[i].caps.get("kv_cache") for i in range(cfg.num_hidden_layers)
@@ -152,6 +153,66 @@ def test_cache(cfg, model):
     model.__dict__.pop("_get_cache_layers", None)
     print(f"  OK  cache: 4 source pools {total:,} B at 1M (3 x 671,088,640 + 1,342,177,280), "
           f"40 DSV41LayerState, carry rings on 2/8/14")
+
+
+def check_numerics_vs_packed_pools(cfg, model):
+    """
+    The attention numerics round compressed entries in the FP16 pool, so the compressed part is
+    refused with a quantized (packed) pool: when such a Cache is built under it, and when the
+    setting switches to it while such a Cache exists. Both are configuration-time errors, so the
+    rounders' overflow policy (a block kept unrounded by default, a refusal under
+    EXL3_DSV41_NUMERICS_STRICT) changes neither: checked under both, with the package's own
+    rounding module, the one the attention layers call.
+    """
+    from exllamav3.modules import dsv41 as attention, dsv41_rounding as rounding
+    assert attention.rounding is rounding, "the attention does not call the package's rounders"
+    previous = rounding.set_strict(False)
+    try:
+        for strict in (False, True):
+            rounding.set_strict(strict)
+            _packed_pool_refusals(cfg, model)
+    finally:
+        rounding.set_strict(previous)
+    print("  OK  numerics vs a quantized Cache: compressed rounding refused when the Cache is built and "
+          "while one exists, under the default overflow policy and the strict switch; index/window "
+          "rounding and FP16 pools unaffected")
+
+
+def _packed_pool_refusals(cfg, model):
+    import gc
+    from exllamav3.cache.cache import Cache
+    from exllamav3.cache.quant import CacheLayer_quant
+    saved = cfg.dsv41_numerics
+    attached = set(model.cache_weakrefs)
+    quant = lambda: Cache(model, max_num_tokens = 65536, max_batch_size = 1,
+                          layer_type = CacheLayer_quant, k_bits = 6, v_bits = 6)
+    try:
+        cfg.dsv41_numerics = "deepseek:index"
+        qc = quant()
+        assert all(l.quant for l in qc.layers.values()) and len(qc.layers) == 4
+        try:
+            cfg.dsv41_numerics = "deepseek"
+        except ValueError as e:
+            assert "quantized pool" in str(e), e
+        else:
+            raise AssertionError("switched to compressed rounding with a packed pool attached")
+        assert str(cfg.dsv41_numerics) == "deepseek:index"
+        cfg.dsv41_numerics = "vllm:index,window"                 # no compressed part: fine
+        qc.detach_from_model()
+        del qc
+        gc.collect()
+        cfg.dsv41_numerics = "deepseek"                          # the packed Cache is gone
+        try:
+            quant()
+        except ValueError as e:
+            assert "quantized Cache" in str(e), e
+        else:
+            raise AssertionError("built a packed pool under compressed rounding")
+        assert set(model.cache_weakrefs) == attached, "a refused Cache stayed attached"
+        Cache(model, max_num_tokens = 65536, max_batch_size = 1).detach_from_model()   # FP16: fine
+    finally:
+        model.__dict__.pop("_get_cache_layers", None)
+        cfg.dsv41_numerics = saved
 
 
 def test_geometry():

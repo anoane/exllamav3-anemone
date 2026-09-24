@@ -9,6 +9,9 @@ The modules here are test oracles, never used at inference time:
     engram_tables    a pread/mmap reader for the file-backed engram tables
     deepseek         loaders for DeepSeek's own reference inference code
 
+and load_numerics(), which loads the attention-numerics parser and rounding kernels without
+the package.
+
 Tests import them as dsv41_ref.<module> with the tests directory on sys.path (pytest puts it
 there; a test run as a script inserts it itself).
 
@@ -25,6 +28,7 @@ import contextlib
 import importlib.util
 import os
 import sys
+import types
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -53,6 +57,24 @@ def load_package_file(relative: str, name: str, package: str | None = None):
         del sys.modules[name]
         raise
     return mod
+
+
+def load_numerics():
+    """
+    (numerics, rounding): architecture/dsv41/numerics.py and modules/dsv41_rounding.py, loaded
+    by path into a stand-in package, so the rounding kernels run with torch alone.
+    """
+    pkg = "_dsv41_numerics_pkg"
+    for name in (pkg, f"{pkg}.architecture", f"{pkg}.architecture.dsv41", f"{pkg}.modules"):
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            m.__path__ = []
+            sys.modules[name] = m
+    num = load_package_file("exllamav3/architecture/dsv41/numerics.py",
+                            f"{pkg}.architecture.dsv41.numerics", f"{pkg}.architecture.dsv41")
+    rnd = load_package_file("exllamav3/modules/dsv41_rounding.py",
+                            f"{pkg}.modules.dsv41_rounding", f"{pkg}.modules")
+    return num, rnd
 
 
 def model_dir() -> str | None:

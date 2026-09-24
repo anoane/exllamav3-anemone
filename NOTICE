@@ -45,6 +45,10 @@ The following files contain portions derived from these vLLM modules:
   tests/test_dsv41_select_.py
     vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
 
+  exllamav3/modules/dsv41_rounding.py
+    vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py
+    vllm/models/deepseek_v4_1/common/ops/cache_utils.py
+
 The vLLM source these were compared against is the one in the container image
 vllm/vllm-openai:deepseekv41-flash-0909, whose vLLM build reports the version
 0.1.dev20904+g179dd0fa9, a revision the public vllm-project/vllm repository
@@ -62,6 +66,10 @@ revision:
     530ed24c8fd2e9daeb5c3d340ef52246618786f19eace8ec217c8d3bdf271110
   vllm/models/deepseek_v4_1/amd/model.py
     b7f6050aa929a174a9dc850f345faf6be687f96169fd02861fea877c0beaf5e8
+  vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py
+    cc486feefe40871f010c38ee97a2217ca70d86b7f42cdfc5884399045d5ac385
+  vllm/models/deepseek_v4_1/common/ops/cache_utils.py
+    bb6bd4fa9ddcf7fb1a8858a0472c039001f436098a613f2679ba10820c2f3086
 
 The local copy of common/engram.py that the port was first compared against
 (SHA256 04d532f1b4560323f7773d3bd1a36121f1322edd644edf8553d39e57d201c3a3)
@@ -88,6 +96,9 @@ exllamav3/architecture/dsv41/engram.py and tests/dsv41_ref/engram_hash.py
 carry parts of its engram.py through vLLM's port listed above: the hash
 multipliers (compute_hash_multipliers), the prime bucket layout
 (EngramLayout) and the n-gram hash (NgramHashState).
+exllamav3/modules/dsv41_rounding.py reimplements in torch the activation
+rounding of its kernel.py (act_quant and fp4_act_quant, with E8M0 and E4M3
+scales).
 
 These tests transcribe parts of the reference as oracles and name the
 transcribed functions in their descriptions:

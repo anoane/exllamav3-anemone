@@ -22,6 +22,12 @@ start positions 0 and 70,000.
 V4's front (DSV4Attention._project_qkv) also applies an UNWEIGHTED per-head RMSNorm to q, which
 fixes every head's query length. It must differ from the transcription by more than 0.1, or the
 check could not see that bug.
+
+The comparisons run under the setting 'precise' (config.dsv41_numerics), pinned whatever
+EXL3_DSV41_NUMERICS is set. Under 'deepseek:window' and 'vllm:window' the front must hand
+round_window_ its rotated kv (the 'precise' kv, to within the projections' run-to-run noise) and
+return exactly the rounded result, with q unchanged: the window rounding is wired after the
+rotation, and to nothing else.
 """
 import os, sys
 import torch
@@ -36,6 +42,8 @@ if __name__ == "__main__" and not torch.cuda.is_available():
 
 from exllamav3 import Config, Model
 from exllamav3.modules.dsv4 import DSV4Attention
+from exllamav3.modules import dsv41_rounding as rounding
+from exllamav3.architecture.dsv41 import numerics
 
 
 def rel(a, b):
@@ -62,6 +70,7 @@ def rope64(x, inv, pos):
 def main(path):
     dev = torch.device("cuda:0")
     cfg = Config.from_directory(path)
+    cfg.dsv41_numerics = "precise"
     model = Model.from_config(cfg)
     B = model.modules[model.first_block_idx: model.first_block_idx + cfg.num_hidden_layers]
     torch.manual_seed(0)
@@ -89,6 +98,28 @@ def main(path):
                     print(f"  L{L} position {p0:>6}: q_res {e[0]:.2e}  q {e[1]:.2e}  kv {e[2]:.2e}")
                     assert max(e) < 1e-3, f"layer {L} at {p0}: front differs from DeepSeek's by {max(e):.2e}"
                     worst = max(worst, *e)
+                    # the window rounding: round_window_ of the rotated kv, returned as is
+                    for setting in ("deepseek:window", "vllm:window"):
+                        seen = []
+                        real = rounding.round_window_
+                        def spy(policy, t, rope_dim):
+                            seen.append(t.clone())
+                            return real(policy, t, rope_dim)
+                        cfg.dsv41_numerics = setting
+                        rounding.round_window_ = spy
+                        try:
+                            q_res_w, q_w, kv_w = a._project_qkv(x, {}, p0)
+                        finally:
+                            rounding.round_window_ = real
+                            cfg.dsv41_numerics = "precise"
+                        assert len(seen) == 1, f"layer {L}: round_window_ called {len(seen)} times"
+                        want = real(numerics.parse(setting), seen[0].clone(), rd)
+                        assert torch.equal(kv_w, want) and not torch.equal(kv_w, seen[0]), \
+                            f"layer {L} at {p0}: {setting} kv is not round_window_ of the rotated kv"
+                        e_in = rel(seen[0], kv)
+                        assert e_in < 1e-6, f"layer {L} at {p0}: {setting} rounded another kv ({e_in:.2e})"
+                        assert rel(q_w, q) < 1e-6 and rel(q_res_w, q_res) < 1e-6, \
+                            f"layer {L} at {p0}: {setting} changed the query"
                 # V4's front at position 0 (its per-head q norm) must be told apart
                 _, q4, _ = DSV4Attention._project_qkv(a, x, {}, 0)
                 pos = torch.arange(0, T, device = dev)
@@ -103,7 +134,8 @@ def main(path):
             a.unload()
             torch.cuda.empty_cache()
     print(f"  OK  V4.1 attention front == DeepSeek's transcription on layers 0, 2, 20 (worst {worst:.2e}); "
-          f"V4's per-head q norm differs by >= {v4_min:.2f}")
+          f"V4's per-head q norm differs by >= {v4_min:.2f}; deepseek:window and vllm:window round "
+          f"exactly the front's kv")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,8 @@ def rel(a, b):
 def main(path):
     dev = torch.device("cuda:0")
     cfg = Config.from_directory(path)
+    # the gates below were measured without rounding: pinned, whatever EXL3_DSV41_NUMERICS is set
+    cfg.dsv41_numerics = "precise"
     model = Model.from_config(cfg)
     B = model.modules[model.first_block_idx: model.first_block_idx + cfg.num_hidden_layers]
     torch.manual_seed(0)

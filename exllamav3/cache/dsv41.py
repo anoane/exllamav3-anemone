@@ -104,6 +104,10 @@ class CacheLayer_dsv41(CacheLayer_dsa):
         # V4 sets D_i only for its 'csa' kind (dsa.py); V4.1 drives the base as 'hca'
         self.D_i = attention.index_head_dim if attention.owns_index_k else 0
         check_pool_addressing(self, f"pool of kv source {attention.layer_idx}")
+        if self.quant and hasattr(config, "register_packed_pool"):
+            # the attention numerics round compressed entries in the FP16 pool: the config
+            # refuses a packed pool under such a setting, now and for as long as this one lives
+            config.register_packed_pool(self)
 
     def tp_export(self, plan):
         raise NotImplementedError("Tensor-parallel loading is not supported for DeepSeek-V4.1 pools")

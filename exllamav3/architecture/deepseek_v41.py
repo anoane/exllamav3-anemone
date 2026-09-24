@@ -31,6 +31,7 @@ which this text model does not build; those entries are ignored.
 from __future__ import annotations
 
 import inspect
+import os
 import weakref
 
 import torch
@@ -39,6 +40,7 @@ from typing_extensions import override
 from ..util.file import no_default
 from ..model.config import Config
 from ..model.model import Model
+from .dsv41 import numerics
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
 V41_VALID_RATIOS = (0, 1, 2)
@@ -50,6 +52,14 @@ QUANTIZE_REFUSAL = (
     "how DeepSeek's original weights are quantized (the lightning indexer's projections, for "
     "one, would be calibrated against the wrong inputs), so a conversion would not produce a "
     "correct model. Conversion from DeepSeek's original checkpoint will come in a later change.")
+
+
+def _without_compressed(n) -> str:
+    """The setting a -cq refusal suggests: the chosen parts without 'compressed', or the default
+    when no other part is left."""
+    if n.index or n.window:
+        return str(numerics.Numerics(n.contract, n.index, n.window, False))
+    return numerics.DEFAULT
 
 
 def _nested(key: str) -> list[str]:
@@ -299,6 +309,47 @@ class DeepseekV41Config(Config):
             if self.engram_pad_token_id is None:
                 # a default of -1 would pad every blocked n-gram with the last vocabulary entry
                 raise ValueError("engram_pad_token_id is required when engram layers exist.")
+
+        # ---- attention numerics ----
+        # How the indexer operands and the attention KV are rounded (architecture/dsv41/
+        # numerics.py). EXL3_DSV41_NUMERICS gives the value this config starts with; the
+        # attention layers read the attribute on every forward, so it can be changed between
+        # sequences on a loaded model
+        self._dsv41_packed_pools = weakref.WeakSet()
+        self.dsv41_numerics = os.environ.get(numerics.ENV_NUMERICS)
+
+    @property
+    def dsv41_numerics(self) -> numerics.Numerics:
+        return self._dsv41_numerics
+
+    @dsv41_numerics.setter
+    def dsv41_numerics(self, value):
+        """
+        Parsed and validated on assignment ('precise', 'deepseek', 'vllm', optionally ':' and
+        parts; None or '' for the default). The compressed part rounds entries in the FP16
+        pool, so it is refused while a packed (quantized) pool built from this config exists.
+        """
+        n = numerics.parse(value)
+        if n.compressed and len(self._dsv41_packed_pools):
+            raise ValueError(
+                f"dsv41 numerics {n}: rounding compressed entries is defined on the FP16 pool, "
+                f"and a Cache with a quantized pool (-cq) exists for this model; use a setting "
+                f"without the compressed part (e.g. {_without_compressed(n)}) or an FP16 Cache")
+        self._dsv41_numerics = n
+
+    def register_packed_pool(self, layer):
+        """
+        Called by each V4.1 kv-source pool built in the packed (quantized) format, when the
+        Cache is constructed. Refuses the pool if the current numerics round compressed entries,
+        and keeps a weak reference so that the setting cannot switch to them while it exists.
+        """
+        n = self._dsv41_numerics
+        if n.compressed:
+            raise ValueError(
+                f"dsv41 numerics {n}: rounding compressed entries is defined on the FP16 pool and "
+                f"cannot be combined with a quantized Cache (-cq); use a setting without the "
+                f"compressed part (e.g. {_without_compressed(n)}) or an FP16 Cache")
+        self._dsv41_packed_pools.add(layer)
 
     # -- topology queries --
 
