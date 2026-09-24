@@ -40,7 +40,7 @@ from typing_extensions import override
 from ..util.file import no_default
 from ..model.config import Config
 from ..model.model import Model
-from .dsv41 import numerics
+from .dsv41 import numerics, pipeline
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
 V41_VALID_RATIOS = (0, 1, 2)
@@ -464,6 +464,10 @@ class DeepseekV41Model(Model):
         self.load_guard = DSV41LoadGuard(
             c, cache_attached = lambda: (m := self_ref()) is not None and m._cache_attached(),
         )
+        # Pipelined prefill (dsv41/pipeline.py): the cached split plan, and the max_chunk_size
+        # of the current load, which bounds its sub-chunk. Both are reset by every load/unload
+        self._dsv41_pipeline_plan = None
+        self._dsv41_loaded_max_chunk = None
 
         self.modules += [
             Embedding(
@@ -694,8 +698,18 @@ class DeepseekV41Model(Model):
     )
 
     @override
+    @torch.inference_mode
+    def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
+        # Two-stage pipelined prefill across the layer split (opt-in, see dsv41/pipeline.py)
+        if params is not None and pipeline.eligible(self, input_ids, params):
+            return pipeline.prefill_pipelined(self, input_ids, params)
+        return super().prefill(input_ids, params)
+
+    @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         from ..modules.attn import prepare_for_attn
+        # A job state left partly advanced by a failed pipelined prefill is refused
+        pipeline.check_state(params)
         # Engram layers hash the raw token ids, so they must survive into params
         params["input_ids"] = input_ids
         # A compressed pool published by one layer is read by its whole kv
@@ -741,7 +755,24 @@ class DeepseekV41Model(Model):
         from .dsv41.placement import TP_REFUSAL
         a = inspect.signature(Model.load_gen).bind(self, *args, **kwargs)
         a.apply_defaults()
-        if a.arguments["tensor_p"]:
+        a = a.arguments
+        # A reload can change modules, devices, CPU hosts and streams
+        self._dsv41_pipeline_plan = None
+        self._dsv41_loaded_max_chunk = None
+        if pipeline.PIPELINE:
+            if pipeline.SUB_CHUNK is None:
+                # the switch turned on in this process after import, without a sub-chunk
+                raise ValueError(
+                    "DSV41 pipelined prefill: pipeline.PIPELINE is on but pipeline.SUB_CHUNK is "
+                    "not set; for an in-process A/B set both before loading")
+            chunk = pipeline._positive_chunk(pipeline.SUB_CHUNK)
+            if chunk > a["max_chunk_size"]:
+                # The load sizes its prefill workspace for max_chunk_size rows
+                raise ValueError(
+                    f"EXL3_DSV41_PIPELINE_CHUNK={chunk} exceeds this load's "
+                    f"max_chunk_size={a['max_chunk_size']}: load with max_chunk_size >= "
+                    f"{chunk}, or lower EXL3_DSV41_PIPELINE_CHUNK")
+        if a["tensor_p"]:
             raise NotImplementedError(TP_REFUSAL)
         self.load_guard.begin()
         try:
@@ -749,6 +780,14 @@ class DeepseekV41Model(Model):
         finally:
             self.load_guard.end()
         self._check_split()
+        self._dsv41_loaded_max_chunk = a["max_chunk_size"]
+        if pipeline.PIPELINE:
+            pipeline.report(self)
+
+    def unload(self):
+        self._dsv41_pipeline_plan = None
+        self._dsv41_loaded_max_chunk = None
+        super().unload()
 
     def _check_split(self):
         """

@@ -864,9 +864,13 @@ between the main process and child workers reaching their first kernel launch.
 ## DeepSeek-V4.1
 
 These variables apply only to DeepSeek-V4.1 checkpoints (`DeepseekV41ForCausalLM`); every other
-architecture ignores them. The first entry is a loading rule that has no variable. exllamav3 runs
-DeepSeek-V4.1 from EXL3 checkpoints; converting DeepSeek's original checkpoint is not supported
-yet, and `convert.py` refuses the architecture before any work, saying why.
+architecture ignores them, with one exception: with `EXL3_DSV41_PIPELINE` on, a malformed
+`EXL3_DSV41_PIPELINE_CHUNK` makes every `Config.from_directory` of the process fail for any model
+until the value is fixed, because the architecture registry imports the DeepSeek-V4.1 module (a
+module whose import failed is imported again, and fails again, on the next attempt). The first
+entry is a loading rule that has no variable. exllamav3 runs DeepSeek-V4.1 from EXL3 checkpoints;
+converting DeepSeek's original checkpoint is not supported yet, and `convert.py` refuses the
+architecture before any work, saying why.
 
 ### Loading across GPUs (the layer split; no variable)
 
@@ -1231,6 +1235,161 @@ set holds about 34 MiB, and the blocks a set gives up when it grows stay cached,
 Longer chunks stage through a transient pageable buffer instead. Read once per process, when the
 first DeepSeek-V4.1 model object is built (`Model.from_config`); set it before that. Its effect on
 prefill throughput has not been measured in isolation; it is an A/B switch.
+
+### `EXL3_DSV41_PIPELINE` (default: `0`), `EXL3_DSV41_PIPELINE_CHUNK` (default: `4096`)
+
+Two-stage pipelined prefill for DeepSeek-V4.1 split across two GPUs. In a plain layer-split
+prefill the two GPUs take turns: the host issues a chunk's first-GPU layers, then its second-GPU
+layers, and inside each half it waits at sync points (block-table uploads, MoE row counts, the
+CPU-MoE stream plans), so it never queues the next chunk's first half while the second GPU is
+still busy. With `EXL3_DSV41_PIPELINE=1`, a prefill call longer than one sub-chunk of
+`EXL3_DSV41_PIPELINE_CHUNK` tokens runs as consecutive sub-chunks (the last may be shorter), and
+the calling thread runs the first-GPU layers of sub-chunk k+1 while a worker thread runs the
+second-GPU layers of sub-chunk k:
+
+```
+calling thread (first GPU):    S1(0)  S1(1)  S1(2)  ...
+worker thread (second GPU):           S2(0)  S2(1)  S2(2)  ...
+```
+
+Stage 2 of a sub-chunk waits, on the GPU, for an event its stage 1 recorded, so it reads the
+first half's products (the residual streams and the carried hyper-connection pre-mix) only once
+they are complete;
+tensors it reads from the first GPU are recorded on its side stream, so the caching allocator
+cannot hand them out again before the read is done. Stage 2 is queued on the caller's current
+stream of the second GPU, so work the caller queues after `prefill()` returns (decode, cache
+reads) is ordered after it without a device-wide synchronization. When the call returns, after
+a failure too, the caller's current stream of the first GPU waits for the side stream, so
+first-GPU work queued afterwards (a page-table defragmentation, for example) cannot overtake
+anything stage 2 still reads there. The job state's position is advanced
+after each stage 1; stage 2 runs on a snapshot of the sub-chunk's own start position.
+
+Values: `EXL3_DSV41_PIPELINE`: `0` off (default), any other value on. `EXL3_DSV41_PIPELINE_CHUNK`:
+the sub-chunk in tokens, a positive integer; it is read (and validated) only when the pipeline is
+on, and a value that is not a positive integer then raises a `ValueError` whenever the architecture
+registry is imported (every `Config.from_directory` until the value is fixed). Both are read once at
+import; set them before loading the first model. For a same-process A/B, set `PIPELINE` and
+`SUB_CHUNK` in `exllamav3.architecture.dsv41.pipeline` before loading the model, as for
+`MoeCpuTuning` above; `PIPELINE` on with `SUB_CHUNK` unset (the variable was off at import) is
+refused with a `ValueError` at load.
+
+Which calls are pipelined: `Model.prefill` calls (the generator's prompt ingestion) of a single
+sequence longer than one sub-chunk, with a job state (`recurrent_states`, one), `cache_seqlens`
+and a `block_table`, and none of these params set: `last_tokens_only`, `export_state_layers`,
+`capture`, `quant_preserve`, `autosplit_measure`, `indexed_embeddings` (a non-empty list:
+multimodal input), `indexed_embeddings_required`, `inv_freq`, `position_ids`, `positions`,
+`past_len`, `position`, `batch_shape`, `recurrent_history`, `dsv41_engram_lookback`. Tensors
+count as set whatever their contents; other values by their truth value, so the generator's
+empty embeddings list of a text-only job does not disqualify it. `Model.forward` is never
+pipelined. Everything else takes the plain path unchanged.
+
+Which loads are eligible (checked from the loaded modules, and re-checked after every
+load/unload):
+
+- a layer split (not `-tp`, which V4.1 refuses anyway) over exactly two CUDA devices, every
+  module past the first second-GPU module on the second GPU, at least the first decoder layer
+  before the split, and the split before the last layer that writes the cache (a split that
+  leaves only the final norm and head on the second GPU gains nothing and is not pipelined).
+  Every V4.1 layer owns a sliding-window ring whose shift both halves must agree on, so a first
+  half without a layer cannot be pipelined; an autosplit whose first GPU cannot hold layer 0
+  leaves only the stream expansion there (the embedding is in system RAM);
+- no layer before the split with experts in system RAM: both stages would feed the same CPU-MoE
+  worker, which is not thread-safe. `-mcl` offloads the first N MoE layers and `-mcs` a share of
+  every layer, so either one makes a split load ineligible; the pipeline applies to a split with
+  every expert in VRAM;
+- no repeated layer instances (`layer_map`).
+
+With the switch on, every load prints one line: whether it is pipelinable and, if not, why
+(`!! DSV41 pipelined prefill: this load is not pipelinable (<reason>) ...`).
+
+Refusals: at load, `EXL3_DSV41_PIPELINE_CHUNK` larger than the load's `max_chunk_size` raises a
+`ValueError` naming both, because the autosplit sizes each device's prefill workspace for
+`max_chunk_size` rows. `-chunk_size` in `model_init` defaults to 4096, but `Model.load`'s own
+`max_chunk_size` defaults to 2048, below the default sub-chunk: with the switch on, every
+DeepSeek-V4.1 load through the Python API must pass `max_chunk_size` of at least
+`EXL3_DSV41_PIPELINE_CHUNK`, single-GPU loads included (the check runs before the layout is
+known). A job state whose position disagrees with `cache_seqlens` is a caller error, refused
+with a `ValueError` before any layer runs. If a pipelined prefill fails partway (an exception
+in either stage, including out-of-memory), the job's layers may have written different amounts
+of its state (its sliding-window rings, compressor carry and engram ring, and its pages); the
+job state is then marked failed, and any later forward with it raises a `RuntimeError`. Those
+writes stay within that job's slot and pages, as when a plain forward fails halfway, so the
+Cache and the other jobs stay usable: the generator ends the failed job with an error result
+(its consumer gets the exception), frees its pages and carries on with the other jobs, and a
+direct caller starts the sequence again with a new job state.
+
+Generator: it hands the model one prefill call per `max_chunk_size` tokens of the generator
+(default 2048, `-gcs` in `examples/chat.py`), so the pipeline only engages with a generator
+`max_chunk_size` above the sub-chunk, e.g. 16384 with 4096-token sub-chunks (four sub-chunks
+per call). The generator's `max_chunk_size` may exceed the load's only because a pipelined call
+never runs more than one sub-chunk of rows at once; a call that takes the plain path runs all
+its rows together. So do not combine a generator chunk larger than the load's with anything
+that keeps long calls on the plain path: an MTP head or draft model (their prefill passes
+`last_tokens_only` or export params, or runs `forward`), multimodal input, or an ineligible
+load (the line printed at load says which it is). A larger generator `max_chunk_size` has two
+more costs: each prefill round interrupts the other active jobs for longer (their decode waits
+for the whole call), and the recurrent checkpoints taken while a prompt is ingested become
+coarser, since they fall only at call boundaries (the one at the end of the prompt is kept).
+The generator path has not been benchmarked.
+
+Memory: while the second GPU works on sub-chunk k, the first GPU already holds sub-chunk k+1's
+working set, and sub-chunk k's first-GPU products stay allocated until both the next first half
+and this second half have finished (the calling thread and the worker both hold them): its
+residual streams, 80 KiB per token on DeepSeek-V4.1-Flash (4 streams x 5120 x FP32), 320 MiB at
+4096 tokens, and its params, which hold the top-k selections of the index sources before the
+split (2 KiB per row each), the candidate blocks when the candidate source (layer 20) is before
+it (8 KiB per row), the rope tables and block-table copies: with the split at layer 20 and 4096
+tokens, about 24 MiB more (the selections of layers 2, 8 and 14). Stage 2's own first-GPU buffers
+(index-select outputs) are allocated on its side stream and come from that stream's own
+allocator pool, which the default stream does not reuse. The autosplit reserves none of this;
+leave that much headroom on the first GPU (its `-gs` budget or `EXL3_AUTOSPLIT_MARGIN_MB`). One
+extra CUDA stream on the first GPU, and one worker thread per sub-chunk.
+
+Performance: measured on DeepSeek-V4.1-Flash split at layer 12 across two GPUs, with the routed
+experts of layers 12-22 held in system RAM and streamed to the second GPU (past the split, so
+eligible; `-mcl` and `-mcs` cannot place experts that way), 4096-token sub-chunks,
+65,024 prompt tokens in four direct `model.prefill` calls of up to 16,384 tokens followed by a
+512-token continuation: 82.4 s plain and 67.2 s pipelined (1.23x) with the split crossing as in
+this code (FP32 residual streams) and every GPU arithmetic path fixed to be independent of the
+row count; 54.4 s and 40.6 s (1.34x) in a build with other options on as well, among them
+BF16 rounding of the crossing. Single unpublished runs that include continuation scoring and
+overlapped other host work, not a controlled prefill benchmark. The gain depends on how evenly
+the layers divide the work between the GPUs and on how much of each half the host spends
+waiting.
+
+Determinism: each sub-chunk runs the same layers with the same inputs as a plain prefill in
+sub-chunk-sized calls, only overlapped; with arithmetic independent of the row count, the six
+pipelined/plain continuation pairs over that 65K-token prefix were bitwise equal. Against a
+plain prefill of the whole call, results differ the way any change of chunk size does.
+
+When to use it: long prompts on a two-GPU split whose first half holds no CPU-offloaded
+experts, with direct `model.prefill` calls or a generator configured as above. With the variable
+unset nothing changes: the plain path runs, at the cost of one failed-state check per forward.
+
+The examples load every routed expert into VRAM, as the eligibility rules above require of the
+first half, and change device at the free cut 14 (with a Cache attached the change must fall at a
+free cut; "Loading across GPUs", above): at 3.0 bpw DeepSeek-V4.1-Flash's layers 0-13 take about
+68 GiB and layers 14-39 about 127 GiB, so on two 96 GiB-class cards this layout does not fit. There the second half has to keep
+part of its experts in system RAM without the first half doing so (the layout measured above
+streams the experts of layers 12-22 from RAM to the second GPU), or the checkpoint has to be
+smaller.
+
+```sh
+EXL3_DSV41_PIPELINE=1 EXL3_DSV41_PIPELINE_CHUNK=4096 \
+    python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -gs 70,130 -chunk_size 4096 -gcs 16384 ...
+```
+
+```python
+import os
+os.environ["EXL3_DSV41_PIPELINE"] = "1"         # before importing exllamav3
+from exllamav3 import Config, Model, Cache, Generator
+
+config = Config.from_directory(model_dir)
+model = Model.from_config(config)
+cache = Cache(model, max_num_tokens = 131072)
+model.load(max_chunk_size = 4096, use_per_device = [70, 130])   # layers 0-13 on the first GPU
+generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 16384)
+```
 
 ### `EXL3_DSV41_ABLATE` (default: unset; tests and validation only)
 

@@ -222,6 +222,18 @@ def part_b(path, P):
     assert model.caps["supports_tp"] is False
     assert not model.load_guard.active
     print("  OK  tensor-parallel refused")
+    # a pipelined-prefill sub-chunk the load's max_chunk_size does not cover
+    from exllamav3.architecture.dsv41 import pipeline
+    with patched(pipeline, "PIPELINE", True), patched(pipeline, "SUB_CHUNK", 8192):
+        raises(ValueError, lambda: next(model.load_gen(use_per_device = [63, 91], max_chunk_size = 4096)),
+               match = "EXL3_DSV41_PIPELINE_CHUNK=8192 exceeds this load's max_chunk_size=4096")
+    # the switch turned on in-process without a sub-chunk (the variable was off at import)
+    with patched(pipeline, "PIPELINE", True), patched(pipeline, "SUB_CHUNK", None):
+        raises(ValueError, lambda: next(model.load_gen(use_per_device = [63, 91], max_chunk_size = 4096)),
+               match = "SUB_CHUNK is not set")
+    assert not model.load_guard.active and model._dsv41_loaded_max_chunk is None
+    print("  OK  pipeline sub-chunk above the load's max_chunk_size, or unset with the switch on, "
+          "refused before anything loads")
 
     # 7. every compressed layer reads its own kv source's pool, and only kv sources own one
     attn = [b.attn for b in blocks]

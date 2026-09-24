@@ -9,8 +9,8 @@ The modules here are test oracles, never used at inference time:
     engram_tables    a pread/mmap reader for the file-backed engram tables
     deepseek         loaders for DeepSeek's own reference inference code
 
-and load_numerics(), which loads the attention-numerics parser and rounding kernels without
-the package.
+and load_numerics() and load_pipeline(), which load the attention-numerics parser and rounding
+kernels, and the pipelined-prefill driver, without the package.
 
 Tests import them as dsv41_ref.<module> with the tests directory on sys.path (pytest puts it
 there; a test run as a script inserts it itself).
@@ -75,6 +75,22 @@ def load_numerics():
     rnd = load_package_file("exllamav3/modules/dsv41_rounding.py",
                             f"{pkg}.modules.dsv41_rounding", f"{pkg}.modules")
     return num, rnd
+
+
+def load_pipeline():
+    """
+    architecture/dsv41/pipeline.py, loaded by path into a stand-in package together with the
+    one module it imports (cache/recurrent_util.py), so its scheduling runs with torch alone.
+    """
+    pkg = "_dsv41_pipeline_pkg"
+    for name in (pkg, f"{pkg}.architecture", f"{pkg}.architecture.dsv41", f"{pkg}.cache"):
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            m.__path__ = []
+            sys.modules[name] = m
+    load_package_file("exllamav3/cache/recurrent_util.py", f"{pkg}.cache.recurrent_util", f"{pkg}.cache")
+    return load_package_file("exllamav3/architecture/dsv41/pipeline.py",
+                             f"{pkg}.architecture.dsv41.pipeline", f"{pkg}.architecture.dsv41")
 
 
 def model_dir() -> str | None:

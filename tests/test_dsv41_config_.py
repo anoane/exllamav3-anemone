@@ -75,6 +75,10 @@ def load_config_module():
     pkg = types.ModuleType("exllamav3.architecture")
     pkg.__path__ = [os.path.join(_HERE, "exllamav3", "architecture")]
     sys.modules["exllamav3.architecture"] = pkg
+    # dsv41/pipeline.py imports cache/recurrent_util.py (torch only), not the cache package
+    cache = types.ModuleType("exllamav3.cache")
+    cache.__path__ = [os.path.join(_HERE, "exllamav3", "cache")]
+    sys.modules.setdefault("exllamav3.cache", cache)
 
     spec = importlib.util.spec_from_file_location(
         "exllamav3.architecture.deepseek_v41",
