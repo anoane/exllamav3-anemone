@@ -61,7 +61,13 @@ def model_dir() -> str | None:
 
 
 def skip(test: str, reason: str):
-    """Report a skipped script-style test."""
+    """
+    Report a skipped check. Run as a script, prints one line and returns (the caller returns
+    or exits 0); inside a pytest test function, raises pytest's skip so the report shows it.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        import pytest
+        pytest.skip(f"{test}: {reason}")
     print(f"  --  {test}: {reason}, skipped", flush = True)
 
 

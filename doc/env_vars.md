@@ -767,6 +767,195 @@ window (e.g. `4`) catches it with no wake cost, at the price of one busy core pe
 window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
 between the main process and child workers reaching their first kernel launch.
 
+## DeepSeek-V4.1
+
+These variables apply only to DeepSeek-V4.1 checkpoints (`DeepseekV41ForCausalLM`); every other
+architecture ignores them. The first entry is a loading rule that has no variable. exllamav3 runs
+DeepSeek-V4.1 from EXL3 checkpoints; converting DeepSeek's original checkpoint is not supported
+yet, and `convert.py` refuses the architecture before any work, saying why.
+
+### Loading across GPUs (the layer split; no variable)
+
+DeepSeek-V4.1 loads across several GPUs as a layer split, like every other model: split budgets
+(`-gs` / `use_per_device`, or `reserve_per_device`, or neither, which lets the autosplit use every
+visible device) and the autosplit, which fills the devices in layer order until each budget runs
+out. V4.1 adds one rule about where the device may change. There is nothing to set: no variable,
+no config attribute, no option.
+
+Why the rule exists. A V4.1 compressed layer does not keep its own compressed KV. The kv source of
+each group owns one paged pool and every other layer of the group reads it: on
+DeepSeek-V4.1-Flash four pools, owned by layers 2, 8, 14 and 20, for the groups 2-7, 8-13, 14-19
+and 20-39. Likewise each index source publishes a top-k selection that the layers above it reuse,
+up to the next index source (2, 8, 14, 20, 24, 28, 32 and 36 on Flash), and the candidate source
+(layer 20 on Flash) publishes candidate blocks for the index sources above it. The attention
+kernels read the Cache's pools, the selections and the candidate blocks on the reading layer's own
+device.
+
+The rule. With a Cache attached, every change of device must fall at a free cut: a layer `c` such
+that no layer at or past `c` reads a pool, a top-k selection or candidate blocks produced below
+`c`. The free cuts follow from the checkpoint's config (`kv_source_layer_ids`,
+`index_source_layer_ids`, `candidate_source_layer_id`); on DeepSeek-V4.1-Flash they are:
+
+| Change of device at layer | Layers before the change | Layers from the change on |
+|---|---|---|
+| 1 | 0 | 1-39 |
+| 2 | 0-1 | 2-39 |
+| 8 | 0-7 | 8-39 |
+| 14 | 0-13 | 14-39 |
+| 20 | 0-19 | 20-39 |
+
+Every other layer lies inside a kv group. Without a Cache any layer works, at a cost (below).
+
+Steering the autosplit. The change of device falls where a budget runs out, so place it with the
+budgets: give each device room for the layers it should hold and their share of the Cache, and
+not for one more layer. Sizes to plan with, for DeepSeek-V4.1-Flash at 3.0 bpw:
+
+- a layer: about 4.9 GiB with every routed expert resident; about 2.5 GiB with `-mcs 192` (the
+  tail 192 of each layer's 384 routed experts in system RAM, about 95 GiB of RAM for all 40
+  layers). The 40 layers are about 195 GiB with every expert resident, more than two 96 GiB cards
+  hold, so a two-card load keeps part of the routed experts in system RAM: `-mcs` (the tail
+  experts of every layer, which relieves both devices) or `-mcl` (every routed expert of the first
+  N layers, which relieves only the first);
+- the Cache: each kv source's pool on its group's device, 640 MiB for a rate-2 source (layers 2, 8
+  and 14) and 1.25 GiB for layer 20's rate-1 pool at `max_num_tokens` = 1M in FP16, in proportion
+  for a smaller Cache; a 768 KiB sliding-window ring per layer and batch slot;
+- headroom: the autosplit keeps the largest transient it measured plus `EXL3_AUTOSPLIT_MARGIN_MB`
+  (256 MiB by default) free on each device. Each device that holds an index source also needs
+  room for the index selection's transient, which grows with the context, up to about 160 MiB for
+  a 2048-token chunk at 1M tokens (`modules/dsv41_select.py`, `transient_bytes`); the autosplit's
+  measuring forward at position 0 sees about 90 MiB of it, and the difference, about 67 MiB, fits
+  inside the default margin.
+
+The embedding stays in system RAM.
+
+What fails, and when:
+
+- A Cache attached before the load (as `model_init` and the examples below do): the first layer
+  past a change of device that is not a free cut refuses to load, with a `RuntimeError` raised
+  before anything of its MoE loads, e.g.
+
+  `DeepSeek-V4.1: the layer split put layers.12 on cuda:1, but layers 8-13 share the compressed-KV pool of layers.8, which is on cuda:0. With a Cache attached, a change of device can only fall where no pool, top-k selection or candidate list is shared across it: at layer 1, 2, 8, 14 or 20 on this model. Change the split budgets (-gs / use_per_device / reserve_per_device): less room on cuda:0, so that it holds layers up to 7 only, or room for layers 12-13 as well, so that the change falls at layer 14 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs")`
+
+  When no free cut lies above the change (layers 21-39 on Flash), the second way reads `room for
+  layers <k>-39 as well, so that no change of device is left`. Load again with the budgets
+  changed.
+- A Cache built after the load: the load succeeds and prints the note below, and the first cached
+  forward of a layer whose pool is on another device raises a `RuntimeError`, e.g.
+  `layers.12.attn: the compressed-KV pool it reads (layers.8) is on cuda:0, but this layer is on cuda:1. A Cache needs the layers that share a pool on one device: reload with every change of device at layer 1, 2, 8, 14 or 20 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs")`.
+- No Cache: the load succeeds and prints
+  ` !! DSV41: layers 12-13 read a compressed-KV pool on another device; without a Cache each forward copies those pools whole, and a Cache would need every change of device at layer 1, 2, 8, 14 or 20`.
+  Each forward then copies the whole pool of a cut group to the other device, about 1.25 KiB per
+  compressed entry of the sequence (about 40 MiB for a 64K-token sequence at rate 2), once per
+  forward and device, plus the top-k selections (2 KiB per query row) and candidate blocks (8 KiB
+  per row) that cross the change. A change of device at a free cut copies nothing but the hidden
+  state, as for every model.
+- After every load the compressed layers are checked against their pool's device. With a Cache
+  attached a layer on another device than its pool is a `RuntimeError` (`DeepSeek-V4.1 load check
+  failed: layers 12-13 read a compressed-KV pool on another device, which the cached path cannot
+  do; reload with every change of device at layer 1, 2, 8, 14 or 20`): the check during the load
+  refuses such a split before it completes, so this catches only a load that went around it,
+  e.g. modules loaded one by one. Without a Cache it is the note above.
+
+Three or more devices: the same rule holds for every change of device. Budgets that put layers
+0-7, 8-19 and 20-39 on three devices load with a Cache; budgets that change device at 8 and 18
+fail at layer 18.
+
+Other loads: a load on one device (`model.load(device = ...)`, one budget, or a single visible
+device) changes device nowhere and needs nothing. Tensor-parallel loading (`-tp`,
+`tensor_p = True`) is refused before anything loads, with `NotImplementedError: DeepSeek-V4.1:
+tensor-parallel loading is not implemented; load it as a layer split (-gs / use_per_device)`.
+`-mcl` / `-mcs` decide which routed experts stay in system RAM exactly as for every other MoE
+model; they change the sizes above, not the rule.
+
+Determinism: where the change of device falls changes no arithmetic of V4.1's own code. As at any
+layer split, which GPU runs a layer can change the results of the kernels on that layer.
+
+Example. Two cards, the tail 192 routed experts of every layer in system RAM, a 256K-token Cache:
+by the sizes above (an estimate, not a measurement), 36 GiB on the first card holds layers 0-13
+and their share of the Cache (about 35 GiB) but not layer 14 as well, so the change falls at the
+free cut 14; the second card holds layers 14-39 and the head (about 66 GiB). If a load reports the
+change at another layer, the message says which way to move the budget.
+
+```sh
+python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -gs 36,90 -mcs 192 ...
+```
+
+```python
+config = Config.from_directory(model_dir)
+config.infer_params.moe_cpu_split = 192            # what -mcs 192 sets
+model = Model.from_config(config)
+cache = Cache(model, max_num_tokens = 262144)       # attached before the load: a cut kv group fails at once
+model.load(use_per_device = [36, 90])
+```
+
+### `EXL3_DSV41_ENGRAM_PREFETCH` (default: `1`)
+
+DeepSeek-V4.1's engram layers (layers 1 and 14 on Flash) add a gated embedding of each position's
+n-gram hashes to the hidden streams. Their tables are about 94 GiB per layer and stay on disk:
+each forward hashes its token ids, removes duplicate rows, reads the rows it needs from the
+checkpoint shards (the extension's `ngram_gather_cpu` thread pool) and dequantizes them on the
+GPU. With this switch on, for a prefill chunk of at least 256 positions (batch size times
+tokens) the hash, the deduplication and the disk reads run on one worker thread per model that
+starts before block 0, so the reads of layer 1 overlap block 0 and those of layer 14 overlap
+blocks 0-13. The forward uses the staged rows only when their token history equals its own and
+stages inline otherwise, so a stale prefetch costs time, never correctness. Decode-sized chunks,
+the autosplit's measuring pass and forwards with `EXL3_DSV41_ABLATE=engram` are never prefetched.
+`0` stages every chunk inline in the engram layer's own forward.
+
+Results are bitwise identical either way. Memory, with the switch on or off (inline staging uses the
+same sets): each engram layer on a GPU keeps at most two page-locked staging sets (one whose uploads
+may still be in flight, one being staged), each sized for the largest chunk seen, 272 bytes per
+hashed row (24 rows per token): 12.8 MiB requested at 2048 tokens and at most 25.5 MiB (4096
+tokens). PyTorch's host allocator rounds each page-locked allocation up to a power of two, so a full
+set holds about 34 MiB, and the blocks a set gives up when it grows stay cached, still page-locked.
+Longer chunks stage through a transient pageable buffer instead. Read once per process, when the
+first DeepSeek-V4.1 model object is built (`Model.from_config`); set it before that. Its effect on
+prefill throughput has not been measured in isolation; it is an A/B switch.
+
+### `EXL3_DSV41_ABLATE` (default: unset; tests and validation only)
+
+A comma-separated list of deliberate errors in DeepSeek-V4.1's function. Each token makes the
+model compute a known wrong function, so that a test or a validation run can show that it
+detects the error it exists to detect: with the token set, the check must fail (a negative
+control). Never set it for inference.
+
+| Token | What it breaks |
+|---|---|
+| `engram` | The engram layers do not run. Their n-gram context is still committed, so the carried ids stay current if the ablation is turned off mid-sequence. |
+| `engram_nocarry` | Each forward hashes its first n-grams without the ids carried from the previous forward, as at position 0: a state-carry bug that only a chunked run can show. |
+| `v4mix` | Every sublayer collapses its input with its own pre-mix, as V4 does, instead of the pre-mix carried from the previous sublayer. |
+| `dense_consumers` | Compressed layers that are not index sources attend over their whole pool instead of their index source's top-k selection. |
+| `rope_consecutive` | Pool entries and index keys are rotated at `first_entry * m + j` instead of `(first_entry + j) * m`: one position apart, wrong at compression rate 2. |
+| `no_candidates` | The candidate stage is off: the candidate source publishes no blocks and the index sources above it score every visible entry. Changes nothing until a query sees more than 16,384 compressed entries (2,048 blocks of 8). |
+
+Syntax: tokens separated by commas; whitespace and empty entries are ignored; tokens are
+case-sensitive. An unknown token is a `ValueError` at the first forward that consults the
+variable (and at every later one), never silently ignored.
+
+When it is read: once per process, at the first forward that checks for an ablation (the
+first DeepSeek-V4.1 forward), and parsed then. Changing the variable afterwards has no effect;
+set it before starting the process. Checking an ablation afterwards costs a set lookup. When
+a token becomes active, one line is printed: ` !! EXL3_DSV41_ABLATE=<token>: deliberately NOT
+DeepSeek-V4.1's function, for tests and validation only`, once per token per process. No
+memory cost. With the variable unset nothing changes.
+
+The V4.1 tests use the tokens as their negative controls (`test_dsv41_select_`,
+`test_dsv41_attention_`, `test_dsv41_cached_`, `test_dsv41_cached_gpu_`,
+`test_dsv41_block_hook_`, `test_dsv41_engram_state_`). To switch an ablation on and off around
+single calls of one loaded model, they use the test-only setter
+`exllamav3.modules.dsv41_ablation.set_ablations(value)`, which takes the variable's syntax
+(`""` for none), replaces the parsed set, and returns the previous setting (or `None` when the
+variable had not been read yet, which makes the next check read it again), so that
+`set_ablations(previous)` restores it; `tests/dsv41_ref`'s `ablate()` context manager wraps it.
+Inference code has no reason to call it.
+
+A manual check that a perplexity run notices a missing engram:
+
+```sh
+python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+EXL3_DSV41_ABLATE=engram python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+```
+
 ## Debug
 
 ### `EXL3_NGRAM_GATHER_PROF` (default: unset)
