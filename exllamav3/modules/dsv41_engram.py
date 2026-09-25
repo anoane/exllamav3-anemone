@@ -86,9 +86,11 @@ from torch import nn
 
 from . import Module
 from .dsv41_ablation import ablated
+from .dsv41_engram_math import stable_engram_gate
 from .linear import Linear
 from ..ext import exllamav3_ext as ext
 from ..loader.safetensors import DiskTensorHandle
+from ..model.math_policy import STABLE_ARITHMETIC
 from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
 
@@ -623,9 +625,15 @@ class DSV41Engram(Module):
         value = kv[..., H * D:].view(B, L, 1, D)
         h = x.float()
         eps = self.config.rms_norm_eps
-        rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
-        dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        if STABLE_ARITHMETIC and h.is_cuda:
+            # torch picks its reduction by shape, so a token's gate would change in the last bit
+            # with the token count of the call; the row-local kernel reduces each (token, stream)
+            # alone (the same gate, scaled against overflow: dsv41_engram_math.py)
+            gate = stable_engram_gate(h, key, self.qk, eps)
+        else:
+            rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
+            dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
+            gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
         dead = hist[:, self.ctx:] == DEAD
         if dead.any():
             # DeepSeek's token_mask: a dead token (an id outside the text vocab; image spans in

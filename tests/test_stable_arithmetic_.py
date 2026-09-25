@@ -262,7 +262,7 @@ class DeepseekV41DebugAssertTests(unittest.TestCase):
     EXL3_DSA_DEBUG_BOUNDS, read at import with the same test as the DSA kernels; a default build
     compiles them without
     """
-    FILES = ("exllamav3/modules/dsv41_compress.py",)
+    FILES = ("exllamav3/modules/dsv41_compress.py", "exllamav3/modules/dsv41_engram_math.py")
 
     def test_every_kernel_follows_the_variable(self):
         upstream = ast.unparse(module_assignment("exllamav3/modules/attention_fn/dsa_triton.py",
@@ -278,6 +278,22 @@ class DeepseekV41DebugAssertTests(unittest.TestCase):
                 for environ, expected in (({}, False), ({"EXL3_DSA_DEBUG_BOUNDS": "0"}, False),
                                           ({"EXL3_DSA_DEBUG_BOUNDS": "1"}, True)):
                     self.assertIs(eval(code, dict(os = NS(environ = environ))), expected)
+
+
+class DeepseekV41EngramTests(unittest.TestCase):
+
+    def test_row_local_gate_for_cuda_inputs_only(self):
+        path = "exllamav3/modules/dsv41_engram.py"
+        code = condition(path, "DSV41Engram", "forward", "STABLE_ARITHMETIC")
+        for stable in (False, True):
+            for cuda in (False, True):
+                ns = dict(STABLE_ARITHMETIC = stable, h = NS(is_cuda = cuda))
+                self.assertEqual(bool(eval(code, ns)), stable and cuda)
+        # the branch it guards is the kernel call, the other one DeepSeek's torch formula
+        node = next(n for n in ast.walk(function(path, "DSV41Engram", "forward"))
+                    if isinstance(n, ast.If) and "STABLE_ARITHMETIC" in ast.unparse(n.test))
+        self.assertIn("stable_engram_gate(h, key, self.qk, eps)", ast.unparse(node.body))
+        self.assertIn("torch.copysign", ast.unparse(node.orelse))
 
 
 def _extension_missing():
@@ -307,13 +323,13 @@ class PackageTests(unittest.TestCase):
             "from exllamav3.modules import mlp, block_sparse_mlp",
             "from exllamav3.modules.quant import exl3, fp16",
             "from exllamav3.model import moe_cpu_host",
-            "from exllamav3.modules import dsv4, dsv41, dsv41_block, dsv41_select",
+            "from exllamav3.modules import dsv4, dsv41, dsv41_block, dsv41_select, dsv41_engram",
             "from exllamav3.architecture.dsv41 import compressor",
             "print(mlp.STABLE_ARITHMETIC, block_sparse_mlp.STABLE_ARITHMETIC, block_sparse_mlp.FUSED_PREFILL,",
             "      exl3.STABLE_ARITHMETIC, fp16.HGEMM_FIXED_ROWS, moe_cpu_host.STABLE_ARITHMETIC,",
             "      moe_cpu_host.TUNING.fused_prefill, ext.stable_arithmetic(), ext.hgemm_fixed_rows(),",
             "      dsv4.STABLE_ARITHMETIC, dsv41.STABLE_ARITHMETIC, dsv41_block.STABLE_ARITHMETIC,",
-            "      dsv41_select.STABLE_ARITHMETIC, compressor.STABLE_ARITHMETIC)",
+            "      dsv41_select.STABLE_ARITHMETIC, compressor.STABLE_ARITHMETIC, dsv41_engram.STABLE_ARITHMETIC)",
         ])
         names = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL",
                  "EXL3_MOE_FUSED_DET", "EXL3_NO_FUSED_RECONSTRUCT")
@@ -323,7 +339,7 @@ class PackageTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True,
                            cwd = ROOT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 5)
+        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 6)
 
 
 if __name__ == "__main__":

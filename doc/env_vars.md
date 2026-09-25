@@ -1113,6 +1113,15 @@ With `1` each operation below takes one arithmetic path at every row count, the 
   different chunk size, or a group closed by a decode step) can differ in the last bit (up to
   1.2e-7 was measured on real latents). Pooling and the carry of open groups are unchanged, and
   CPU tensors keep the torch path.
+- DeepSeek-V4.1's engram gate (layers 1 and 14 of DeepSeek-V4.1-Flash) is computed by a Triton
+  kernel with one program per token and residual stream (`modules/dsv41_engram_math.py`) instead
+  of torch reductions over the whole call, whose strategy follows the tensor shape (on real layer
+  inputs the torch gates changed by up to 4.5e-8 between a 32-token and a one-token call). The
+  kernel scales each vector by its largest magnitude before reducing, so no intermediate sum
+  overflows for finite inputs; a vector far outside the activation range (largest magnitude below
+  1e-15 or above 1e15) finishes its scalar normalization in FP64, a few scalar operations per
+  program that ordinary activations never reach. An exact zero dot product counts as positive, as
+  the reference's torch sum gives. CPU tensors keep the torch formula.
 
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported. It
 may be combined with `EXL3_HGEMM_FIXED_ROWS` and `EXL3_MOE_FUSED_PREFILL` left unset or set to
@@ -1143,16 +1152,21 @@ Refused, as an error rather than a partial profile:
   domain, below that, so decode and short chunks would round other quantities than long prefill
   chunks. The profile covers DeepSeek-V4.1 with an FP16 Cache;
 - with `EXL3_DSA_DEBUG_BOUNDS=1` only, during a DeepSeek-V4.1 forward, a nonfinite compressor
-  projection, norm weight or normalized latent. That variable, the debug switch of the DSA kernels
-  (below, read once at import), also compiles the row-local kernels in Triton's debug mode, so
-  such a value stops the kernel with a CUDA device-side assertion instead of reaching the cache.
-  A device-side assertion leaves the CUDA context of the process unusable: every later CUDA call
-  fails, and the process has to be restarted. Debug mode also compiles int32-overflow checks into
-  the kernels' address arithmetic (redundant with the host-side int32 guards) and makes the
-  kernels larger. Without the variable (the default) the kernels are compiled without any of
-  that, like every other kernel of a default build, and do not check their operands, as the
-  torch path does not either: a nonfinite value is not detected. Set it for validation runs that
-  must stop at the first nonfinite latent.
+  projection, norm weight or normalized latent, or a nonfinite engram gate operand (residual
+  stream, n-gram key, gate weight). That variable, the debug switch of the DSA kernels (below,
+  read once at import), also compiles the row-local kernels in Triton's debug mode, so such a
+  value stops the kernel with a CUDA device-side assertion instead of reaching the cache or the
+  streams. A device-side assertion leaves the CUDA context of the process unusable: every later
+  CUDA call fails, and the process has to be restarted. Debug mode also compiles int32-overflow
+  checks into the kernels' address arithmetic (redundant with the host-side int32 guards) and
+  makes the kernels larger. Without the variable (the default) the kernels are compiled without
+  any of that, like every other kernel of a default build, and do not check their operands, as
+  the torch path does not either: a nonfinite value is not detected. Set it for validation runs
+  that must stop at the first nonfinite latent or gate operand;
+- during a DeepSeek-V4.1 forward, an engram call of more than 83,886 tokens, with a `ValueError`:
+  the engram kernel addresses its keys in int32 (a key row is 25,600 values wide on
+  DeepSeek-V4.1-Flash). Only a batched cached forward can reach it: a stateless forward is capped
+  at 65,535 rows before the first engram layer, and the generator prefills one job per chunk.
 
 What it does not cover: operations not listed above keep their row-count-dependent dispatch,
 among them the attention kernels of most architectures (prefill and decode kernels differ); the
@@ -1173,7 +1187,9 @@ router's FP32 split-K partials of large calls, up to `8 x rows x experts x 4` by
 reuses the router's static workspace, which is already sized for the maximum slice count. Decoding
 through the reconstruct path allocates each linear's dequantized weights per call (`in x out`
 FP16, in slices of at most 32768 columns), the same transient every long prefill already
-allocates and the autosplit already measures.
+allocates and the autosplit already measures. The DeepSeek-V4.1 kernels allocate FP32 outputs of
+the size of the torch results they replace, plus a packed copy of an input only when it arrives
+strided.
 
 Performance: slower, in prefill and much more in decode. Every decoded token reconstructs the
 weights of every EXL3 linear that `LinearEXL3.forward` dispatches and runs the MoE layers through
@@ -1215,6 +1231,26 @@ router logits, selected experts and weights of real layer inputs agreed at every
 one included, on two GPU types. Combined with `EXL3_MOE_FUSED_DET` (on by default), identical
 calls are also bitwise repeatable. Whether a whole model becomes chunk-size invariant depends on
 every operation it uses being covered, see above.
+
+DeepSeek-V4.1-Flash is covered end to end with an FP16 Cache (a quantized one is refused, above).
+With the complete profile, on an sm_80 and an sm_120 GPU
+with the model split at layer 12 and the routed experts of layers 12-22 held in system RAM and
+streamed to the second GPU
+(`EXL3_PLACEMENT='0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1'`): 4096-, 2048- and
+2047-token chunkings, single-expert staging and a repeated run gave bitwise-identical scores for
+all 65,535 predictions of a 64K-token prompt and all 131,071 of a 128K-token prompt (whose first
+65,535 also equalled the 64K run); 17-token and one-token calls after a 16K-token prefix equalled
+256-token calls; a 2,200-token greedy decode through the generator, the same tokens decoded one call
+at a time and a prefill of them were bitwise identical, as was a continuation resumed from a state
+stashed during decoding; and prompts reusing a cached prefix through the generator (re-sent and
+branched prompts) matched cold computation bitwise. Two of these results come from a run before the
+lightning indexer scored every row count with the same kernel (above) and have not been repeated
+since: the 17- and one-token calls after the 16K-token prefix, and the prefix reuse through the
+generator, whose third case, a prompt continuing a long generated history, still differed in that
+run (largest KL divergence 0.013); its history was decoded, the case in which the scorer change made
+decode equal prefill in the 2,200-token comparison. With the default arithmetic the same
+prefix-reuse comparisons agreed in every greedy token, but not bitwise (largest KL divergence
+between warm and cold 0.075).
 
 ```sh
 EXL3_STABLE_ARITHMETIC=1 python eval/ppl.py -m /path/to/model
@@ -1464,7 +1500,9 @@ until the value is fixed, because the architecture registry imports the DeepSeek
 module whose import failed is imported again, and fails again, on the next attempt). The first
 entry is a loading rule that has no variable. exllamav3 runs DeepSeek-V4.1 from EXL3 checkpoints;
 converting DeepSeek's original checkpoint is not supported yet, and `convert.py` refuses the
-architecture before any work, saying why.
+architecture before any work, saying why. For results that do not depend on the chunk size or on
+decode versus prefill, `EXL3_STABLE_ARITHMETIC` (Reproducible arithmetic, above) covers
+DeepSeek-V4.1 end to end, with an FP16 Cache.
 
 ### Loading across GPUs (the layer split; no variable)
 
@@ -2136,10 +2174,12 @@ kernels are unaffected (compiled with asserts off).
 DeepSeek-V4.1's own Triton kernels follow the same variable, read once when their module is
 imported: with `1` they are compiled in Triton's debug mode, so their device assertions are live
 and a nonfinite operand or result stops the kernel with a CUDA device-side assertion (which
-leaves the process's CUDA context unusable; restart the process). These are the row-local
-compressor RMSNorm of `EXL3_STABLE_ARITHMETIC` (`modules/dsv41_compress.py`, checking the
-projection, the norm weight and the normalized latent). Unset or `0` (the default), they are
-compiled without assertions, like the DSA kernels, and do not check their operands.
+leaves the process's CUDA context unusable; restart the process). These are the row-local kernels
+of `EXL3_STABLE_ARITHMETIC`: the compressor RMSNorm (`modules/dsv41_compress.py`, checking the
+projection, the norm weight and the normalized latent) and the engram gate
+(`modules/dsv41_engram_math.py`, checking the residual stream, the n-gram key, the gate weight and
+the gate). Unset or `0` (the default), they are compiled without assertions, like the DSA
+kernels, and do not check their operands.
 
 ## Quantization
 
