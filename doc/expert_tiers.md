@@ -494,6 +494,34 @@ each GPU's room, before any of the tier is allocated. It prints:
     disk experts=off io=auto: 0 experts on disk only; 73.8 GiB of RAM left unpinned
 ```
 
+### Where an expert is read from: extents and slot geometry
+
+The tier never repacks the checkpoint. Each routed expert of a `cache` layer is read in place
+from its shard (`model/expert_extents.py`, `build_extent_index`, from the headers alone):
+
+- **One extent per expert.** An expert's tensors (per projection: `suh`, `svh`, `mul1`,
+  `trellis`, and `bias` when present) are written back to back by `convert.py`, so the extent from
+  the first byte of the first to the last byte of the last is one read: 13,315,596 bytes for a
+  DeepSeek-V4.1 3.0 bpw expert. The trellis tensors lie inside it at offsets that are not sector
+  aligned; the index records them.
+- **Split experts.** When the tensors of one expert are in different files (an override
+  collection replaced one projection) or another tensor lies between them, the expert is read as
+  one piece per projection, each piece its trellis alone. Such an expert costs three reads instead
+  of one; nothing else changes.
+- **Slot geometry**, one per set of cache layers on a GPU (their experts must have the same
+  trellis sizes):
+
+| Name | What it holds | V4.1 3.0 bpw |
+|---|---|---|
+| VRAM slot | the gate, up and down trellis back to back (the compact layout) | 13,271,040 B (3 x 4,423,680) |
+| projection offsets in a compact slot | `(0, gate, gate + up)` | `(0, 4423680, 8847360)` |
+| RAM slot | one extent read: each piece rounded up to 4 KiB, plus 4 KiB for a start that is not 4 KiB aligned | 13,320,192 B (3,252 pages), 80 per 1 GiB chunk |
+
+The disk engine reads the 4 KiB-aligned superset of an extent into a 4 KiB-aligned slot with
+`O_DIRECT` and reports where the payload landed (the file offset modulo 4 KiB); the trellis of
+projection `p` is then at `slot + payload offset + sub-offset[p]`. A promotion copies those three
+ranges into the compact VRAM slot.
+
 ### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
 
 | | (a) PRO + RAM for every expert outside VRAM | (b) PRO + 96 GiB RAM tier + SSD | (c) CMP resident + PRO cache + RAM, no expert SSD reads |
