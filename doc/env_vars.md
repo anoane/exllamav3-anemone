@@ -1653,6 +1653,118 @@ Keep the last N reads for `disk_trace()`; `0` off.
 Test only: injected read failures, short reads, `EINTR`, delays, a refused `io_uring`, a ring that
 fails for good, and polling on any device.
 
+## Expert tiers
+
+Tuning of the expert tier: the `experts=cache` layers of a placement, whose routed experts live in
+a VRAM cache per GPU over a RAM tier over the checkpoint on the SSD (the placement's `cuda:<n>`,
+`ram` and `disk` rules say what the tier does; these variables say how). Full description, the
+sizing and every refusal: [expert_tiers.md](expert_tiers.md). **`experts=cache` is not available
+in this build yet** (the placement refuses it at parse time); the variables are read and checked
+by the load of a placement with `experts=cache` layers, all of them at once, when the load
+starts: a malformed value, two values that contradict, or an unknown name starting with
+`EXL3_MOE_TIER_` or `EXL3_MOE_HEAT_` fails the load with a `ValueError` naming it (with a
+did-you-mean hint), never a silent default. A load prints the ones that differ from their default
+under its `-- expert tiers:` summary.
+
+### `EXL3_MOE_TIER_DEMOTE` (default: `1`)
+
+Master switch of demotion (copying a VRAM victim back to the RAM tier, device to host). `0` drops
+every victim whatever `ram demote=` says, as `ram demote=off` does; the disk still has a copy.
+Refused next to `disk experts=off` (unless `ram policy=inclusive`, where every victim keeps a RAM
+copy anyway): `EXL3_MOE_TIER_DEMOTE=0 would drop VRAM victims, but disk experts=off keeps no other
+copy of them`. `0` or `1`.
+
+### `EXL3_MOE_TIER_STAGING` (default: `double`)
+
+Prefill staging per GPU with cache layers: `double` keeps 2 x (E - hot) VRAM slots (the widest
+cache layer on the GPU), so the copies of the next layer's experts overlap the current layer's
+compute (whole-layer double buffering); `single` keeps E - hot, without that overlap, and gives
+the other half to the cache pool. DeepSeek-V4.1 3.0 bpw: 9.49 GiB (`double`) or 4.75 GiB. The
+staging is set aside before the pool is sized; when it leaves too little for the smallest cache,
+the refusal names this variable.
+
+### `EXL3_MOE_TIER_PREFILL_ROWS` (default: `256`), `EXL3_MOE_TIER_DECODE_ROWS` (default: `8`)
+
+The row counts that decide how a call of a cache layer runs. Up to `DECODE_ROWS` (1-8, the largest
+decode-shaped MoE call) a call is a decode call: misses may be admitted into the cache and the
+use stamps are updated. From `PREFILL_ROWS` (2 to 1,048,576, above `DECODE_ROWS`) a call runs in
+layer mode: every expert of the next layer that VRAM does not hold is copied into the staging
+while the current one computes. Between the two, a call copies only the experts it touches
+(routed mode). Neither mode admits, stamps or demotes during prefill, so a long prompt never
+flushes the decode working set.
+
+### `EXL3_MOE_HEAT_HALFLIFE` (default: `256`), `EXL3_MOE_HEAT_PREFILL` (default: `0.0625`)
+
+The heat of an expert is its routing count, halved every `HALFLIFE` decode tokens (1 to 2^30). A
+decode assignment adds 1, a prefill assignment adds `PREFILL` (0 to 1; kept in 16.16 fixed
+point, so `0.0625` = 4096/65536): a 4096-token prompt gives every expert of a layer about 64
+assignments, which at 1 would outweigh about 40 tokens of decode for the whole layer. Heat decides
+the RAM tier's victims (`ram evict=lfu`), `admit=heat`, `evict=lfu`, the demotion gate and the
+heat file.
+
+### `EXL3_MOE_HEAT_FILE` (default: unset)
+
+A file the heat is saved to at unload and between generations, and read at load to seed the cold
+fill and the first decisions, so a restart warms from the last run. Unset: no file.
+
+### `EXL3_MOE_TIER_ADMIT_P` (default: unset), `EXL3_MOE_TIER_ADAPT_EVERY` (default: `2048`), `EXL3_MOE_TIER_ADMIT_PMIN` (default: `0.05`)
+
+`admit=adaptive` admits a decode miss with a probability p, adapted every `ADAPT_EVERY` accesses
+(1 to 2^30) so the VRAM and RAM tiers' cache lives match, between `ADMIT_PMIN` (0.0001 to 1) and
+C / (C + R) (the cache's slots over the cache's and the RAM tier's). `ADMIT_P` (0 to 1) pins p
+instead: replays, tests and A/B runs, since a live p depends on host timing (never on logits).
+
+### `EXL3_MOE_TIER_SAMPLE` (default: `16`)
+
+RAM tier entries sampled (1 to 4096) to find the coldest one when the tier needs a victim or a
+demotion needs a warmer-than-coldest test.
+
+### `EXL3_MOE_TIER_RAM_ADMIT` (default: `always`)
+
+How an expert read from the SSD enters the RAM tier: `always` takes a free slot, else a
+reclaimable duplicate, else the coldest sampled entry (the rule the policy simulation measured);
+`heat` takes the coldest entry only when the new expert is warmer, and otherwise reads it into
+the disk slab without keeping it.
+
+### `EXL3_MOE_TIER_REFILL` (default: `1`), `EXL3_MOE_TIER_REFILL_INFLIGHT` (default: `2`)
+
+Background reads that bring warm experts only the SSD holds into the RAM tier (the disk engine's
+refill class, `EXL3_DISK_WINDOW_REFILL`), at most `INFLIGHT` (1-64) at a time; candidates beyond
+that are dropped, never queued. `0` turns them off.
+
+### `EXL3_MOE_TIER_DISK_SLAB` (default: `auto`)
+
+Pinned slots (one RAM tier slot each) for SSD reads that bypass the RAM tier: decode misses the
+RAM tier does not admit, and the prefill read-ahead. `auto` = 8 plus what the read-ahead needs;
+a number (1-4096) fixes it. Counted in the load's host-memory check (`disk slab=` in its
+message). None with `disk experts=off`.
+
+### `EXL3_MOE_TIER_HEADROOM_MB` (default: `1024`)
+
+VRAM (MiB) each GPU keeps free after its expert cache, for the generator's statics and later
+allocations. An `auto` cache takes the rest of the device's `-gs` budget after the placed
+modules, the Cache, the margins, the prefill staging and this headroom.
+
+### `EXL3_MOE_TIER_MIN_LINK_GBS` (default: `2.0`)
+
+The host link (GB/s, measured at load) below which a GPU may not hold an expert cache: at ~0.4
+GB/s (a CMP 170HX on an x1 link) one DeepSeek-V4.1 expert takes over 30 ms to copy. Such a GPU
+keeps its layers `experts=vram` (static placement). `0` allows any link.
+
+### `EXL3_MOE_TIER_SPIN_US` (default: `-1`), `EXL3_MOE_TIER_AFFINITY` (default: unset)
+
+The tier thread, which serves misses and demotions, spins while a forward pass is active (`-1`),
+never (`0`, it sleeps on a condition variable), or N microseconds before sleeping.
+`AFFINITY` pins it to a CPU list (`16-23`, `4,6,8`).
+
+### `EXL3_MOE_TIER_DETERMINISTIC` (default: `0`), `EXL3_MOE_TIER_VERIFY` (default: `0`), `EXL3_MOE_TIER_TRACE` (default: unset)
+
+`DETERMINISTIC=1`: the tier thread applies every call (copies, demotions, returned slots) before
+the next one, so the cache's state follows the reference policy exactly (replays, debugging; it
+changes timing only, never logits). `VERIFY=1`: the tier's invariants are checked after every call
+(synchronizes the GPU; tests and debugging). `TRACE=<path>`: every call record is written to the
+file.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

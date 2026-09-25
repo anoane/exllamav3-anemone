@@ -253,6 +253,79 @@ def ram_layers(model, infer_params, component: str, placement) -> tuple[str | No
     return None, out
 
 
+# ---------------------------------------------------------------------------------------- tier
+
+def _expert_tier_config():
+    """model/expert_tier_config.py, through the package or, loaded by path, by path"""
+    try:
+        from . import expert_tier_config
+        return expert_tier_config
+    except ImportError:
+        import importlib.util
+        import sys
+        from pathlib import Path
+        name = "_exl3_torch_free_expert_tier_config"
+        mod = sys.modules.get(name)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / "expert_tier_config.py")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            spec.loader.exec_module(mod)
+        return mod
+
+
+def _span(stc, keys) -> int:
+    """Bytes from the first to the last byte of tensors that share one file, from the headers (the
+    extent one read of them covers); the sum of their sizes when they spread over files"""
+    loc = []
+    for k in keys:
+        s = stc.find_stc(k) if hasattr(stc, "find_stc") else stc
+        fn = s.tensor_file_map.get(k)
+        if fn is not None:
+            loc.append((fn, *s.file_headers[fn][k]["data_offsets"]))
+    if len({f for f, _, _ in loc}) == 1:
+        return max(e for _, _, e in loc) - min(b for _, b, _ in loc)
+    return sum(e - b for _, b, e in loc)
+
+
+_EXPERT_SUFFIXES = (".trellis", ".suh", ".svh", ".mul1", ".bias", ".su", ".sv")
+
+
+def expert_slots(stc, m, e: int = 0) -> tuple[int, int]:
+    """
+    (VRAM slot, RAM slot) bytes of routed expert e of an MoE layer, from the headers: the VRAM slot
+    holds the gate / up / down trellis tensors; the RAM slot the expert's whole extent in the
+    checkpoint (every tensor of its three projections, read in one piece), rounded up to 4 KiB
+    plus one 4 KiB page for an unaligned start. DeepSeek-V4.1 3.0 bpw: 13,271,040 and 13,320,192
+    """
+    linears = ([m.gates[e]] if m.gated else []) + [m.ups[e], m.downs[e]]
+    vram = sum(_meta(stc, l.key + ".trellis")[1] for l in linears)
+    span = _span(stc, [l.key + x for l in linears for x in _EXPERT_SUFFIXES])
+    return vram, (-(-span // 4096) + 1) * 4096
+
+
+def tier_layers(model, placement):
+    """The component's experts=cache layers as expert_tier_config.TierLayers, None without any"""
+    if placement is None:
+        return None
+    etc = _expert_tier_config()
+    experts, hot, device, top_k, first = {}, {}, {}, 0, None
+    for m in walk(model.modules):
+        if not is_moe(m):
+            continue
+        plan = m.placement_plan()
+        if plan is None or plan[0] != "cache":
+            continue
+        idx = m.layer_idx
+        experts[idx], hot[idx], device[idx] = m.num_experts, plan[2], placement.device_for_layer(idx)
+        top_k = max(top_k, m.num_experts_per_tok)
+        first = first or m
+    if first is None:
+        return None
+    vram_slot, ram_slot = expert_slots(model.config.stc, first)
+    return etc.TierLayers(experts, hot, device, top_k, vram_slot, ram_slot)
+
+
 # ---------------------------------------------------------------------------------------- n-gram
 
 @dataclass
@@ -296,10 +369,13 @@ class ComponentBudget:
     engram_keys: list = field(default_factory = list)       # DeepSeek-V4.1 engram layers (disk)
     memory: HostMemory | None = None
     reserve: int = 0
+    tier_layers: object = None          # expert_tier_config.TierLayers of the experts=cache layers
+    tier_config: object = None          # expert_tier_config.TierConfig
+    tier: object = None                 # expert_tier_config.TierSizing (stage 1)
 
     def worth_reporting(self) -> bool:
-        """Anything held in RAM, or a budget set: the load prints summary()"""
-        return bool(self.layers or self.ngram_held or self.expert_cap is not None or
+        """Anything held in RAM, a budget set, or an expert tier: the load prints summary()"""
+        return bool(self.layers or self.ngram_held or self.expert_cap is not None or self.tier is not None or
                     (self.ngram_tables or self.engram_keys) and self.ngram_budget != ZERO)
 
     def summary(self) -> str:
@@ -321,7 +397,10 @@ class ComponentBudget:
         tail = f"; {human(mem.available)} available" if mem is not None and mem.available is not None else ""
         if tail and mem.cgroup_limits:
             tail += f" (memory cgroup {mem.cgroup_path})"
-        return f" -- RAM budget ({self.component}): " + ", ".join(parts) + tail
+        lines = [f" -- RAM budget ({self.component}): " + ", ".join(parts) + tail] if parts else []
+        if self.tier is not None:
+            lines.append(self.tier.text)
+        return "\n".join(lines)
 
 
 def plan_component(model, placement, memory: HostMemory | None = None) -> ComponentBudget:
@@ -340,10 +419,14 @@ def plan_component(model, placement, memory: HostMemory | None = None) -> Compon
     b.expert_bytes = sum(l.nbytes for l in b.layers)
     what = "placement" if placement is not None and component == "text" else (b.label or "--ngram_ram")
 
-    # Routed experts: a request above the cap, or arenas above the request or the cap
+    # Routed experts: a request above the cap, or arenas above the request or the cap (with
+    # experts=cache layers, size_tiers below checks the request against the tier as well)
     req = b.expert_request
     static = b.expert_bytes
-    if req is not None and req.is_bytes:
+    b.tier_layers = tier_layers(model, placement) if component == "text" else None
+    if b.tier_layers is not None:
+        pass
+    elif req is not None and req.is_bytes:
         if cap is not None and req.nbytes > cap.nbytes:
             raise ValueError(f"placement asks ram experts={req} ({human(req.nbytes)}) but {flag} caps this "
                              f"component at {cap}")
@@ -389,11 +472,20 @@ def plan_component(model, placement, memory: HostMemory | None = None) -> Compon
     else:
         b.ngram_held = ngram_fill(b.ngram_tables, b.ngram_budget.nbytes)
     b.ngram_bytes = sum(t.nbytes for t in b.ngram_held)
-    ledger = HostLedger(memory = b.memory, reserve = b.reserve)
-    ledger.add("ram experts", static)
-    ledger.add("ngram", b.ngram_bytes)
-    ledger.check(what, "lower the budgets or use auto" if what == "placement" else
-                 "offload fewer layers, lower --ngram_ram, or free host memory")
+    if b.tier_layers is not None:
+        # The expert tier: its settings, and every check that needs no VRAM figure (explicit
+        # sizes, the tier's own refusals, the host check of what is known); the pools are sized
+        # at the end of the layer split, with each GPU's room
+        etc = _expert_tier_config()
+        b.tier_config = etc.TierConfig.from_env()
+        b.tier = etc.size_tiers(placement, b.tier_layers, b.tier_config, b.memory, static_bytes = static,
+                                ngram_bytes = b.ngram_bytes, expert_cap = cap, reserve = b.reserve)
+    else:
+        ledger = HostLedger(memory = b.memory, reserve = b.reserve)
+        ledger.add("ram experts", static)
+        ledger.add("ngram", b.ngram_bytes)
+        ledger.check(what, "lower the budgets or use auto" if what == "placement" else
+                     "offload fewer layers, lower --ngram_ram, or free host memory")
     # Kept per table key, so that a component loading later (an MTP head sharing the config)
     # leaves the main model's entries alone
     held = {t.key for t in b.ngram_held}

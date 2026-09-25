@@ -431,3 +431,136 @@ Each is a `ValueError`, prefixed with `placement rule <n> '<rule>': ` where one 
 | `*=cuda:0 experts=cache` (in this build) | `placement '*=cuda:0 experts=cache': experts=cache is not available in this build yet; it needs the expert tier runtime (a VRAM expert cache per GPU over the RAM tier and the disk) (see doc/expert_tiers.md)` |
 
 `tests/test_placement_tiers_.py` holds every case with its full text.
+
+## The expert tier
+
+**Not available in this build yet**: `experts=cache` is parsed and checked, then refused. This
+section describes what the words ask for, how a load sizes the tier and what it refuses, as
+`model/expert_tier_config.py` implements it (its tests, `tests/test_expert_tier_config_.py`, run
+every number below).
+
+### Where a routed expert of a `cache` layer lives
+
+| Place | Holds | Sized by |
+|---|---|---|
+| VRAM, `hot=` pins | `hot` experts per layer, never evicted | the layer (counted as its weights) |
+| VRAM, the GPU's cache | a changing set, shared by every `cache` layer on that GPU (one least-recently-used pool per GPU) | `cuda:<n> cache=` |
+| VRAM, prefill staging | the next layer's experts during a long prefill | `EXL3_MOE_TIER_STAGING` |
+| RAM, the tier | the warmest experts VRAM does not hold (`policy=lazy-exclusive` / `exclusive`), or a copy of what it holds too (`inclusive`) | `ram experts=` |
+| RAM, the disk slab | SSD reads that bypass the tier | `EXL3_MOE_TIER_DISK_SLAB` |
+| SSD | every expert: the checkpoint's shards, read in place, never written | `disk experts=` |
+
+With `disk experts=off` nothing is read from the SSD after the load: VRAM and RAM must hold every
+cached expert, and every VRAM victim moves back to RAM (demotion is then unconditional).
+
+### Sizing a tiered load
+
+Per GPU with `cache` layers, `n` = its cached experts (E - hot, summed over its `cache` layers),
+`vram_slot` = one expert's three trellis tensors (13,271,040 bytes for DeepSeek-V4.1 3.0 bpw):
+
+```
+staging = (2 with EXL3_MOE_TIER_STAGING=double, else 1) x max over its cache layers of (E - hot) slots
+room    = what the GPU has left inside its -gs budget after the placed modules, the Cache and the
+          loader's margins  -  staging  -  EXL3_MOE_TIER_HEADROOM_MB
+S       = min(n, room / vram_slot)             cache=auto
+S       = min(n, size / vram_slot)             cache=<size>, refused when size > room
+held    = n if S == n (everything fits: no spare needed), else S - spare
+```
+
+Then for the component, `N` = cached experts on every GPU, `ram_slot` = one expert's extent in the
+checkpoint rounded up to 4 KiB plus one page for an unaligned start (13,320,192 bytes):
+
+```
+tier_all = N - sum(held)          lazy-exclusive, exclusive (inclusive: N)
+want     = static arenas + tier_all x ram_slot                  ram experts=all
+         = min(that, available - reserve - pagecache - ngram)   ram experts=auto (the default), within --expert_ram
+         = the size                                             ram experts=<size>
+R        = min(tier_all, (want - static arenas) / ram_slot)     RAM tier slots
+disk-only experts = N - sum(held) - R                           (inclusive: N - R)
+```
+
+`ram experts=` covers the `stream` / `cpu` / `split` layers' arenas first; the tier gets the rest.
+The disk slab (8 slots by default) is pinned too when `disk experts=` is not `off`. The host check
+covers the static arenas, the tier, the n-gram tables and the slab together.
+
+A load checks what it can before any module loads (explicit `cache=` and `ram experts=` sizes,
+the settings, the host memory they need), and sizes the pools at the end of the layer split, with
+each GPU's room, before any of the tier is allocated. It prints:
+
+```
+ -- expert tiers: cuda:1 cache 6553 slots (81.0 GiB, 8 spare, evict=lru admit=adaptive; staging 768 slots (9.5 GiB, double))
+    ram experts 52.2 GiB pinned (static 0 MiB + tier 4207 slots), policy lazy-exclusive demote=swap, evict=lfu
+    ngram 0 MiB (every row streams from disk)
+    disk experts=off io=auto: 0 experts on disk only; 73.8 GiB of RAM left unpinned
+```
+
+### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
+
+| | (a) PRO + RAM for every expert outside VRAM | (b) PRO + 96 GiB RAM tier + SSD | (c) CMP resident + PRO cache + RAM, no expert SSD reads |
+|---|---|---|---|
+| Devices | `CUDA_VISIBLE_DEVICES=0` | same | `1,0` (cuda:0 = CMP, cuda:1 = PRO) |
+| Placement | `*=cuda:0 experts=cache; ram experts=all; disk experts=off` | `*=cuda:0 experts=cache; ram experts=96GiB` | `0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off` |
+| Pool (65.5 / 71.5 GiB estimated) | 5,299 slots | 5,299 slots | 5,784 slots |
+| RAM tier | 10,069 slots, 124.9 GiB | 7,738 slots, 96 GiB | 4,976 slots, 61.7 GiB |
+| SSD-only experts | 0 | 2,331 (28.9 GiB) | 0 |
+| Under a 128 GiB cgroup | refused (the refusal names the cgroup) | fits | fits |
+| Engram tables | disk | disk | disk |
+
+The CMP 170HX's x1 link (~0.4 GB/s) is below `EXL3_MOE_TIER_MIN_LINK_GBS`: it holds resident
+layers only, as in (c).
+
+### Load-time refusals of the tier
+
+| Situation | Message |
+|---|---|
+| `disk experts=off`, tiers too small | `placement: disk experts=off needs every cached expert in VRAM or RAM, but 1628 of 10752 fit in neither (6545 VRAM slots besides the spare ones, 2579 RAM slots); raise ram experts= by 20.2 GiB or allow disk reads` |
+| budgets above the host memory | `placement: ram experts=96.0 GiB + ngram=6.0 GiB + disk slab=102 MiB need 102.1 GiB of host memory, but 53.0 GiB is available and 2.0 GiB is kept free (EXL3_HOST_MEM_RESERVE_MB) (no swap: pinned and anonymous memory cannot be reclaimed); lower the budgets or use auto` (with the cgroup when it is the limit) |
+| cache below its minimum | `placement: cuda:0 cache=100MiB holds 7 expert slots; experts=cache needs at least top-k (6) + spare (8) = 14 slots (177 MiB), or cache=0` |
+| cache above the device's room | `placement: cuda:0 cache=90GiB does not fit: 80.0 GiB is free on cuda:0 after the placed modules, the cache and the margins (the prefill staging, 9.5 GiB with EXL3_MOE_TIER_STAGING=double, and EXL3_MOE_TIER_HEADROOM_MB=1024 are set aside first)` |
+| staging leaves too little | `placement: cuda:0 has 100 MiB left for the expert cache after the placed modules, the margins and the prefill staging (9.5 GiB, EXL3_MOE_TIER_STAGING=double); an expert cache needs at least top-k + spare = 14 slots (177 MiB); set EXL3_MOE_TIER_STAGING=single, raise -gs on cuda:0, or move layers` |
+| request above the flag | `placement asks ram experts=64GiB (64.0 GiB) but --expert_ram caps this component at 48GiB` |
+| static arenas above the request | `placement: the stream / cpu layers keep 47.6 GiB of routed experts in RAM, more than ram experts=40GiB; raise it or move layers to experts=cache` |
+| a tier smaller than one decode step | `placement: ram experts=50MiB leaves the RAM tier 3 slots, fewer than one decode step uses (top-k = 6); raise it, or use ram experts=0 (a VRAM cache straight over the disk)` |
+| `inclusive` too small | `placement: policy=inclusive keeps a RAM copy of every expert the VRAM cache holds, so ram experts= must hold more than the cache's 6472 + 8 slots (80.4 GiB); it holds 5159 (64.0 GiB)` |
+| a slow host link | `placement: cuda:0 reaches host memory at 0.38 GB/s (measured at load), below the 2.0 GB/s an expert cache needs (EXL3_MOE_TIER_MIN_LINK_GBS); keep its layers experts=vram, or set EXL3_MOE_TIER_MIN_LINK_GBS=0 to allow it` |
+| `EXL3_MOE_TIER_DEMOTE=0` with `disk experts=off` | `EXL3_MOE_TIER_DEMOTE=0 would drop VRAM victims, but disk experts=off keeps no other copy of them` |
+| two expert shapes on one GPU | `placement: the experts=cache layers on cuda:1 have different expert shapes (...); one expert slot size per GPU is supported` |
+| a layer the tier cannot serve | `placement: <layer> cannot use experts=cache: it needs the fused MoE kernel (EXL3 mul1 codebook shared by gate, up and down; silu, silu_ref or gelu gated, or relu2 gateless; no per-expert biases; unpadded dims; at most 512 experts); use experts=vram, stream or cpu for this layer` |
+| not Linux | `placement: experts=cache needs the disk engine, which is Linux-only` |
+
+### Tuning
+
+The placement says what the tier does; `EXL3_MOE_TIER_*` and `EXL3_MOE_HEAT_*` say how. Every
+variable is described in [env_vars.md](env_vars.md) ("Expert tiers"); a load checks them all
+when it starts (a malformed value or an unknown name under those prefixes is refused, with a
+did-you-mean hint) and prints the ones that differ from their default.
+
+| Variable | Default | Values |
+|---|---|---|
+| `EXL3_MOE_TIER_DEMOTE` | `1` | `0` drops every VRAM victim (master switch of `ram demote=`) |
+| `EXL3_MOE_TIER_STAGING` | `double` | `double`, `single` |
+| `EXL3_MOE_TIER_PREFILL_ROWS` | `256` | rows from which a call copies whole layers (2 .. 2^20, above the decode rows) |
+| `EXL3_MOE_TIER_DECODE_ROWS` | `8` | rows up to which a call may admit (1 .. 8) |
+| `EXL3_MOE_HEAT_HALFLIFE` | `256` | decode tokens per halving of the heat |
+| `EXL3_MOE_HEAT_PREFILL` | `0.0625` | heat of a prefill assignment (0 .. 1) |
+| `EXL3_MOE_HEAT_FILE` | unset | path |
+| `EXL3_MOE_TIER_ADMIT_P` | unset | pins the adaptive probability (0 .. 1) |
+| `EXL3_MOE_TIER_ADAPT_EVERY` | `2048` | accesses per adaptation |
+| `EXL3_MOE_TIER_ADMIT_PMIN` | `0.05` | lower bound of the probability |
+| `EXL3_MOE_TIER_SAMPLE` | `16` | RAM entries sampled for the coldest |
+| `EXL3_MOE_TIER_RAM_ADMIT` | `always` | `always`, `heat` |
+| `EXL3_MOE_TIER_REFILL` | `1` | `0` turns refills off |
+| `EXL3_MOE_TIER_REFILL_INFLIGHT` | `2` | 1 .. 64 |
+| `EXL3_MOE_TIER_DISK_SLAB` | `auto` | slots, 1 .. 4096 |
+| `EXL3_MOE_TIER_HEADROOM_MB` | `1024` | MiB |
+| `EXL3_MOE_TIER_MIN_LINK_GBS` | `2.0` | GB/s; `0` allows any link |
+| `EXL3_MOE_TIER_SPIN_US` | `-1` | `-1` while a pass is active, `0` never, N us |
+| `EXL3_MOE_TIER_AFFINITY` | unset | CPU list |
+| `EXL3_MOE_TIER_DETERMINISTIC` | `0` | `1` applies every call before the next |
+| `EXL3_MOE_TIER_VERIFY` | `0` | `1` checks invariants after every call |
+| `EXL3_MOE_TIER_TRACE` | unset | path of the call-record trace |
+
+The policies themselves (`admit=`, `evict=`, `policy=`, `demote=`) are words of the placement, so
+one string says what a load does; the defaults (`admit=adaptive`, `evict=lru`,
+`policy=lazy-exclusive`, `demote=swap`, `ram evict=lfu`, `spare=8`) are those of the policy
+simulation until measurements on the target host replace them.

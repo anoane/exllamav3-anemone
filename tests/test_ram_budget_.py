@@ -76,7 +76,7 @@ class MoE:
 
     def __init__(self, stc, key, layer_idx, num_experts = 384, hidden = 5120, inter = 2304, plan = None,
                  activation = "silu", **linear_kw):
-        self.key, self.layer_idx, self.num_experts = key, layer_idx, num_experts
+        self.key, self.layer_idx, self.num_experts, self.num_experts_per_tok = key, layer_idx, num_experts, 6
         self.gated, self.activation_fn, self.num_local_experts, self.routing_first = True, activation, None, None
         self.gates, self.ups, self.downs, self.modules = [], [], [], []
         self._plan = plan
@@ -395,6 +395,54 @@ class PlacementRequestTests(unittest.TestCase):
         self.assertEqual(str(cm.exception), "placement: 'disk ngram=off' would never read n-gram rows from disk, but the "
                                             "DeepSeek-V4.1 engram tables of model.layers.1.engram are always read from "
                                             "disk; remove disk ngram=off")
+
+
+class TierStageOneTests(unittest.TestCase):
+    """experts=cache layers at stage 1 (this build refuses the word at parse time; the gate is lifted
+    here): the tier's settings are read, its explicit sizes checked with the rest of the host memory"""
+
+    P = PlacementRequestTests.P
+
+    def parse(self, text):
+        with patch.dict(self.P.storage.PENDING, {}, clear = True):
+            return self.P.parse(text)
+
+    def cached(self, n = 4, hot = 0):
+        stc, moes = v41(range(n))
+        for m in moes:
+            m._plan = ("cache", "gpu", hot)
+        return stc, moes
+
+    def test_expert_slots_from_headers(self):
+        stc, (m,) = v41([0], num_experts = 2)
+        vram, ram = RB.expert_slots(stc, m, 1)
+        span = 3 * 4_423_680 + 2 * (5120 + 2304) * 4 + (2304 + 5120) * 4 + 3 * 4     # this checkpoint keeps fp32 suh / svh
+        self.assertEqual((vram, ram), (3 * 4_423_680, (-(-span // 4096) + 1) * 4096))
+
+    def test_tier_layers(self):
+        stc, moes = self.cached(3, hot = 16)
+        placement = self.parse("*=cuda:1 experts=cache hot=16")
+        tl = RB.tier_layers(model(moes, stc), placement)
+        self.assertEqual((tl.experts, tl.hot, tl.device, tl.top_k), ({0: 384, 1: 384, 2: 384}, {0: 16, 1: 16, 2: 16},
+                                                                    {0: "cuda:1", 1: "cuda:1", 2: "cuda:1"}, 6))
+        self.assertEqual((tl.vram_slot, tl.cached()), (3 * 4_423_680, 3 * 368))
+        self.assertIsNone(RB.tier_layers(model(moes, stc), None))
+
+    def test_plan_component(self):
+        stc, moes = self.cached()
+        placement = self.parse("*=cuda:0 experts=cache; ram experts=4GiB")
+        with patch.object(RB._expert_tier_config(), "sys", NS(platform = "linux")), \
+                patch.dict(os.environ, {"EXL3_HOST_MEM_RESERVE_MB": "2048"}):
+            b = RB.plan_component(model(moes, stc), placement, memory = memory(150))
+            self.assertIsNotNone(b.tier)
+            self.assertEqual(b.tier.tier_slots, 4 * GiB // b.tier_layers.ram_slot)
+            self.assertTrue(b.worth_reporting())
+            self.assertIn(" -- expert tiers: cuda:0 cache auto (sized at the end of the load, 8 spare", b.summary())
+            with self.assertRaisesRegex(RuntimeError, r"^placement: ram experts=4.0 GiB \+ disk slab=102 MiB need"):
+                RB.plan_component(model(moes, stc), placement, memory = memory(5))
+            with patch.dict(os.environ, {"EXL3_MOE_TIER_STAGING": "tripple"}), \
+                    self.assertRaisesRegex(ValueError, "EXL3_MOE_TIER_STAGING='tripple' must be double or single"):
+                RB.plan_component(model(moes, stc), placement, memory = memory(150))
 
 
 class NgramDecisionTests(unittest.TestCase):
