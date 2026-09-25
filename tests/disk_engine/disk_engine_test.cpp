@@ -1719,6 +1719,15 @@ void test_config()
     CHECK(!err({ { "qd", "8" }, { "reserve0", "8" } }).empty(), "%s: reserve0 >= qd", what);
     CHECK(!err({ { "window_prefetch", "8M/16M" } }).empty(), "%s: lo > hi", what);
     CHECK(!err({ { "window_expert", "8M/0" } }).empty(), "%s: expert lo", what);
+    // the expert window is a power of two in [256K, 1G], or inf
+    for (const char* v : { "3M", "12M", "1000K", "128K", "64K", "2G", "4G" })
+        CHECK(!err({ { "window_expert", v } }).empty(), "%s: window_expert=%s accepted", what, v);
+    for (const char* v : { "256K", "512K", "1M", "8M", "64M", "1G", "inf" })
+        CHECK(err({ { "window_expert", v } }).empty(), "%s: window_expert=%s refused", what, v);
+    CHECK(config_from_env({}).window_hi[kExpert] == 8 << 20 &&
+          config_from_env({ { "window_expert", "64M" } }).window_hi[kExpert] == 64 << 20 &&
+          config_from_env({ { "window_expert", "inf" } }).window_hi[kExpert] < 0,
+          "%s: window_expert values", what);
     // a zero hi window would never admit its class
     for (const char* k : { "window_expert", "window_prefetch", "window_refill" })
         for (const char* v : { "0", "0K", "0/0" })

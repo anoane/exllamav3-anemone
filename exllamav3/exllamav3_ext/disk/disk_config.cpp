@@ -195,6 +195,12 @@ std::vector<int> parse_cpu_list(const Knobs& k, const std::string& key)
     return cpus;
 }
 
+// Expert demand window bounds. 256 KiB is one bulk chunk at its smallest: below it a demand read
+// could not keep even one chunk in flight. 1 GiB leaves room for devices far faster than today's
+// (PCIe 6/7 drives, striped arrays), which need more bytes in flight to reach full rate
+constexpr int64_t kExpertWindowMin = 256ll << 10;
+constexpr int64_t kExpertWindowMax = 1ll << 30;
+
 // hi must be positive or unlimited: a class whose window is 0 outside the hold rule would
 // never be admitted. lo may be 0 (nothing new while the hold rule is active, which ends)
 void parse_window(const Knobs& k, const std::string& key, bool allow_lo, int64_t def_hi,
@@ -266,8 +272,16 @@ Config config_from_env(const Overrides& ov)
 
     // Windows (bytes in flight per class); class 0 has none
     c.window_hi[kEngram] = c.window_lo[kEngram] = -1;
-    parse_window(k, "window_expert", false, 32ll << 20, 32ll << 20,
+    parse_window(k, "window_expert", false, 8ll << 20, 8ll << 20,
                  &c.window_hi[kExpert], &c.window_lo[kExpert]);
+    {
+        // a power of two, so the window divides evenly into chunks and doubling / halving it is
+        // the natural tuning step; inf (negative) stays available for measurements
+        int64_t w = c.window_hi[kExpert];
+        if (w >= 0 && (w < kExpertWindowMin || w > kExpertWindowMax || (w & (w - 1)) != 0))
+            k.bad("window_expert", k.get("window_expert"),
+                  "a power of two from 256K to 1G, such as 1M, 8M or 64M, or inf");
+    }
     parse_window(k, "window_prefetch", true, 8ll << 20, 0,
                  &c.window_hi[kPrefetch], &c.window_lo[kPrefetch]);
     parse_window(k, "window_refill", true, 8ll << 20, 0,

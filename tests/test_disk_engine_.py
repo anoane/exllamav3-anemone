@@ -564,3 +564,10 @@ def test_hold_class_and_zero_window(ext, data):
     for k in ("window_expert", "window_prefetch", "window_refill"):
         with pytest.raises(RuntimeError, match = k.upper()):
             ext.disk_engine_configure({"backend": "io_uring", k: "0"})
+    # the expert window: a power of two in [256K, 1G], or inf
+    for v in ("3M", "128K", "2G"):
+        with pytest.raises(RuntimeError, match = "WINDOW_EXPERT"):
+            ext.disk_engine_configure({"backend": "io_uring", "window_expert": v})
+    for v in ("256K", "64M", "1G", "inf"):
+        ext.disk_engine_configure({"backend": "io_uring", "window_expert": v})
+    ext.disk_engine_configure({"backend": "io_uring"})

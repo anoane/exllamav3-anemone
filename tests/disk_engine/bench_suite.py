@@ -325,7 +325,7 @@ def preset(name, scale, h):
             ("uring_async", ["io_uring"], "uring_async", ["64"], [f"rows:u=8192,cache=warm,iters={S(2)}"]),
             ("spin_us", ["io_uring"], "spin_us", ["0"], rows_s),
             ("chunk", ["io_uring"], "chunk", ["512K"], ext_s),
-            ("window_expert", ["io_uring"], "window_expert", ["8M"], [f"mixed:bulk=extents,bulk_cls=1,iters={S(15)}"]),
+            ("window_expert", ["io_uring"], "window_expert", ["32M"], [f"mixed:bulk=extents,bulk_cls=1,iters={S(15)}"]),
             ("window_prefetch", ["io_uring"], "window_prefetch", ["32M/0"], [f"mixed:bulk=extents,bulk_cls=2,iters={S(15)}"]),
         ]
         reps = 2
@@ -360,7 +360,7 @@ def preset(name, scale, h):
             ("spin_us", ["io_uring", "pread"], "spin_us", ["0", "200"], rows_s + warm_s),
             ("chunk", ["io_uring", "odirect"], "chunk", ["512K", "4M"], ext_s + [f"extents:k=1,cache=cold,iters={S(20, 3)}"]),
             ("engram_qd", ["io_uring"], "engram_qd", ["32", "64"], pref_s + [f"rows:u=96,cache=cold,iters={S(300)}"]),
-            ("window_expert", ["io_uring"], "window_expert", ["8M", "64M"],
+            ("window_expert", ["io_uring"], "window_expert", ["32M", "64M"],
              [f"mixed:bulk=extents,bulk_cls=1,iters={S(100)}"]),
             ("window_prefetch", ["io_uring"], "window_prefetch", ["32M/0"],
              [f"mixed:bulk=extents,bulk_cls=2,iters={S(100)}"]),

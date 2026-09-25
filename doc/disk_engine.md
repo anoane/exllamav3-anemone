@@ -272,7 +272,9 @@ Every variable below is also listed in `doc/env_vars.md` ("Disk I/O engine"). Si
 ### `EXL3_DISK_BACKEND` (default: `auto`)
 
 `auto`, `original`, `pread`, `odirect` or `io_uring` (see [backends](#backends)). `auto`
-resolves through `disk_auto.h` ([how `auto` is decided](#how-auto-is-decided)). `original` keeps
+resolves through `disk_auto.h` ([how `auto` is decided](#how-auto-is-decided)); on the test host
+it is `io_uring` with the n-gram gather through the engine and a 5 ms keep-alive, decided from the
+2026-09-25 maintenance-window run. `original` keeps
 `ngram_gather_cpu` on its original pool while the engine's own entry points use `auto`'s backend:
 the switch back to the pre-engine behaviour, whatever `auto` says. Naming a backend sends
 `ngram_gather_cpu` and the DeepSeek-V4.1 engram (one call per layer for both tables) through the
@@ -318,13 +320,16 @@ flight on the test host; beyond that depth only adds latency to everything else.
 large prefill gather (8192 rows and more) should leave depth to expert reads; the `engram_qd`
 sweep measures 32 and 64.
 
-### `EXL3_DISK_WINDOW_EXPERT` (default: `32M`), `EXL3_DISK_WINDOW_PREFETCH` (default: `8M/0`), `EXL3_DISK_WINDOW_REFILL` (default: `8M/0`)
+### `EXL3_DISK_WINDOW_EXPERT` (default: `8M`), `EXL3_DISK_WINDOW_PREFETCH` (default: `8M/0`), `EXL3_DISK_WINDOW_REFILL` (default: `8M/0`)
 
 Bytes in flight per class: 1 (expert demand), 2 (prefetch, earliest deadline first) and 3
 (background refill); `inf` means unlimited. For classes 2 and 3, `hi/lo`: `lo` applies while the
 hold rule is active, `hi` otherwise; a single value sets `hi` and keeps `lo` at 0. Class 1 is
-never held and takes one value. `hi` must be positive or `inf` (`0` would never admit the class
-and is refused); `lo` may be 0. A read larger than its window is admitted when nothing else of
+never held and takes one value: a power of two from `256K` to `1G` (`1M`, `2M`, `4M`, `8M`, ...),
+or `inf` for measurements; anything else is refused with the accepted range in the message. The
+lower bound is one bulk chunk at its smallest; the upper bound leaves room for devices much faster
+than today's. For the other classes `hi` must be positive or `inf` (`0` would never admit the
+class and is refused); `lo` may be 0. A read larger than its window is admitted when nothing else of
 its class is in flight, so a window never starves a class.
 
 Why windows: the device serves roughly in order, so a row read queued behind B bytes of bulk
@@ -336,8 +341,11 @@ the batch's wait to ~0.8 ms, and whether it costs bulk rate depends on how much 
 needs. On the test host's smoke run it cost none: with four extents queued, `8M` kept the stream
 at 10.0 GB/s (9.7 GB/s at 32M) and cut the decode batch next to it from 2.9 ms to 0.70 ms at p50
 (`io_uring`, one run of 15 calls on a busy host, so a hint, not a result). The maintenance-window
-run sweeps 8M and 64M, and `decide` reports what the sweep says (as advice: the default window is
-not part of `auto`). The prefetch window with `lo` 0 keeps look-ahead reads entirely out of the
+run on the model's shards (2026-09-25, `io_uring`, four extents in flight, a cold 48-row decode
+batch every 2 ms) confirmed it, so the default is `8M`: decode p50 / p99 750 / 1116 us and a
+bulk rate of 8.94 GB/s at 8M, against 1419 / 3198 us and 8.39 GB/s at 32M and 1717 / 3662 us and
+8.25 GB/s at 64M. The window run sweeps the alternatives (32M, 64M), and `decide` reports what the
+sweep says (as advice: the default window is not part of `auto`). The prefetch window with `lo` 0 keeps look-ahead reads entirely out of the
 way of a held decode batch (raising it to `32M/0` made decode next to a prefetch stream 6x slower
 in the same smoke run). Chunks of `EXL3_DISK_CHUNK` make the windows fine-grained. On a faster
 device (bare-metal PCIe 5 NVMe at ~14 GB/s) the same window costs less time, so larger windows
@@ -584,7 +592,7 @@ MoE workers do not use (`EXL3_DISK_AFFINITY`); on bare metal with NVMe, boot wit
 | `EXL3_DISK_SQPOLL` | off | off | try on, with `SQPOLL_CPU` on a spare core |
 | `EXL3_DISK_IOPOLL` | refused (no poll queues) | refused | try on, with `nvme.poll_queues` |
 | `EXL3_DISK_REGISTER` | `all` | `all` | `all` |
-| `EXL3_DISK_WINDOW_EXPERT` | 32M (8M looked better in the smoke run: see its sweep) | measure 8M-32M | measure 8M-64M |
+| `EXL3_DISK_WINDOW_EXPERT` | 8M (measured best: see the window run) | measure 8M-32M | measure 8M-64M |
 | `EXL3_DISK_AFFINITY` | CPUs outside the CPU MoE set | same | CPUs on the drive's NUMA node |
 | `EXL3_DISK_KEEPALIVE_MS` | `auto` (decided here; 5 if the host's power states stay) | same | 0 if APST / ASPM are off, else measure |
 

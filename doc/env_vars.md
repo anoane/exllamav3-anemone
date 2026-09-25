@@ -1500,7 +1500,9 @@ variable that does not apply to the chosen backend is reported once and ignored.
 `auto`, `original`, `pread`, `odirect` or `io_uring`. A named backend sends `ngram_gather_cpu`
 (PLE n-gram tables, the DeepSeek-V4.1 engram, which then reads both of a layer's tables in one
 call) through the engine. `auto` resolves to what `exllamav3_ext/disk/disk_auto.h` records, set
-from a benchmark on the test host; until that benchmark has run it keeps the original gather.
+from a benchmark on the test host: `io_uring`, with the n-gram gather through the engine and a 5 ms
+keep-alive (decided 2026-09-25; a decode engram call at 75% cached took 267 us against 457 us for
+`pread` and 577 us for the original gather).
 `original` keeps `ngram_gather_cpu` on its original thread pool whatever `auto` says.
 
 ### `EXL3_DISK_DIRECT` (default: `auto`)
@@ -1520,10 +1522,15 @@ Slots only class 0 (rows the forward waits for) may use; classes 1-3 share the r
 
 Requests in flight for class 0 alone.
 
-### `EXL3_DISK_WINDOW_EXPERT` (default: `32M`), `EXL3_DISK_WINDOW_PREFETCH` (default: `8M/0`), `EXL3_DISK_WINDOW_REFILL` (default: `8M/0`)
+### `EXL3_DISK_WINDOW_EXPERT` (default: `8M`), `EXL3_DISK_WINDOW_PREFETCH` (default: `8M/0`), `EXL3_DISK_WINDOW_REFILL` (default: `8M/0`)
 
 Bytes in flight for expert demand reads, prefetch and background refill; `hi/lo` for the latter
-two (`lo` while a decode row batch is held); `inf` for unlimited; `0` is refused for `hi`.
+two (`lo` while a decode row batch is held); `inf` for unlimited; `0` is refused for `hi`. The
+expert window must be a power of two from `256K` to `1G` (e.g. `1M`, `8M`, `64M`) or `inf`; smaller
+windows favour decode-row latency on slow devices (SATA SSD, HDD), larger ones keep very fast
+devices (PCIe 6/7 NVMe, striped arrays) at full rate. The expert default is 8M: on the test host it kept decode rows next to an expert stream at 750 us p50
+(1.1 ms p99) against 1.4 ms (3.2 ms) at 32M, with a higher bulk rate (8.9 vs 8.4 GB/s); see
+doc/disk_engine.md.
 
 ### `EXL3_DISK_HOLD_ARM_MS` (default: `50`)
 
@@ -1592,7 +1599,7 @@ Drop an extent's pages after reading it through the page cache.
 ### `EXL3_DISK_KEEPALIVE_MS` (default: `auto`), `EXL3_DISK_KEEPALIVE_IDLE_S` (default: `30`)
 
 While the engine is in use, read one small `O_DIRECT` block whenever the device has been idle for
-`KEEPALIVE_MS` (`1`-`1000`; `0` off; `auto` as `disk_auto.h` records), so a device that sleeps when
+`KEEPALIVE_MS` (`1`-`1000`; `0` off; `auto` as `disk_auto.h` records: 5 ms on the test host), so a device that sleeps when
 idle (NVMe power states, PCIe link power management) is awake for the next real read; stops
 `KEEPALIVE_IDLE_S` seconds after the last submission.
 
