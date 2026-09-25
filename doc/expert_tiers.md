@@ -522,6 +522,112 @@ The disk engine reads the 4 KiB-aligned superset of an extent into a 4 KiB-align
 projection `p` is then at `slot + payload offset + sub-offset[p]`. A promotion copies those three
 ranges into the compact VRAM slot.
 
+### Policies: what the tier decides
+
+Every decision of the tier is made by one set of rules, written once as a reference
+(`model/expert_tier_policy.py`) and reproduced exactly by the native core
+(`exllamav3_ext/tier/tier_policy.cpp`). The rules depend only on the sequence of calls, never on
+timing, so a replay of the same calls gives the same records, the same copies and the same final
+contents. Tier state changes where an expert's bytes come from, never the arithmetic: a layer
+computes the same logits whatever the cache holds.
+
+**Keys and sizes.** A cached expert is `lc * E + e`: `lc` numbers the `cache` layers of one GPU in
+forward order, `e` is the routed expert. `S` = the GPU's pool slots, `spare` its spare slots,
+`C = S - spare` the experts the pool holds in steady state, `R` = the RAM tier's slots.
+
+**One call of a cache layer** (the lookup):
+
+1. Calls are numbered (`seq`), one per call of any cache layer on the GPU. The call's routed
+   experts are deduplicated in order of first occurrence (`U`), with their counts.
+2. **Heat** (below) grows by the count: 1 per decode assignment, `EXL3_MOE_HEAT_PREFILL` per
+   prefill assignment.
+3. **Protection** (decode calls only): every expert of the call that the pool holds gets
+   `stamp = seq` before any victim is chosen, so a call never evicts an expert it uses.
+4. For each expert of `U` in order:
+   - held by the pool: a **hit**;
+   - a prefill call (routed mode, fewer rows than `EXL3_MOE_TIER_PREFILL_ROWS`): a
+     **transient**: it is copied into the staging for this call only;
+   - a decode call: **admitted** while the pool holds fewer than `C` experts, otherwise as
+     `admit=` says. An admitted expert takes the lowest free slot; with none free it becomes a
+     transient (counted as *starved*). When the pool then holds more than `C` experts, one
+     **victim** is retired and paired with the admission.
+5. The call's record lists every expert of `U`: hit, admit (with its victim), or transient.
+
+| `cuda:<n> admit=` | A decode miss enters the pool when |
+|---|---|
+| `adaptive` (default) | a draw keyed on the access counter falls under the probability `p`; `p` adapts every `EXL3_MOE_TIER_ADAPT_EVERY` accesses so the VRAM and RAM tiers' cache lives match (Gill's PROMOTE), between `EXL3_MOE_TIER_ADMIT_PMIN` and `C / (C + R)`; `EXL3_MOE_TIER_ADMIT_P` pins it |
+| `heat` | its heat is at least the would-be victim's |
+| `always` | always |
+
+| `cuda:<n> evict=` | The victim is the pool slot, among those not used by this call, with |
+|---|---|
+| `lru` (default) | the oldest stamp, then the lowest slot |
+| `lfu` | the least heat, then the oldest stamp, then the lowest slot |
+
+A victim's bytes stay intact while it is *retiring*: its slot returns to the free list only after
+its copy back to RAM (if any) has landed, so a spare slot is always ready for the next admission
+and an admission never waits on a demotion. `spare=0` (allowed with `ram demote=off` or
+`policy=inclusive`) replaces victims in place instead.
+
+**What the host does with a record**, entry by entry (every miss, then its paired victim):
+
+| A miss is read from | when |
+|---|---|
+| a retiring VRAM slot that still holds it (device to device) | its demotion is still in flight |
+| its RAM tier slot (host to device, three copies from an SSD-filled slot, one from a demoted one) | RAM holds it |
+| the SSD (a class-1 read of the disk engine, into a RAM slot or the disk slab) | otherwise |
+
+| What RAM keeps | `exclusive` | `lazy-exclusive` (default) | `inclusive` |
+|---|---|---|---|
+| admitted, was in RAM | the RAM slot is freed | the RAM copy becomes a reclaimable duplicate | the RAM copy becomes a duplicate |
+| admitted, read from the SSD | nothing (read into the slab) | a duplicate, in a free slot or over a reclaimed duplicate; else nothing | a duplicate, in a free slot or over the coldest owner |
+| transient, read from the SSD (decode) | RAM admission: a free slot, else a reclaimed duplicate, else over the coldest sampled owner (`EXL3_MOE_TIER_RAM_ADMIT=heat`: only when warmer); else the slab | same | same, without reclaiming duplicates |
+| transient, read from the SSD (prefill) | the slab; a refill candidate (below) | same | same |
+
+| The victim (`ram demote=`) | Rule |
+|---|---|
+| has a duplicate in RAM | the duplicate becomes the owner; nothing is copied |
+| `swap` (default) | copied back only into the RAM slot its admission freed or made a duplicate, and only when it is warmer than RAM's coldest sampled owner; else dropped: at most one copy back per promotion from RAM |
+| `heat` | copied into a free slot, else over a reclaimed duplicate, else over the coldest sampled owner when warmer; else dropped |
+| `all` | always copied back (a free slot, else a reclaimed duplicate, else over the coldest sampled owner) |
+| `off`, or `EXL3_MOE_TIER_DEMOTE=0` | dropped (the SSD has it) |
+| any, with `disk experts=off` | always copied back: into the slot its admission left, else a free slot, else a reclaimed duplicate |
+
+`inclusive` never copies a victim back: RAM always has it. A copied-back victim's RAM slot holds
+its three trellis tensors back to back (compact layout).
+
+- **Coldest sampled owner**: the least heat (`ram evict=lfu`, default) or the oldest RAM stamp
+  (`ram evict=lru`; set when an expert enters RAM and when a decode call reads it), then the
+  lowest key, over `EXL3_MOE_TIER_SAMPLE` draws from the owners (all of them when there are no
+  more than that).
+- **Reclaimed duplicate**: among sampled duplicates, the one whose VRAM copy was used last (the
+  last to lose it), then the lowest key.
+- **Refills** (`EXL3_MOE_TIER_REFILL`): an expert a prefill call read from the SSD past the RAM
+  tier is read again into RAM in the background (class 3) when a free slot or a duplicate is
+  available, or when it is warmer than RAM's coldest sampled owner; at most
+  `EXL3_MOE_TIER_REFILL_INFLIGHT` in flight (refills of earlier calls that are still reading
+  count; in deterministic mode they have all landed), the others are dropped, never queued. Decode
+  misses already went through RAM admission.
+- **Layer mode** (prefill calls from `EXL3_MOE_TIER_PREFILL_ROWS` rows): every cached expert of
+  the layer that the pool does not hold is staged (from RAM, or read from the SSD into the slab);
+  no stamps, no admission, no demotion; heat grows.
+
+**Heat** is a decayed routing count per key, kept in 16.16 fixed point with the epoch it was last
+written in. The epoch is `decode tokens // EXL3_MOE_HEAT_HALFLIFE` (one decode pass = one token);
+reading a key halves its value once per epoch since (lazily, no sweep). A decode assignment adds
+1.0, a prefill assignment `EXL3_MOE_HEAT_PREFILL` (1/16): a 4K-token prompt adds about 4 to every
+expert of a layer, a few tokens of decode.
+
+**Cold fill** (end of the load): in priority order (round robin across layers by expert index:
+expert 0 of every layer, then expert 1, ...), the first `C` experts fill the pool (all of them when
+they fit), the next `R` the RAM tier (`inclusive`: RAM first takes a duplicate of every pool
+expert). Nothing else is read after the load unless a decode or prefill call misses.
+
+**Checked in the tests** (`tests/test_expert_tier_policy_.py`): nine micro-scenarios with every
+record, counter and final state; invariants after every call of 200 random configurations x 5,000
+calls; agreement with the policy simulator the defaults were chosen on; the adaptive rule on
+scripted cache lives, exactly.
+
 ### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
 
 | | (a) PRO + RAM for every expert outside VRAM | (b) PRO + 96 GiB RAM tier + SSD | (c) CMP resident + PRO cache + RAM, no expert SSD reads |
