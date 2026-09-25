@@ -12,6 +12,7 @@ test_stable_arithmetic_torch_.py.
 import ast
 import importlib.machinery
 import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -55,6 +56,27 @@ def assignment(path, cls, name, target):
     value = next(n.value for n in ast.walk(fn) if isinstance(n, ast.Assign)
                  and any(isinstance(t, ast.Name) and t.id == target for t in n.targets))
     return compile(ast.Expression(value), str(path), "eval")
+
+
+def module_assignment(path, target):
+    """The value of the module-level assignment `target = ...` of a production file"""
+    tree = ast.parse((ROOT / path).read_text())
+    return next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == target for t in n.targets))
+
+
+def jit_debug_arguments(path):
+    """{name: source of the debug= argument (None without one)} for every @triton.jit kernel"""
+    out = {}
+    for n in ast.parse((ROOT / path).read_text()).body:
+        if not isinstance(n, ast.FunctionDef):
+            continue
+        for d in n.decorator_list:
+            call = d if isinstance(d, ast.Call) else None
+            if ast.unparse(call.func if call else d) == "triton.jit":
+                out[n.name] = next((ast.unparse(k.value) for k in call.keywords if k.arg == "debug"), None) \
+                    if call else None
+    return out
 
 
 class QuantizedLinearTests(unittest.TestCase):
@@ -211,6 +233,53 @@ class DeepseekV41AttentionTests(unittest.TestCase):
                                  rows <= 4 and few_query)
 
 
+class DeepseekV41CompressorTests(unittest.TestCase):
+    PATH = "exllamav3/architecture/dsv41/compressor.py"
+
+    def test_row_local_norm_for_cuda_inputs_only(self):
+        code = condition(self.PATH, None, "rms_norm", "STABLE_ARITHMETIC")
+        for stable in (False, True):
+            for cuda in (False, True):
+                ns = dict(STABLE_ARITHMETIC = stable, x = NS(is_cuda = cuda))
+                self.assertEqual(bool(eval(code, ns)), stable and cuda)
+
+    def test_cpu_reference_unchanged_under_the_profile(self):
+        ns = dict(math = math, torch = torch, _MIN_EPS = 2.0 ** -126, _MAX_EPS = float.fromhex("0x1.fffffep+127"))
+        g = torch.Generator().manual_seed(3)
+        x = torch.randn(37, 512, generator = g) * torch.logspace(-30, 30, 37).unsqueeze(1)
+        w = 1 + torch.randn(512, generator = g) * 0.1
+        results = []
+        for stable in (False, True):
+            ns["STABLE_ARITHMETIC"] = stable
+            rms_norm = method(self.PATH, None, "rms_norm", dict(ns))
+            results.append(rms_norm(x, w, 1e-20))
+        self.assertTrue(torch.equal(*results))
+
+
+class DeepseekV41DebugAssertTests(unittest.TestCase):
+    """
+    The V4.1 Triton kernels compile their device assertions (Triton's debug mode) only with
+    EXL3_DSA_DEBUG_BOUNDS, read at import with the same test as the DSA kernels; a default build
+    compiles them without
+    """
+    FILES = ("exllamav3/modules/dsv41_compress.py",)
+
+    def test_every_kernel_follows_the_variable(self):
+        upstream = ast.unparse(module_assignment("exllamav3/modules/attention_fn/dsa_triton.py",
+                                                 "dsa_debug_bounds"))
+        for path in self.FILES:
+            with self.subTest(path = path):
+                kernels = jit_debug_arguments(path)
+                self.assertTrue(kernels)
+                self.assertEqual(set(kernels.values()), {"DEBUG_ASSERTS"}, kernels)
+                value = module_assignment(path, "DEBUG_ASSERTS")
+                self.assertEqual(ast.unparse(value), upstream)
+                code = compile(ast.Expression(value), path, "eval")
+                for environ, expected in (({}, False), ({"EXL3_DSA_DEBUG_BOUNDS": "0"}, False),
+                                          ({"EXL3_DSA_DEBUG_BOUNDS": "1"}, True)):
+                    self.assertIs(eval(code, dict(os = NS(environ = environ))), expected)
+
+
 def _extension_missing():
     """
     Why the package test cannot run here, or None. It needs the prebuilt extension (importing
@@ -239,11 +308,12 @@ class PackageTests(unittest.TestCase):
             "from exllamav3.modules.quant import exl3, fp16",
             "from exllamav3.model import moe_cpu_host",
             "from exllamav3.modules import dsv4, dsv41, dsv41_block, dsv41_select",
+            "from exllamav3.architecture.dsv41 import compressor",
             "print(mlp.STABLE_ARITHMETIC, block_sparse_mlp.STABLE_ARITHMETIC, block_sparse_mlp.FUSED_PREFILL,",
             "      exl3.STABLE_ARITHMETIC, fp16.HGEMM_FIXED_ROWS, moe_cpu_host.STABLE_ARITHMETIC,",
             "      moe_cpu_host.TUNING.fused_prefill, ext.stable_arithmetic(), ext.hgemm_fixed_rows(),",
             "      dsv4.STABLE_ARITHMETIC, dsv41.STABLE_ARITHMETIC, dsv41_block.STABLE_ARITHMETIC,",
-            "      dsv41_select.STABLE_ARITHMETIC)",
+            "      dsv41_select.STABLE_ARITHMETIC, compressor.STABLE_ARITHMETIC)",
         ])
         names = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL",
                  "EXL3_MOE_FUSED_DET", "EXL3_NO_FUSED_RECONSTRUCT")
@@ -253,7 +323,7 @@ class PackageTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True,
                            cwd = ROOT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 4)
+        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 5)
 
 
 if __name__ == "__main__":

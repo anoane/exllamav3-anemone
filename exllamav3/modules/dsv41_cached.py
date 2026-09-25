@@ -87,7 +87,9 @@ class CompressCarry:
     local to each group and row. CPU regressions compare chunked and one-shot latents
     bitwise (tests/test_dsv41_cached_.py, against compress_reference). GPU reduction order
     can depend on row count; the GPU tests use explicit numerical tolerances rather
-    than assuming bitwise equality for all schedules or input ranges.
+    than assuming bitwise equality for all schedules or input ranges, except under
+    EXL3_STABLE_ARITHMETIC=1, where rms_norm reduces each row alone and chunked latents
+    are bitwise equal (tests/test_dsv41_stable_norm_gpu_.py).
     """
 
     @staticmethod

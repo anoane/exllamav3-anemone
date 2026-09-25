@@ -1106,6 +1106,13 @@ With `1` each operation below takes one arithmetic path at every row count, the 
   row then selects different entries, and decode and prefill of the same tokens diverge. Under the
   profile V4.1's selector calls `dsa_indexer_scores(..., few_query = False)`. (`few_query`
   defaults to `True`, the automatic choice, for every other caller.)
+- DeepSeek-V4.1's KV compressor normalizes each pooled latent (its overflow-safe scaled FP32
+  RMSNorm) with a Triton kernel that reduces every row on its own (`modules/dsv41_compress.py`),
+  in the cached and the stateless compression paths alike. The default torch reduction chooses
+  its strategy from the tensor shape, so a latent normalized in a call of another row count (a
+  different chunk size, or a group closed by a decode step) can differ in the last bit (up to
+  1.2e-7 was measured on real latents). Pooling and the carry of open groups are unchanged, and
+  CPU tensors keep the torch path.
 
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported. It
 may be combined with `EXL3_HGEMM_FIXED_ROWS` and `EXL3_MOE_FUSED_PREFILL` left unset or set to
@@ -1134,7 +1141,18 @@ Refused, as an error rather than a partial profile:
 - when a Cache is built, a quantized DeepSeek-V4.1 Cache (`-cq`): its cached attention stages the
   packed pool back to FP16 for calls of 64 or more query rows and reads it packed, in the rotated
   domain, below that, so decode and short chunks would round other quantities than long prefill
-  chunks. The profile covers DeepSeek-V4.1 with an FP16 Cache.
+  chunks. The profile covers DeepSeek-V4.1 with an FP16 Cache;
+- with `EXL3_DSA_DEBUG_BOUNDS=1` only, during a DeepSeek-V4.1 forward, a nonfinite compressor
+  projection, norm weight or normalized latent. That variable, the debug switch of the DSA kernels
+  (below, read once at import), also compiles the row-local kernels in Triton's debug mode, so
+  such a value stops the kernel with a CUDA device-side assertion instead of reaching the cache.
+  A device-side assertion leaves the CUDA context of the process unusable: every later CUDA call
+  fails, and the process has to be restarted. Debug mode also compiles int32-overflow checks into
+  the kernels' address arithmetic (redundant with the host-side int32 guards) and makes the
+  kernels larger. Without the variable (the default) the kernels are compiled without any of
+  that, like every other kernel of a default build, and do not check their operands, as the
+  torch path does not either: a nonfinite value is not detected. Set it for validation runs that
+  must stop at the first nonfinite latent.
 
 What it does not cover: operations not listed above keep their row-count-dependent dispatch,
 among them the attention kernels of most architectures (prefill and decode kernels differ); the
@@ -2114,6 +2132,14 @@ kernel with the kernel name, source line and bad index instead of corrupting mem
 faulting asynchronously downstream. Debug tool for paged-pool issues; significant JIT
 overhead (forces Triton debug mode globally), leave unset in production. AOT/BC graph
 kernels are unaffected (compiled with asserts off).
+
+DeepSeek-V4.1's own Triton kernels follow the same variable, read once when their module is
+imported: with `1` they are compiled in Triton's debug mode, so their device assertions are live
+and a nonfinite operand or result stops the kernel with a CUDA device-side assertion (which
+leaves the process's CUDA context unusable; restart the process). These are the row-local
+compressor RMSNorm of `EXL3_STABLE_ARITHMETIC` (`modules/dsv41_compress.py`, checking the
+projection, the norm weight and the normalized latent). Unset or `0` (the default), they are
+compiled without assertions, like the DSA kernels, and do not check their operands.
 
 ## Quantization
 

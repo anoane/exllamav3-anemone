@@ -17,15 +17,26 @@ from dsv41_ref import load_package_file, skip
 from dsv41_ref import deepseek
 
 
+_P = "dsv41cstub"
+
+
+def _load_compressor():
+    """Load the compressor math into a stand-in package, with the real torch-only files it and
+    the cached helpers import (the arithmetic policy, the device copy), without CUDA imports."""
+    for n in (_P, f"{_P}.model", f"{_P}.modules", f"{_P}.util", f"{_P}.architecture",
+              f"{_P}.architecture.dsv41"):
+        if n not in sys.modules:
+            m = types.ModuleType(n); m.__path__ = []; sys.modules[n] = m
+    c = types.ModuleType(f"{_P}.constants"); c.PAGE_SIZE = 256; sys.modules[c.__name__] = c
+    load_package_file("exllamav3/model/math_policy.py", f"{_P}.model.math_policy")
+    load_package_file("exllamav3/util/device_copy.py", f"{_P}.util.device_copy")
+    return load_package_file("exllamav3/architecture/dsv41/compressor.py", f"{_P}.architecture.dsv41.compressor")
+
+
 def _load_cached_helpers():
-    """Load the cached helpers and their real CPU-safe copy dependency without CUDA imports."""
-    P = "dsv41cstub"
-    for n in (P, f"{P}.modules", f"{P}.util", f"{P}.architecture", f"{P}.architecture.dsv41"):
-        m = types.ModuleType(n); m.__path__ = []; sys.modules[n] = m
-    c = types.ModuleType(f"{P}.constants"); c.PAGE_SIZE = 256; sys.modules[c.__name__] = c
-    load_package_file("exllamav3/util/device_copy.py", f"{P}.util.device_copy")
-    load_package_file("exllamav3/architecture/dsv41/compressor.py", f"{P}.architecture.dsv41.compressor")
-    return load_package_file("exllamav3/modules/dsv41_cached.py", f"{P}.modules.dsv41_cached", f"{P}.modules")
+    """Load the cached helpers (modules/dsv41_cached.py) next to the compressor math."""
+    _load_compressor()
+    return load_package_file("exllamav3/modules/dsv41_cached.py", f"{_P}.modules.dsv41_cached", f"{_P}.modules")
 
 
 def check_carry_ring(cp):
@@ -131,9 +142,6 @@ def check_vs_deepseek(cp):
               f"DeepSeek Compressor (rel {max(es):.1e}; compress_chunk and CompressCarry bitwise equal), "
               f"index K == DeepSeek Indexer (rel {ek:.1e})")
 
-def _compressor():
-    return load_package_file("exllamav3/architecture/dsv41/compressor.py", "_dsv41_compressor")
-
 
 def check_port(cp):
     """The port alone: rate 1's gate cancels, chunked rate-2 pooling equals one shot, the
@@ -193,7 +201,7 @@ def check_port(cp):
 
 def test_compressor():
     """pytest entry point: the port checks and the carry ring, no reference code."""
-    cp = _compressor()
+    cp = _load_compressor()
     check_port(cp)
     check_carry_ring(cp)
 
@@ -203,7 +211,7 @@ def test_compressor_vs_deepseek():
     if deepseek.ref_dir() is None:
         import pytest
         pytest.skip("compressor vs DeepSeek Compressor: DSV41_DEEPSEEK_REF not set")
-    check_vs_deepseek(_compressor())
+    check_vs_deepseek(_load_compressor())
 
 
 def main():
@@ -211,7 +219,7 @@ def main():
     if deepseek.ref_dir() is None:
         skip("compressor vs DeepSeek Compressor", "DSV41_DEEPSEEK_REF not set")
     else:
-        check_vs_deepseek(_compressor())
+        check_vs_deepseek(_load_compressor())
 
 
 if __name__ == "__main__":

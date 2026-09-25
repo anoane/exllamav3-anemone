@@ -47,6 +47,8 @@ import math
 
 import torch
 
+from ...model.math_policy import STABLE_ARITHMETIC
+
 _MIN_EPS = 2.0 ** -126
 _MAX_EPS = float.fromhex("0x1.fffffep+127")
 
@@ -63,11 +65,18 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     The mean is a torch reduction. On the CPU a row's result does not depend on how many
     rows share the call; on a GPU the reduction strategy follows the row count, so the same
     latent normalised in chunks of different sizes agrees to about 1e-6 (3e-7 relative
-    measured), not bitwise.
+    measured), not bitwise. Under EXL3_STABLE_ARITHMETIC=1 a CUDA input goes to
+    modules/dsv41_compress.py instead, the same formula with one fixed reduction per row, so
+    the cached and the stateless compression paths normalise a latent identically whatever
+    the row count of the call. The CPU path is the same in both cases.
     """
     if not math.isfinite(eps) or not _MIN_EPS <= eps <= _MAX_EPS:
         raise ValueError("compressor RMSNorm requires epsilon in the positive normal FP32 range")
     x = x.float()
+    if STABLE_ARITHMETIC and x.is_cuda:
+        # imported here so this module, which the CPU reference tests load, never needs Triton
+        from ...modules.dsv41_compress import rms_norm_rows
+        return rms_norm_rows(x, weight, eps)
     scale = x.abs().amax(dim = -1, keepdim = True).clamp_min(math.sqrt(eps))
     scaled = x / scale
     eps_scaled = math.sqrt(eps) / scale
@@ -90,7 +99,8 @@ def group_pool(kv: torch.Tensor, score: torch.Tensor) -> torch.Tensor:
     which is what makes ``tests/test_dsv41_compressor_.py`` a gate rather than
     a tolerance check. On a GPU the pooling stays elementwise, but the latent's
     RMSNorm (rms_norm) reduces by row count, so chunked and one-shot latents
-    agree to about 1e-6 there.
+    agree to about 1e-6 there (bitwise under EXL3_STABLE_ARITHMETIC=1, see
+    rms_norm).
     """
     mx = score.amax(dim = 1, keepdim = True)
     e = (score - mx).exp()

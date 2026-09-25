@@ -28,10 +28,11 @@ def load_file(name, relative):
 def compressor_class():
     # Execute the actual constructor/forward without importing CUDA module plumbing.
     package = "precision_stub"
-    for suffix in ("", ".modules", ".architecture", ".architecture.dsv41"):
+    for suffix in ("", ".model", ".modules", ".architecture", ".architecture.dsv41"):
         module = types.ModuleType(package + suffix)
         module.__path__ = []
         sys.modules[module.__name__] = module
+    load_file(package + ".model.math_policy", "exllamav3/model/math_policy.py")
     math = load_file(package + ".architecture.dsv41.compressor",
                      "exllamav3/architecture/dsv41/compressor.py")
 
