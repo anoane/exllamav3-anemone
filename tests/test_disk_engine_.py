@@ -11,10 +11,13 @@ scratch files on a chosen file system (O_DIRECT needs a real one; tmpfs may refu
     EXL3_DISK_TEST_MINI=1 EXL3_DISK_TEST_DIR=/path/on/ext4 python -m pytest tests/test_disk_engine_.py
 """
 
+import gc
 import os
 import subprocess
 import sys
 import threading
+import time
+import weakref
 
 import numpy as np
 import pytest
@@ -351,3 +354,195 @@ def test_knob_routing(data):
     assert r.returncode != 0 and "EXL3_DISK_BACKEND=uring" in r.stderr
     r = _run(code, {"EXL3_DISK_BACKEND": "pread", "EXL3_DISK_WINDOW_PREFETCH": "1M/2M"})
     assert r.returncode != 0 and "EXL3_DISK_WINDOW_PREFETCH" in r.stderr
+
+
+@pytest.mark.parametrize("cfg", [{"backend": "pread", "fault_delay_us": 2000},
+                                 {"backend": "io_uring", "direct": "all"}],
+                         ids = ["pread", "io_uring"])
+def test_ticket_wait_release_threads(ext, data, cfg):
+    """DiskTicket.wait() on one Python thread while another releases (or drops) the ticket: the
+    wait returns or raises "released", nothing is used after it was freed, nothing hangs."""
+    path, fd, buf = data
+    ext.disk_engine_configure(cfg)
+    slot = 9 << 20
+    errors = []
+    for i in range(24):
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        dst = aligned_u8(slot)
+        t = ext.disk_read_extents(torch.tensor([fd]), torch.tensor([4096 * (i + 1) + 5]),
+                                  torch.tensor([8 << 20]), dst, torch.tensor([0]), slot, cls = 1)
+        go = threading.Event()
+
+        def waiter():
+            go.wait()
+            try:
+                t.wait(timeout = 60)
+            except RuntimeError as e:
+                if "released" not in str(e) and "cancelled" not in str(e):
+                    errors.append(repr(e))
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        def releaser():
+            go.wait()
+            t.release()
+
+        ws = [threading.Thread(target = waiter) for _ in range(1 + i % 3)]
+        rs = [threading.Thread(target = releaser) for _ in range(1 + (i % 2))]
+        for x in ws + rs: x.start()
+        go.set()
+        for x in ws + rs: x.join(timeout = 120)
+        assert not any(x.is_alive() for x in ws + rs), "a wait or release hung"
+        with pytest.raises(RuntimeError, match = "released"):
+            t.done()
+        del t, dst
+    assert not errors, errors
+    s = ext.disk_stats()
+    assert s["tickets_live"] == 0 and s["inflight_now"] == 0
+
+
+def test_sync_calls_use_the_synchronous_path(ext, data):
+    """wait=True runs the engine's synchronous path: with io_uring a class-0 caller submits its
+    own reads before the call's submission returns, and reaps their completions itself (no
+    reaper hand-off).
+
+    Both checks hold on a loaded host. Submission is checked by order, not by time: a call
+    counts when its first read was issued (trace) before its submission returned
+    (disk_profile), which only the caller can do; the asynchronous hand-off (wait=False, then
+    wait()) is the control, where the reaper issues the reads after the submission returned.
+    Reaping is checked with the caller and the engine's threads on two different CPUs: on a
+    shared CPU the reaper, which the ring wakes as the caller's reads complete, can preempt the
+    caller under load and drain the completions first (it took 22 % of them on a busy host),
+    which says nothing about the path the call took."""
+    path, fd, buf = data
+    own_cpus = os.sched_getaffinity(0)
+    cpus = sorted(own_cpus)
+    pin = len(cpus) >= 2
+    cfg = {"backend": "io_uring", "trace": 8192}
+    if pin:
+        cfg["affinity"] = str(cpus[-1])             # the engine's threads
+    ext.disk_engine_configure(cfg)
+    try:
+        if pin:
+            os.sched_setaffinity(0, {cpus[0]})     # this thread only
+        w_base, s_base = 664, 30 * (1 << 20) + 2712
+        rng = np.random.default_rng(3)
+        uids = np.unique(rng.integers(0, 3000, size = 48)).astype(np.int64)
+        u = torch.from_numpy(uids)
+        w = torch.zeros((len(uids), 256), dtype = torch.uint8)
+        s = torch.zeros((len(uids), 8), dtype = torch.uint8)
+        fds, offs, rbs, outs = [fd, fd], [w_base, s_base], [256, 8], [w, s]
+        ext.disk_gather_rows(u, 0, fds, offs, rbs, outs)       # both tables in the page cache
+
+        def calls(wait):
+            """50 class-0 calls; returns how many issued their first read before the submission
+            returned, and the engine's stats over the 50"""
+            ext.disk_trace(clear = True)
+            ext.disk_stats(reset = True)
+            t_sub = []
+            ext.disk_profile(True)
+            try:
+                for _ in range(50):
+                    t = ext.disk_gather_rows(u, 0, fds, offs, rbs, outs, 0, False, wait)
+                    t_sub.append(ext.disk_profile_last()[1])
+                    if t is not None:
+                        t.wait(timeout = 60)
+                        t.release()
+            finally:
+                ext.disk_profile(False)
+            st = ext.disk_stats()
+            tr = ext.disk_trace(clear = True).numpy()
+            ids = np.unique(tr[:, 0])                  # ascending: one ticket per call, in order
+            assert len(ids) == 50, len(ids)
+            early = sum(int(tr[tr[:, 0] == k, 6].min() <= ts) for k, ts in zip(ids, t_sub))
+            return early, st
+
+        early, st = calls(True)
+        assert np.array_equal(w.numpy(), ref_rows(buf, w_base, 256, uids))
+        assert np.array_equal(s.numpy(), ref_rows(buf, s_base, 8, uids))
+        assert early >= 38, f"only {early} of 50 synchronous calls issued their reads themselves"
+        if not pin:
+            pytest.skip("one CPU: the reaper shares the caller's CPU (submission checked only)")
+        assert st["inline_reaped"] > 0
+        assert st["reaper_reaped"] <= st["inline_reaped"] // 4, st
+        early, _ = calls(False)
+        assert early <= 25, f"control: {early} of 50 handed-off calls had a read issued before " \
+                            "the submission returned"
+    finally:
+        os.sched_setaffinity(0, own_cpus)
+        ext.disk_engine_shutdown()
+
+
+def test_registered_buffer_follows_its_engine(ext, data):
+    """A registered tensor is dropped once its engine is gone (configure / shutdown), not kept
+    until some unrelated unregister call."""
+    path, fd, buf = data
+    ext.disk_engine_configure({"backend": "io_uring"})
+    arena = aligned_u8(16 << 20)
+    idx = ext.disk_register_buffer(arena)
+    if idx < 0:
+        pytest.skip("registered buffers unavailable")
+    ref = weakref.ref(arena)
+    ext.disk_engine_configure({"backend": "io_uring"})     # the old engine is gone
+    del arena
+    gc.collect()
+    assert ref() is None, "the registered tensor outlived its engine"
+    with pytest.raises(RuntimeError, match = "no registered buffer"):
+        ext.disk_unregister_buffer(idx)
+    arena = aligned_u8(16 << 20)
+    idx = ext.disk_register_buffer(arena)
+    ref = weakref.ref(arena)
+    ext.disk_engine_shutdown()
+    del arena
+    gc.collect()
+    assert ref() is None, "the registered tensor outlived shutdown"
+
+
+def test_forget(ext, data, tmp_path_factory):
+    """disk_engine_forget closes the engine's descriptors of a file; an unlinked file is closed
+    once idle; a later read reopens."""
+    path, fd, buf = data
+    ext.disk_engine_configure({"backend": "io_uring"})
+    d = os.environ.get("EXL3_DISK_TEST_DIR") or str(tmp_path_factory.mktemp("disk_forget"))
+    p2 = os.path.join(d, "disk_engine_forget.bin")
+    np.random.default_rng(9).integers(0, 256, size = 1 << 20, dtype = np.uint8).tofile(p2)
+    real = os.path.realpath(p2)
+
+    def engine_fds():
+        n = 0
+        for x in os.listdir("/proc/self/fd"):
+            try:
+                if os.readlink(f"/proc/self/fd/{x}").startswith(real):
+                    n += 1
+            except OSError:
+                pass
+        return n
+
+    f2 = os.open(p2, os.O_RDONLY)
+    u = torch.tensor([1, 2, 3], dtype = torch.long)
+    out = torch.zeros((3, 256), dtype = torch.uint8)
+    ext.disk_gather_rows(u, 0, [f2], [0], [256], [out])
+    assert engine_fds() == 2                        # ours and the engine's
+    assert ext.disk_engine_forget(p2) == 1
+    assert engine_fds() == 1
+    assert ext.disk_engine_forget(p2) == 0
+    ext.disk_gather_rows(u, 0, [f2], [0], [256], [out])     # reopened
+    os.close(f2)
+    os.unlink(p2)
+    for _ in range(200):                            # the engine notices the unlink on its own
+        ext.disk_gather_rows(u, 0, [fd], [0], [256], [out])
+    assert engine_fds() == 0, "an unlinked file is still held open by the engine"
+    assert ext.disk_engine_forget(os.path.join(d, "no_such_file")) == 0
+
+
+def test_hold_class_and_zero_window(ext, data):
+    path, fd, buf = data
+    ext.disk_engine_configure({"backend": "io_uring"})
+    u = torch.tensor([1], dtype = torch.long)
+    out = torch.zeros((1, 256), dtype = torch.uint8)
+    with pytest.raises(RuntimeError, match = "hold"):
+        ext.disk_gather_rows(u, 0, [fd], [0], [256], [out], cls = 2, hold = True)
+    ext.disk_gather_rows(u, 0, [fd], [0], [256], [out], cls = 1, hold = True)
+    for k in ("window_expert", "window_prefetch", "window_refill"):
+        with pytest.raises(RuntimeError, match = k.upper()):
+            ext.disk_engine_configure({"backend": "io_uring", k: "0"})

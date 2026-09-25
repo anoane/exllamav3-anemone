@@ -29,6 +29,7 @@ m.def("disk_engine_info", &disk_engine_info, "disk_engine_info");
 m.def("disk_engine_configure", &disk_engine_configure, "disk_engine_configure",
       py::arg("overrides"));
 m.def("disk_engine_shutdown", &disk_engine_shutdown, "disk_engine_shutdown");
+m.def("disk_engine_forget", &disk_engine_forget, "disk_engine_forget", py::arg("path"));
 m.def("disk_set_thread_class", &disk_set_thread_class, "disk_set_thread_class", py::arg("cls"));
 m.def("disk_ngram_route", &disk_ngram_route, "disk_ngram_route");
 m.def("disk_register_buffer", &disk_register_buffer, "disk_register_buffer", py::arg("t"));

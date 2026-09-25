@@ -8,8 +8,15 @@ side stamps its own entry and exit (ext.disk_profile), on the same clock as time
     python tests/disk_engine/bench_engine.py --file SHARD --no-cold      (maintenance window)
 
 Patterns (one Python call each, as the model makes them):
-  engram U     one DeepSeek-V4.1 engram layer: U unique rows of a 256-byte table and of an 8-byte
-               table in one disk_gather_rows call (U = 48 decode, 96, 8192 prefill-sized)
+  engram U     one DeepSeek-V4.1 engram layer exactly as DSV41Engram._stage calls it: U unique
+               rows of a 256-byte table and of an 8-byte table in one disk_gather_rows call, the
+               argument lists built once, class and hold positional (U = 48 decode, 96, 8192)
+  keywords U   the same with cls= / hold= keywords and the lists built per call (pybind's
+               keyword path; what the model did before)
+  sync-cls2 U  a synchronous class-2 gather (how the look-ahead used to stage)
+  prefetch U   the prefill look-ahead: a class-2 ticket (wait=False), after --overlap-ms of
+               simulated compute promoted to class 0, waited for and released; stall is the
+               time the forward waits after the overlap
   original U   the same rows through the original path: two ngram_gather_cpu calls
   extents k    k expert extents of 13,315,596 bytes in one disk_read_extents call
   null         an empty gather: the fixed cost of a call
@@ -111,6 +118,7 @@ class Bench:
         w = torch.empty((U, 256), dtype = torch.uint8)
         s = torch.empty((U, 8), dtype = torch.uint8)
         fds, bases, rbs, outs = [fd, fd], [self.w_base, self.s_base], [256, 8], [w, s]
+        hold = U < 256
 
         def prep():
             u = np.unique(self.rng.integers(0, self.rows, size = U)).astype(np.int64)
@@ -118,9 +126,20 @@ class Bench:
 
         if mode == "engine":
             def call(u):
-                # what DSV41Engram does: the whole staging set, argument lists built once per set
-                ext.disk_gather_rows(u, 0, fds, bases, rbs, outs)
+                # what DSV41Engram._stage does: the whole staging set, lists built once per
+                # descriptor pair, class and hold positional
+                ext.disk_gather_rows(u, 0, fds, bases, rbs, outs, 0, hold)
             label = f"engram U={U}"
+        elif mode == "sync2":
+            def call(u):
+                # a synchronous class-2 gather (the prefill look-ahead before it was promoted)
+                ext.disk_gather_rows(u, 0, fds, bases, rbs, outs, 2, False)
+            label = f"sync-cls2 U={U}"
+        elif mode == "keywords":
+            def call(u):
+                ext.disk_gather_rows(u, 0, [fd, fd], [self.w_base, self.s_base], [256, 8], [w, s],
+                                     cls = 0, hold = hold)
+            label = f"keywords U={U}"
         elif mode == "sliced":
             def call(u):
                 n = u.numel()
@@ -129,6 +148,11 @@ class Bench:
                                      [w[:n], s[:n]])
             label = f"sliced U={U}"
         else:
+            # as DSV41Engram._fds() prepares the original path: no readahead around the rows
+            # (on a small scratch file, readahead would fetch neighbouring rows the real table
+            # never has)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+
             def call(u):
                 n = u.numel()
                 ext.ngram_gather_cpu(fd, self.w_base, 256, u, 0, w[:n])
@@ -136,6 +160,32 @@ class Bench:
             label = f"original U={U}"
         iters = self.iters if U < 4096 else max(5, self.iters // 20)
         return self.run(label, prep, call, U, iters)
+
+    def prefetch(self, U, overlap_ms):
+        """The prefill look-ahead as DSV41Engram stages it: class 2, not waited for; after the
+        overlap the forward promotes it to class 0, waits, releases."""
+        ext, fd = self.ext, self.fd
+        w = torch.empty((U, 256), dtype = torch.uint8)
+        s = torch.empty((U, 8), dtype = torch.uint8)
+        fds, bases, rbs, outs = [fd, fd], [self.w_base, self.s_base], [256, 8], [w, s]
+        iters = max(5, self.iters // 20)
+        wall, stall = [], []
+        for _ in range(iters):
+            u = torch.from_numpy(np.unique(self.rng.integers(0, self.rows, size = U)).astype(np.int64))
+            self.drop()
+            t0 = time.monotonic_ns()
+            t = ext.disk_gather_rows(u, 0, fds, bases, rbs, outs, 2, False, False)
+            if overlap_ms:
+                time.sleep(overlap_ms / 1e3)
+            t1 = time.monotonic_ns()
+            t.promote(0)
+            t.wait()
+            t.release()
+            t2 = time.monotonic_ns()
+            wall.append(t2 - t0)
+            stall.append(t2 - t1)
+        return {"case": f"prefetch U={U} +{overlap_ms:g}ms", "calls": iters, "wall_us": pct(wall),
+                "stall_us": pct(stall), "throughput": U * iters / (sum(wall) / 1e9)}
 
     def extents(self, k, L = 13315596):
         ext, fd = self.ext, self.fd
@@ -170,6 +220,11 @@ def fmt(r):
     def g(k, f = "p50"):
         return r.get(k, {}).get(f, float("nan"))
     unit = r.get("throughput_unit", "/s")
+    if "stall_us" in r:
+        return (f"  {r['case']:<22} wall p50 {g('wall_us'):9.1f} p90 {g('wall_us', 'p90'):9.1f} "
+                f"p99 {g('wall_us', 'p99'):9.1f} us | stall after the overlap p50 "
+                f"{g('stall_us'):9.1f} p90 {g('stall_us', 'p90'):9.1f} p99 "
+                f"{g('stall_us', 'p99'):9.1f} us | {r['throughput']:.4g} {unit}")
     return (f"  {r['case']:<16} wall p50 {g('wall_us'):9.1f} p90 {g('wall_us', 'p90'):9.1f} "
             f"p99 {g('wall_us', 'p99'):9.1f} p99.9 {g('wall_us', 'p99.9'):9.1f} us | "
             f"python {g('python_us'):5.1f} (in {g('python_in_us'):4.1f} out "
@@ -188,6 +243,10 @@ def main():
     ap.add_argument("--cold", action = "store_true")
     ap.add_argument("--backends", default = "pread,odirect,io_uring,io_uring:all")
     ap.add_argument("--extent-gb", type = float, default = 0.4, help = "bytes read per extent case")
+    ap.add_argument("--overlap-ms", type = float, default = 20.0,
+                    help = "simulated compute between a prefetch and its forward")
+    ap.add_argument("--only", default = "",
+                    help = "comma-separated case prefixes to run (e.g. 'engram U=8192,original')")
     ap.add_argument("--json")
     a = ap.parse_args()
     assert bool(a.file) != bool(a.scratch), "one of --file or --scratch"
@@ -218,16 +277,23 @@ def main():
             print(f"-- {spec}: {info['describe']}")
             b = Bench(ext, path, size, a.cold, a.iters, a.extent_gb)
             b.warm()
-            rs = [b.null()]
-            for U in (48, 96, 8192):
-                rs.append(b.engram(U))
-            rs.append(b.engram(48, mode = "sliced"))
-            for k in (1, 2, 4, 8):
-                rs.append(b.extents(k))
-            if name == "pread" and not direct:
+            only = [x.strip() for x in a.only.split(",") if x.strip()]
+            want = lambda label: not only or any(label.startswith(x) for x in only)
+            cases = [("null", b.null)]
+            cases += [(f"engram U={U}", lambda U = U: b.engram(U)) for U in (48, 96, 8192, 32768)]
+            cases += [("keywords U=48", lambda: b.engram(48, mode = "keywords")),
+                      ("sliced U=48", lambda: b.engram(48, mode = "sliced"))]
+            for U in (8192, 32768):
+                cases += [(f"sync-cls2 U={U}", lambda U = U: b.engram(U, mode = "sync2")),
+                          (f"prefetch U={U} +0ms", lambda U = U: b.prefetch(U, 0)),
+                          (f"prefetch U={U} +{a.overlap_ms:g}ms", lambda U = U: b.prefetch(U, a.overlap_ms))]
+            cases += [(f"extents k={k}", lambda k = k: b.extents(k)) for k in (1, 2, 4, 8)]
+            rs = [f() for label, f in cases if want(label)]
+            originals = [U for U in (48, 96, 8192, 32768) if want(f"original U={U}")]
+            if name == "pread" and not direct and originals:
                 ext.disk_engine_configure({"backend": "auto"})
                 b.warm()
-                for U in (48, 96, 8192):
+                for U in originals:
                     rs.append(b.engram(U, mode = "original"))
             for r in rs:
                 r["backend"] = spec

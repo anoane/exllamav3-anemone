@@ -11,6 +11,10 @@
 #include <cstring>
 #include <mutex>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 using exl3_disk::Engine;
 using exl3_disk::Error;
 
@@ -90,6 +94,43 @@ struct RegBuf
 std::mutex g_reg_mx;
 std::vector<RegBuf>* g_reg = new std::vector<RegBuf>();     // leaked: tensors outlive exit
 
+void install_reg_fork_handler()
+{
+#if defined(__linux__)
+    // a forked child must not inherit g_reg_mx locked by a thread it does not have
+    static std::once_flag once;
+    std::call_once(once, []
+    {
+        (void) pthread_atfork(+[] { g_reg_mx.lock(); }, +[] { g_reg_mx.unlock(); },
+                              +[] { g_reg_mx.unlock(); });
+    });
+#endif
+}
+
+// Entries whose engine is gone (replaced by disk_engine_configure, shut down, or released by
+// its last ticket): its ring was closed, so the kernel no longer holds their pages. Returns
+// the tensors, to be dropped by the caller with the GIL held and g_reg_mx released (a tensor's
+// deleter may need Python)
+std::vector<at::Tensor> prune_registered_locked()
+{
+    std::vector<at::Tensor> drop;
+    auto keep_end = std::stable_partition(g_reg->begin(), g_reg->end(),
+                                          [](const RegBuf& b) { return !b.eng.expired(); });
+    for (auto it = keep_end; it != g_reg->end(); ++it) drop.push_back(std::move(it->t));
+    g_reg->erase(keep_end, g_reg->end());
+    return drop;
+}
+
+void prune_registered()
+{
+    install_reg_fork_handler();
+    std::vector<at::Tensor> drop;
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mx);
+        drop = prune_registered_locked();
+    }
+}
+
 bool finalizing()
 {
 #if PY_VERSION_HEX >= 0x030D0000
@@ -136,10 +177,20 @@ void DiskTicket::wait(py::object timeout)
         TORCH_CHECK(s >= 0.0 && s < 1e9, "disk engine: bad timeout");
         tns = (int64_t) (s * 1e9);
     }
+    // Another Python thread may release this ticket (or drop it) while this one waits without
+    // the GIL: wait on an engine reference of our own. The engine keeps the ticket alive until
+    // this wait returns; a release that finished first makes the ticket unknown
+    std::shared_ptr<Engine> eng = eng_;
     int r = 0;
+    try
     {
         py::gil_scoped_release nogil;
-        r = eng_->wait(id_, tns);
+        r = eng->wait(id_, tns);
+    }
+    catch (const Error& e)
+    {
+        if (e.code() == ENOENT) throw std::runtime_error("disk engine: ticket already released");
+        throw;
     }
     if (r == -ETIMEDOUT) raise_timeout("disk engine: ticket not complete after the timeout");
     if (r == -ECANCELED) throw std::runtime_error("disk engine: ticket was cancelled");
@@ -254,18 +305,22 @@ std::unique_ptr<DiskTicket> disk_gather_rows
     {
         py::gil_scoped_release nogil;
         eng = exl3_disk::default_engine();
-        id = eng->submit_rows(up, n, uid_base, tabs.data(), (int) nt, o);
-        stamp(1);
         if (wait)
         {
-            struct Rel
+            // the engine's synchronous path: page-cache prepass (pools), inline submission
+            // (io_uring, class 0), release included
+            int64_t t_sub = 0;
+            r = eng->gather_rows(up, n, uid_base, tabs.data(), (int) nt, o, &t_sub);
+            if (t_prof)
             {
-                Engine* e;
-                uint64_t id;
-                ~Rel() { e->release(id); }
-            } rel { eng.get(), id };
-            r = eng->wait(id, -1);
-            stamp(2);
+                t_times[1] = t_sub;
+                t_times[2] = mono_ns();
+            }
+        }
+        else
+        {
+            id = eng->submit_rows(up, n, uid_base, tabs.data(), (int) nt, o);
+            stamp(1);
         }
     }
     if (wait)
@@ -340,18 +395,20 @@ std::unique_ptr<DiskTicket> disk_read_extents
     {
         py::gil_scoped_release nogil;
         eng = exl3_disk::default_engine();
-        id = eng->submit_extents(ex.data(), n, o, pay);
-        stamp(1);
         if (wait)
         {
-            struct Rel
+            int64_t t_sub = 0;
+            r = eng->read_extents(ex.data(), n, o, pay, &t_sub);
+            if (t_prof)
             {
-                Engine* e;
-                uint64_t id;
-                ~Rel() { e->release(id); }
-            } rel { eng.get(), id };
-            r = eng->wait(id, -1);
-            stamp(2);
+                t_times[1] = t_sub;
+                t_times[2] = mono_ns();
+            }
+        }
+        else
+        {
+            id = eng->submit_extents(ex.data(), n, o, pay);
+            stamp(1);
         }
     }
     if (wait)
@@ -478,13 +535,25 @@ py::dict disk_engine_configure(const py::dict& overrides)
         py::gil_scoped_release nogil;
         eng = exl3_disk::configure_default(ov);
     }
+    prune_registered();         // buffers of the replaced engine, if it is gone
     return info_of(eng);
 }
 
 void disk_engine_shutdown()
 {
+    {
+        py::gil_scoped_release nogil;
+        exl3_disk::shutdown_default();
+    }
+    prune_registered();
+}
+
+int64_t disk_engine_forget(const std::string& path)
+{
+    std::shared_ptr<Engine> eng = exl3_disk::default_engine_if_created();
+    if (!eng) return 0;                     // no engine: nothing of the file is open
     py::gil_scoped_release nogil;
-    exl3_disk::shutdown_default();
+    return eng->forget_path(path);
 }
 
 int64_t disk_set_thread_class(int64_t cls)
@@ -501,6 +570,7 @@ std::string disk_ngram_route()
 int64_t disk_register_buffer(const at::Tensor& t)
 {
     check_cpu_bytes(t, "the buffer");
+    prune_registered();
     std::shared_ptr<Engine> eng = exl3_disk::default_engine();
     int idx = eng->register_buffer(t.data_ptr(), (size_t) (t.numel() * (int64_t) t.element_size()));
     if (idx < 0) return -1;
@@ -511,14 +581,13 @@ int64_t disk_register_buffer(const at::Tensor& t)
 
 void disk_unregister_buffer(int64_t idx)
 {
+    install_reg_fork_handler();
     std::shared_ptr<Engine> eng = exl3_disk::default_engine();
     at::Tensor keep;
+    std::vector<at::Tensor> drop;           // dropped after g_reg_mx, with the GIL held
     {
         std::lock_guard<std::mutex> lk(g_reg_mx);
-        // entries of engines that are gone: their rings released the pages
-        g_reg->erase(std::remove_if(g_reg->begin(), g_reg->end(),
-                                    [](const RegBuf& b) { return b.eng.expired(); }),
-                     g_reg->end());
+        drop = prune_registered_locked();
         auto it = std::find_if(g_reg->begin(), g_reg->end(), [&](const RegBuf& b)
                                { return b.idx == idx && b.eng.lock() == eng; });
         TORCH_CHECK(it != g_reg->end(), "disk engine: no registered buffer ", idx);

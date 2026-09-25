@@ -85,6 +85,7 @@ py::dict disk_stats(bool reset);
 py::dict disk_engine_info();
 py::dict disk_engine_configure(const py::dict& overrides);
 void disk_engine_shutdown();
+int64_t disk_engine_forget(const std::string& path);   // 1 closed, 0 not open, -1 closed once idle
 int64_t disk_set_thread_class(int64_t cls);
 std::string disk_ngram_route();
 int64_t disk_register_buffer(const at::Tensor& t);
