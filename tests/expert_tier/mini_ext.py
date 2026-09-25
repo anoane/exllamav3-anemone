@@ -6,6 +6,9 @@ own (exllamav3_ext/tier, exllamav3_ext/disk); only the module definition differs
 
     from tests.expert_tier.mini_ext import load_ext
     ext = load_ext()                       # EXL3_TIER_MINI_BUILD_DIR sets the build directory
+
+It carries the disk engine's bindings too (its own copy of the engine), so a test process loads either
+this one or tests/disk_engine's (EXL3_DISK_TEST_MINI), never both: pybind11 registers a type once.
 """
 
 import glob

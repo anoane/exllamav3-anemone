@@ -87,6 +87,9 @@ SETTINGS = (
             help = "refill reads in flight at most; further candidates are dropped, not queued"),
     Setting("EXL3_MOE_TIER_DISK_SLAB", "disk_slab", None, "slots", 1, 4096,
             help = "pinned slots for SSD reads that bypass the RAM tier; auto = 8 + the prefill read-ahead"),
+    Setting("EXL3_MOE_TIER_HUGEPAGE", "hugepage", False, "bool",
+            help = "transparent huge pages for the RAM tier and the disk slab (off: faulting 2 MiB pages in "
+                   "can stall for seconds when the page cache is large)"),
     Setting("EXL3_MOE_TIER_HEADROOM_MB", "headroom_mb", 1024, "int", 0, 1 << 20,
             help = "VRAM (MiB) left free on each GPU after its expert cache"),
     Setting("EXL3_MOE_TIER_MIN_LINK_GBS", "min_link_gbs", 2.0, "float", 0.0, 1e6,
@@ -164,6 +167,7 @@ class TierConfig:
     refill: bool = True
     refill_inflight: int = 2
     disk_slab: int | None = None
+    hugepage: bool = False
     headroom_mb: int = 1024
     min_link_gbs: float = 2.0
     spin_us: int = -1

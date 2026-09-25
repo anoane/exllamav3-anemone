@@ -1744,6 +1744,14 @@ RAM tier does not admit, and the prefill read-ahead. `auto` = 8 plus what the re
 a number (1-4096) fixes it. Counted in the load's host-memory check (`disk slab=` in its
 message). None with `disk experts=off`.
 
+### `EXL3_MOE_TIER_HUGEPAGE` (default: `0`)
+
+`1` asks for transparent huge pages (`MADV_HUGEPAGE`) on the RAM tier's chunks and the disk slab.
+Off by default: when the page cache holds most of the host's memory (the engram tables are read
+buffered), the kernel compacts memory to find each 2 MiB page and faulting the tier in took 9-12 s
+per 8 GiB on the AI VM, against 0.5-0.8 s with 4 KiB pages. The tier is faulted in by several
+threads, then registered with the disk engine, at load. `0` or `1`.
+
 ### `EXL3_MOE_TIER_HEADROOM_MB` (default: `1024`)
 
 VRAM (MiB) each GPU keeps free after its expert cache, for the generator's statics and later

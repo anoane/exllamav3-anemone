@@ -96,7 +96,8 @@ class ConfigTests(unittest.TestCase):
                "EXL3_MOE_HEAT_FILE": "/var/lib/exl3/v41.heat", "EXL3_MOE_TIER_ADMIT_P": "0.5",
                "EXL3_MOE_TIER_ADAPT_EVERY": "4096", "EXL3_MOE_TIER_ADMIT_PMIN": "0.01", "EXL3_MOE_TIER_SAMPLE": "32",
                "EXL3_MOE_TIER_RAM_ADMIT": "heat", "EXL3_MOE_TIER_REFILL": "0", "EXL3_MOE_TIER_REFILL_INFLIGHT": "4",
-               "EXL3_MOE_TIER_DISK_SLAB": "64", "EXL3_MOE_TIER_HEADROOM_MB": "512", "EXL3_MOE_TIER_MIN_LINK_GBS": "0",
+               "EXL3_MOE_TIER_DISK_SLAB": "64", "EXL3_MOE_TIER_HUGEPAGE": "1", "EXL3_MOE_TIER_HEADROOM_MB": "512",
+               "EXL3_MOE_TIER_MIN_LINK_GBS": "0",
                "EXL3_MOE_TIER_SPIN_US": "0", "EXL3_MOE_TIER_AFFINITY": "16-19,23, 21", "EXL3_MOE_TIER_DETERMINISTIC": "1",
                "EXL3_MOE_TIER_VERIFY": "1", "EXL3_MOE_TIER_TRACE": "/tmp/t.bin", "UNRELATED": "x"}
         c = T.TierConfig.from_env(env)
@@ -104,8 +105,8 @@ class ConfigTests(unittest.TestCase):
                          (False, "single", 1, 512, 4, 128))
         self.assertEqual((c.heat_prefill, c.heat_prefill_q16, c.heat_file, c.admit_p, c.adapt_every, c.admit_pmin),
                          (0.125, 8192, "/var/lib/exl3/v41.heat", 0.5, 4096, 0.01))
-        self.assertEqual((c.sample, c.ram_admit, c.refill, c.refill_inflight, c.disk_slab, c.headroom_mb),
-                         (32, "heat", False, 4, 64, 512))
+        self.assertEqual((c.sample, c.ram_admit, c.refill, c.refill_inflight, c.disk_slab, c.hugepage, c.headroom_mb),
+                         (32, "heat", False, 4, 64, True, 512))
         self.assertEqual((c.min_link_gbs, c.spin_us, c.affinity, c.deterministic, c.verify, c.trace),
                          (0.0, 0, (16, 17, 18, 19, 21, 23), True, True, "/tmp/t.bin"))
         self.assertEqual(len(c.changed()), len(T.SETTINGS))

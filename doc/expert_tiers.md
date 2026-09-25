@@ -437,7 +437,10 @@ Each is a `ValueError`, prefixed with `placement rule <n> '<rule>': ` where one 
 **Not available in this build yet**: `experts=cache` is parsed and checked, then refused. This
 section describes what the words ask for, how a load sizes the tier and what it refuses, as
 `model/expert_tier_config.py` implements it (its tests, `tests/test_expert_tier_config_.py`, run
-every number below).
+every number below), and the parts of the tier that exist in this build: the extent index, the
+policy (reference and native), and the RAM tier host with its reads, refills, read-ahead and cold
+fill, which a CPU replay of a routing trace drives today and the GPU runtime will drive (a lookup
+kernel inside the MoE layer and a tier thread doing the copies with the copy engines).
 
 ### Where a routed expert of a `cache` layer lives
 
@@ -634,6 +637,116 @@ micro-scenarios and 10^6 random calls with every invariant and a mirror director
 the records (the tier thread's view of the lookup kernel's directory), under AddressSanitizer,
 UndefinedBehaviorSanitizer and ThreadSanitizer.
 
+### The RAM tier: memory, reads and copies
+
+The RAM tier and everything that moves bytes for it live in the parent process
+(`exllamav3_ext/tier/tier_host.cpp`, Python `model/expert_tier_host.py`, class `TierHost`). No
+child process and no copy of the checkpoint are involved: experts are read in place from the
+model's own shards.
+
+**Memory.**
+
+| Part | What it is | V4.1 3.0 bpw |
+|---|---|---|
+| RAM tier | `R` slots of the RAM slot size, in anonymous mappings of whole slots (one chunk = at most 1 GiB; transparent huge pages only with `EXL3_MOE_TIER_HUGEPAGE=1`); each chunk is one registered io_uring buffer of the disk engine, so reads into it are `READ_FIXED` (up to 1,023 chunks) | 80 slots (1,065,615,360 bytes) per chunk; `R` = 4,976 slots = 63 chunks for layout (c) |
+| disk slab | `EXL3_MOE_TIER_DISK_SLAB` slots (default 8), same layout, registered too | 106.6 MB |
+| pool and staging | the GPU's; this build's CPU replay stands in a host buffer for them | |
+
+Every slot is filled at load, so the chunks are faulted in right away by several threads
+(`prefault_threads`, 8), then registered with io_uring, which pins them; the GPU runtime registers
+them with CUDA once they are filled (pin after fill). Registering alone would fault them in one
+chunk after the other: on the AI VM, 8 GiB took 1.4 s that way and 0.5-0.8 s faulted in by
+threads; with transparent huge pages 9-12 s (compaction next to a large page cache, hence
+`EXL3_MOE_TIER_HUGEPAGE=0` by default). The cold fill then reads at 10-12 GB/s. All of it counts in
+the load's host-memory check (`ram experts=`, `disk slab=`).
+
+**What a RAM slot holds.** Either an expert as it was read from the SSD (*extent layout*: its
+pieces at 4 KiB-aligned bases, each payload at its file offset modulo 4 KiB, the three trellis
+tensors at the recorded sub-offsets), or an expert copied back from VRAM by a demotion (*compact
+layout*: the three trellis tensors back to back, as in a VRAM slot). A promotion copies three
+ranges from an extent-layout slot and one from a compact one.
+
+**Reads** go through the process-wide disk engine ([disk_engine.md](disk_engine.md)), with the
+extent API (`O_DIRECT` when the backend and file system allow it; the payload offset is the same
+either way), one ticket per expert, in the engine's request classes:
+
+| Class | Tier reads |
+|---|---|
+| 1 expert demand | a decode or routed call's miss that only the SSD holds; a layer-mode staging read that was not read ahead |
+| 2 prefetch | the cold fill; the layer-mode read-ahead (`prefetch_layer`), with a deadline, promoted to class 1 when its layer is staged (`promote_layer`) |
+| 3 refill | refills (the policy's refill decisions) |
+
+A read the engine fails (an I/O error, a short read, a file that changed) is retried once with a
+plain `pread` of the same bytes into the same place. If that fails too, the tier fails: the call
+raises `RuntimeError` with `expert tier: reading layer <l> expert <e> (<first projection key>) from
+<file> at offset <n> failed: ... (errno <n>)`, and every later call raises the same message.
+
+**Ordering.** The policy's decisions are final when a record is processed; the bytes follow, and
+every slot keeps what is still reading or writing it: a read into a RAM slot waits for the copies
+still reading its old contents and for a demotion still writing it; a promotion from a RAM slot
+waits for the read or the demotion that fills it; a demotion into a slot is ordered after the
+promotion that last read it (the swap case: the victim goes into the slot its admission's copy is
+reading from). A pool slot returns to the free list only after the demotion that reads it has
+landed. `spare=0` replaces victims in place, so it needs `ram demote=off` or `policy=inclusive`
+(the runtime refuses it otherwise, as the grammar does).
+
+**Disk slab.** Reads that bypass the RAM tier land in the slab, are copied, and give their slot
+back. The layer-mode read-ahead fills free slab slots only (the rest of the layer is counted as
+*starved* and read on demand); a demand read that finds the slab full of read-ahead takes the slot
+of the read-ahead farthest ahead (counted as dropped). Read-ahead of an expert that reached RAM or
+VRAM another way before its layer is dropped when the layer is staged.
+
+**Cold fill** (`cold_fill`, end of the load): the RAM tier's experts are read straight into their
+slots, `fill_inflight` (8) at a time; the pool's experts are copied from their RAM copy when RAM
+holds one (`policy=inclusive`), else read through the slab. The order is the policy's (round robin
+across layers by expert index, until a heat file or profile gives another). On the AI VM, 44 real
+V4.1 experts (586 MB) fill at 8.9 GB/s.
+
+**Deterministic mode** (the default of this build, `EXL3_MOE_TIER_DETERMINISTIC=1` in the GPU
+runtime): a call returns only when every read and copy it started, refills included, has landed.
+Otherwise refills complete in the background and land on `poll()` or the next access of their
+slot. Either way the decisions are the same; only timing differs.
+
+**Statistics** (`TierHost.stats()`): `ssd_reads`, `ssd_bytes`, `pread_fallbacks`, `h2d` / `d2h` /
+`d2d` (copies, a three-piece promotion counts once) and their bytes, `staged`, `prefetch_issued`,
+`prefetch_used`, `prefetch_starved`, `prefetch_dropped`, `refill_reads`, `hazard_waits` (a write
+waited for a reader or writer of its slot), `slab_waits`, `cold_ram`, `cold_vram`, `cold_bytes`,
+`cold_ns`, `arena_ns` (mapping, faulting in and registering the tier), and the policy's counters (`policy_hits`, `policy_admits`, ... as in "Policies").
+
+**Python.**
+
+```python
+from exllamav3.model.expert_extents import build_extent_index
+from exllamav3.model.expert_tier_policy import PolicyConfig, round_robin_order, DECODE, ROUTED
+from exllamav3.model.expert_tier_host import TierHost
+
+index = build_extent_index(stc, keys)             # keys[lc * E + e] = (gate, up, down) projection keys
+tier = TierHost(index, layers = L, experts = E, policy = PolicyConfig(spare = 8), pool_slots = S,
+                ram_slots = R, slab_slots = 8)
+tier.cold_fill()                                  # round robin across layers
+tier.tick()                                       # one decode pass
+entries = tier.call(lc, ids)                      # [(key, kind, dst, cnt, heat, vkey, vslot, ...)]
+tier.prefetch(lc + 1); tier.promote(lc + 1)       # layer-mode read-ahead, then its layer is next
+tier.layer(lc + 1, ids, half = 1)                 # stage the layer into staging half 1
+tier.stats(); tier.state(); tier.arena()
+# or from a load's placement and sizing: TierHost.from_placement(stc, cache_modules, placement,
+#     "cuda:1", tier_config, pool_slots = S, ram_slots = R)
+```
+
+`call()` runs the policy's own lookup (the CPU replay of a routing trace); `process(record)` takes a
+record decided elsewhere (the GPU lookup kernel's) and applies it to the host's mirror of the
+directory before the same host step.
+
+**Checked in the tests** (`tests/test_expert_tier_ram_.py`, `tests/expert_tier/tier_host_test.cpp`):
+after every call of scripted and random traces over every policy x demote x admit x evict, with the
+disk on and off, `spare=0`, deferred returns and asynchronous refills, the host's records, actions
+and state equal the reference policy's, and every pool slot, retiring slot, RAM tier slot and
+staging slot holds exactly the checkpoint bytes of the expert the policy says it holds; the cold
+fill with every engine backend; the read-ahead; refills; every engine read failing (the `pread`
+fallback serves them); a shard cut short (the error names the expert); the arena's chunks and
+registrations; the real V4.1 shards. The C++ driver runs under AddressSanitizer,
+UndefinedBehaviorSanitizer and ThreadSanitizer.
+
 ### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
 
 | | (a) PRO + RAM for every expert outside VRAM | (b) PRO + 96 GiB RAM tier + SSD | (c) CMP resident + PRO cache + RAM, no expert SSD reads |
@@ -692,6 +805,7 @@ did-you-mean hint) and prints the ones that differ from their default.
 | `EXL3_MOE_TIER_REFILL` | `1` | `0` turns refills off |
 | `EXL3_MOE_TIER_REFILL_INFLIGHT` | `2` | 1 .. 64 |
 | `EXL3_MOE_TIER_DISK_SLAB` | `auto` | slots, 1 .. 4096 |
+| `EXL3_MOE_TIER_HUGEPAGE` | `0` | `1`: transparent huge pages for the RAM tier and the slab |
 | `EXL3_MOE_TIER_HEADROOM_MB` | `1024` | MiB |
 | `EXL3_MOE_TIER_MIN_LINK_GBS` | `2.0` | GB/s; `0` allows any link |
 | `EXL3_MOE_TIER_SPIN_US` | `-1` | `-1` while a pass is active, `0` never, N us |
