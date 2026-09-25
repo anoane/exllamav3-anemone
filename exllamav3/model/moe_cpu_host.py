@@ -601,6 +601,10 @@ class MoeCpuHost:
         # draft_moe_cpu_threads for anything else (MTP head / draft model); falls back to the
         # tuning default (EXL3_MOE_CPU_THREADS env, else cpu_count/2)
         comp = getattr(config.infer_params, "moe_cpu_component", "text")
+        # The component's RAM cap (--expert_ram / --draft_expert_ram) and what its layers hold so
+        # far (ram_budget.charge_expert_ram, before each registration)
+        self.component = comp
+        self.expert_ram_used = 0
         cfg_threads = getattr(config.infer_params,
             "moe_cpu_threads" if comp == "text" else "draft_moe_cpu_threads", None)
         self.threads = cfg_threads or TUNING.threads

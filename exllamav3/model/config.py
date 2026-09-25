@@ -4,6 +4,7 @@ import os, json
 from dataclasses import dataclass
 from .moe_expert_policy import parse_cpu_mode
 from .placement import parse as parse_placement
+from .ram_budget import as_expert_ram, as_ngram_ram, ngram_ram_from_env
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
@@ -67,14 +68,54 @@ class InferParams:
         # pinned host memory instead of VRAM, computing straight from a zero-copy device alias.
         # Set before loading the vision component
         self.vision_pinned = os.environ.get("EXL3_VISION_PINNED", "0") != "0"
-        # Stream an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) from disk with
-        # per-forward row gathers instead of loading the whole table into system RAM (tens of
-        # GB). Set before loading the model
-        self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Host-memory budgets, read when a component loads (model/ram_budget.py,
+        # doc/expert_tiers.md). Sizes as util/host_budget.py reads them: "48GiB", "48GB", 48 (GiB).
+        # expert_ram caps the system RAM the main model's routed experts take (the CPU worker's
+        # arena of -mcl / -mcs and of a placement's stream / cpu / split layers), draft_expert_ram
+        # that of any other component (an MTP head sharing this config, -dmcl); None: no cap.
+        # ngram_ram is the RAM for n-gram tables (PLE models, e.g. Qwen3.8-Flash-Next): None or 0
+        # streams every row from disk with per-forward gathers, "all" holds every table whole, a
+        # size the tables that fit, smallest first; ngram_stream_from_disk is its older on/off form
+        self.expert_ram = as_expert_ram(os.environ.get("EXL3_EXPERT_RAM"), "EXL3_EXPERT_RAM")
+        self.draft_expert_ram = None
+        self.ngram_ram = ngram_ram_from_env(os.environ)
         # Logits in FP32 instead of the logits-output module's own output dtype (FP16 unless the
         # architecture sets one): the head's output is stored without rounding it to FP16, in a
         # buffer twice as large. Applied when the model loads
         self.fp32_logits = os.environ.get("EXL3_FP32_LOGITS", "0") != "0"
+
+    @property
+    def expert_ram(self):
+        return self._expert_ram
+
+    @expert_ram.setter
+    def expert_ram(self, value):
+        self._expert_ram = as_expert_ram(value, "expert_ram")
+
+    @property
+    def draft_expert_ram(self):
+        return self._draft_expert_ram
+
+    @draft_expert_ram.setter
+    def draft_expert_ram(self, value):
+        self._draft_expert_ram = as_expert_ram(value, "draft_expert_ram")
+
+    @property
+    def ngram_ram(self):
+        return self._ngram_ram
+
+    @ngram_ram.setter
+    def ngram_ram(self, value):
+        self._ngram_ram = as_ngram_ram(value, "ngram_ram")
+
+    @property
+    def ngram_stream_from_disk(self) -> bool:
+        """The older on/off form of ngram_ram: False when every n-gram table is held in RAM"""
+        return not (self._ngram_ram is not None and self._ngram_ram.is_all)
+
+    @ngram_stream_from_disk.setter
+    def ngram_stream_from_disk(self, value: bool):
+        self._ngram_ram = None if value else as_ngram_ram("all")
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which

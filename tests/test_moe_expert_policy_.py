@@ -43,6 +43,7 @@ def load(name, rel):
 
 policy = load("_moe_policy_subject", "exllamav3/model/moe_expert_policy.py")
 placement = load("_placement_subject", "exllamav3/model/placement.py")
+ram_budget = load("_ram_budget_subject", "exllamav3/model/ram_budget.py")
 
 
 class Device:
@@ -106,6 +107,8 @@ def module_assignment(path, name):
 def execute(nodes, extra = None):
     ns = dict(vars(policy), torch = TORCH, os = os,
               parse_placement = placement.parse, expert_plan = placement.expert_plan,
+              as_expert_ram = ram_budget.as_expert_ram, as_ngram_ram = ram_budget.as_ngram_ram,
+              ngram_ram_from_env = ram_budget.ngram_ram_from_env,
               _LAYER_KEY = module_assignment(MIXIN, "_LAYER_KEY"),
               TUNING = NS(stream_debug = False, stream_fused_t = 8, stream_deterministic = False,
                           fused_prefill = False),

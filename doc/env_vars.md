@@ -905,13 +905,18 @@ when it is created, or the load fails naming the chunk.
 
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 
-Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
-held in RAM with `--ngram_ram`): before each one, `MemAvailable` (from `/proc/meminfo`, or
-psutil where that is unavailable) must cover the allocation plus this reserve, or the load
-fails with a message naming the allocation. Linux has no allocation-time failure for anonymous
-or shmem memory: an oversized arena only fails once the machine has swapped itself into a
-minutes-long stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at
-all. `0` disables the check.
+Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram tables
+held in RAM with `--ngram_ram`), kept free on top of two checks: once per load, before anything
+loads, of everything the component will hold together (the RAM-held experts and n-gram tables of
+the load's RAM budget plan, see `EXL3_EXPERT_RAM` and [expert_tiers.md](expert_tiers.md)), and
+again before each allocation. The available memory is `MemAvailable` (from `/proc/meminfo`, or
+psutil where that is unavailable), lowered to what the process's memory cgroup (v2) still allows
+when a cgroup on its path has a limit (`systemd-run -p MemoryMax=...`, a container): its
+`memory.max` / `memory.high` minus `memory.current`, plus its reclaimable page cache. A load that
+does not fit fails with a message naming each item. Linux has no allocation-time failure for
+anonymous or shmem memory: an oversized arena only fails once the machine has swapped itself into
+a minutes-long stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at
+all. A whole number of MiB; `0` disables the checks.
 
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
@@ -1283,17 +1288,43 @@ into tens of thousands of segments with large reserved-but-unallocated overhead.
 module frees its blocks; at most one boundary block shared with a neighboring module stays
 pinned. Set to `0` to fall back to per-tensor allocations.
 
+### `EXL3_EXPERT_RAM` (default: unset, no cap)
+
+Default for `Config.infer_params.expert_ram`, which `-er` / `--expert_ram` sets in
+`model_init`-based scripts: the most system RAM the routed experts of the main model may take, as
+a size (`48GiB`, `48GB`, `48` = 48 GiB; bare `48G` is refused as ambiguous). What counts is the
+CPU worker's expert arena: the experts of `-mcl` / `-mcs` and of a placement's `stream`, `cpu`
+and `split` layers, per expert the trellis plus the fp16 `suh` / `svh` (and bias) vectors of each
+projection, each rounded up to 64 bytes (13,315,584 bytes for DeepSeek-V4.1-Flash 3.0 bpw, 4.76
+GiB per layer). A load that needs more is refused before anything loads, from the checkpoint
+headers (`-mcl 11 keeps 52.4 GiB of routed experts in RAM, more than --expert_ram 40GiB; raise the
+cap or offload fewer layers`), and the worker checks the running total again as each layer
+registers. A draft model or MTP head has its own cap, `-der` / `--draft_expert_ram`
+(`config.infer_params.draft_expert_ram`, no variable). Full description:
+[expert_tiers.md](expert_tiers.md).
+
+### `EXL3_NGRAM_RAM` (default: unset, `0`)
+
+Default for `Config.infer_params.ngram_ram`, which `-ngr` / `--ngram_ram [SIZE]` sets in
+`model_init`-based scripts: the system RAM for n-gram embedding tables (PLE models, e.g.
+Qwen3.8-Flash-Next). `0` (the default) streams every row from disk; `all` (and a bare `-ngr`)
+holds every table whole; a size holds the tables that fit, whole, smallest first, and streams the
+others. The tables are checked against the host memory with the rest of the load before anything
+loads (`EXL3_HOST_MEM_RESERVE_MB`). DeepSeek-V4.1's engram tables are always read from disk
+whatever the budget. Full description: [expert_tiers.md](expert_tiers.md).
+
 ### `EXL3_NGRAM_STREAM` (default: `1`)
 
-Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
-(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (run-coalesced
-positioned reads into pinned staging — threaded preads on Linux, overlapped `ReadFile` at high
-queue depth on Windows) instead of loading the whole table into system RAM. The quantized table
-is tens of GB, and streaming costs little on SSD-class storage (decode is latency-tolerant at
-~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
-only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
-unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
-`--ngram_ram` in `model_init`-based scripts.
+The older on/off form of `EXL3_NGRAM_RAM`: `0` holds every n-gram table in RAM (the same as
+`EXL3_NGRAM_RAM=all`, and refused next to an `EXL3_NGRAM_RAM` other than `all`); other values
+change nothing. Streaming reads rows from disk with per-forward gathers (run-coalesced positioned
+reads into pinned staging — threaded preads on Linux, overlapped `ReadFile` at high queue depth on
+Windows) instead of loading the whole table into system RAM. The quantized table is tens of GB,
+and streaming costs little on SSD-class storage (decode is latency-tolerant at ~30 rows/token;
+prefill gathers are batched). Holding a table in RAM is worthwhile only when it lives on
+high-latency storage (e.g. HDD, where per-row seeks make streaming unusable).
+`config.infer_params.ngram_stream_from_disk` is derived from `ngram_ram` (`False` exactly when it
+is `all`); setting it still works.
 
 ### `EXL3_AUTOSPLIT_WORSTCASE` (default: `1`)
 

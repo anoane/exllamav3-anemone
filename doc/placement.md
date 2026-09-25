@@ -270,7 +270,10 @@ pass (rows x hidden size x element size), as a split made by the autosplit does;
 returns to an earlier device pays that copy at each change. GPU memory per device is what is
 placed there plus the loader's transients. System RAM holds every expert of the `stream` and
 `cpu` layers and the RAM share of the `split` layers, plus the worker's pinned staging ring, as
-with `-mcl` / `-mcs`. The cost of the expert modes is theirs: see `EXL3_MOE_CPU_MODE` for
+with `-mcl` / `-mcs`. `-er` / `--expert_ram` (`EXL3_EXPERT_RAM`) caps that RAM, and before
+anything loads the loader counts it from the checkpoint headers and checks it, with the n-gram
+tables `--ngram_ram` holds, against the host memory (MemAvailable, or the memory cgroup's limit):
+see [expert_tiers.md](expert_tiers.md). The cost of the expert modes is theirs: see `EXL3_MOE_CPU_MODE` for
 `stream` (the transfer per decoded token), and the CPU MoE offload section of
 [env_vars.md](env_vars.md) for `cpu` and `split`.
 

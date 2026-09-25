@@ -93,8 +93,8 @@ class NGramEmbedding(Module):
         self.head_dim = ple_embed_dim // self.num_heads
         assert self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
         self.eos_token_id = eos_token_id
-        # None: defer to config.infer_params.ngram_stream_from_disk at load time (the load-time
-        # option; also EXL3_NGRAM_STREAM). An explicit bool here overrides it
+        # None: the n-gram RAM budget decides at load time (config.infer_params.ngram_ram, set by
+        # --ngram_ram / EXL3_NGRAM_RAM; model/ram_budget.py). An explicit bool here overrides it
         self.stream_from_disk = stream_from_disk
         self.out_dtype = out_dtype
 
@@ -212,8 +212,10 @@ class NGramEmbedding(Module):
         self._table_keys = keys      # for tp_export: workers stream the table by their own handles
         stream_from_disk = self.stream_from_disk
         if stream_from_disk is None:
-            infer_params = getattr(self.config, "infer_params", None)
-            stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
+            # The n-gram RAM budget (--ngram_ram, EXL3_NGRAM_RAM, the placement's ram ngram=): the
+            # load's plan, else the budget alone (model/ram_budget.py)
+            from ..model.ram_budget import ngram_in_ram
+            stream_from_disk = not ngram_in_ram(self.config, self.key, sum(stc.get_tensor_size(k) for k in keys))
         if stream_from_disk:
             self.mode = "trellis_disk" if quantized else "fp16_disk"
             self.handles = [stc.get_tensor_handle(k) for k in keys]
@@ -259,6 +261,20 @@ class NGramEmbedding(Module):
                 self.rows_per_shard = self.num_rows
             if not quantized:
                 self._row_dtype = self.tables[0].dtype
+
+    def table_nbytes(self) -> int:
+        """Bytes of the whole table (every shard) as the checkpoint stores it, from the headers: what
+        holding it in RAM takes (the n-gram budget, model/ram_budget.py)"""
+        stc = self.config.stc
+        for suffix in ("trellis", "weight"):
+            keys = []
+            while stc.has_tensor(f"{self.key}.shard_{len(keys)}.{suffix}"):
+                keys.append(f"{self.key}.shard_{len(keys)}.{suffix}")
+            if not keys and stc.has_tensor(f"{self.key}.{suffix}"):
+                keys = [f"{self.key}.{suffix}"]
+            if keys:
+                return sum(stc.get_tensor_size(k) for k in keys)
+        return 0
 
     @override
     def unload(self):

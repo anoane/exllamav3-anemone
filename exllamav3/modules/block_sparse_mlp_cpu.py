@@ -6,6 +6,7 @@ import torch
 from ..ext import exllamav3_ext as ext
 from ..model.moe_expert_policy import execution_mode
 from ..model.placement import parse as parse_placement, expert_plan
+from ..model.ram_budget import charge_expert_ram
 
 # The decoder layer a module belongs to, from its key ("model.layers.12.mlp"), for modules
 # that do not carry layer_idx themselves
@@ -495,6 +496,9 @@ class BlockSparseMLP_CPU:
             aux["svh_g"] = fetch_aux(self.gates, ".svh")
             aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
 
+        # --expert_ram / --draft_expert_ram: refused before the worker loads anything of the layer
+        charge_expert_ram(host, self.key, dict(g = gd, u = ud, d = dd),
+                          {p: aux.get(f"bias_{p}") is not None for p in "gud"}, self.num_experts)
         self.cpu_layer_idx = host.register_layer(
             self.key,
             [l.key for l in self.gates] if self.gated else [],
@@ -629,6 +633,9 @@ class BlockSparseMLP_CPU:
             aux["svh_g"] = fetch_aux(self.gates, ".svh")
             aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
 
+        # --expert_ram / --draft_expert_ram: refused before the worker loads anything of the layer
+        charge_expert_ram(host, self.key, dict(g = gd, u = ud, d = dd),
+                          {p: aux.get(f"bias_{p}") is not None for p in "gud"}, split_k)
         self.cpu_layer_idx = host.register_layer(
             self.key,
             [l.key for l in self.gates[first:]] if self.gated else [],

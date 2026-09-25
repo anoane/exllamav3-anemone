@@ -584,6 +584,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         if getattr(self, "component", "text") == "text":
             placement = self._resolve_placement(device, tensor_p)
 
+        # What this component keeps in system RAM (routed experts, n-gram tables), against the RAM
+        # budgets and the host memory, before anything loads (model/ram_budget.py)
+        from .ram_budget import plan_component
+        budget = plan_component(self, placement)
+        if budget.worth_reporting():
+            print(budget.summary())
+
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."
 
