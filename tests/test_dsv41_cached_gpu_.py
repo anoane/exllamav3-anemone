@@ -51,6 +51,13 @@ counted and left out of the rel-L2.
 Also negative controls that must FAIL the exact gate: a carry ring cleared before every
 step, and the rope_consecutive and dense_consumers ablations.
 
+And the fused rate-2 pooling (EXL3_DSV41_FUSED_COMPRESS, switched here through
+exllamav3.cache.dsv41.FUSED_COMPRESS before each Cache is built) against the default torch
+pooling: the stored pools of the rate-2 sources after the same chunk-7-plus-decode schedule
+within rel-L2 1e-3 (every layer's output difference is printed), under 'precise' whatever
+--numerics says, since an index rounding turns an ulp of difference in a pooled latent into a
+lattice step of its index key.
+
 And the generation-state paths (state_checks), exact mode, each against a fresh run of the
 final token stream at the same step sizes (gate 1e-6: same kernels, so any difference is a
 state bug): in-place rewinds replayed with different rows, including rewinds by the full
@@ -792,8 +799,9 @@ def main():
                         def clear_carry(rig_, st, pos):
                             for L in (2, 8):
                                 rsl = rig_.cache.get_recurrent_layer((L, 0))
-                                if rsl.comp_carry is not None:
-                                    rsl.comp_carry[st.slot].zero_()
+                                for ring in (rsl.comp_carry, rsl.comp_buf_kv, rsl.comp_buf_gate):
+                                    if ring is not None:
+                                        ring[st.slot].zero_()
                         controls = [("carry cleared before every step", steps, clear_carry, None, (2, 3, 8, 12))]
                         controls.append(("EXL3_DSV41_ABLATE=rope_consecutive", schedule(T, 1000), None,
                                          "rope_consecutive", (2, 3, 8, 12)))
@@ -856,6 +864,49 @@ def main():
         ok &= state_checks(rig, cfg)
     finally:
         rig.close()
+
+    # the fused rate-2 pooling (EXL3_DSV41_FUSED_COMPRESS) vs the default torch pooling, on the
+    # stored pools of the rate-2 sources after the same schedule (odd chunks and decode, so the
+    # carry rings are read) and on every layer's output. Under 'precise' whatever --numerics
+    # says: an index rounding (deepseek:index, vllm:index) turns an ulp of difference in a pooled
+    # latent into a whole lattice step of its index key, which the pool gate would read as a
+    # pooling error
+    import exllamav3.cache.dsv41 as cache_dsv41
+    default_fused = cache_dsv41.FUSED_COMPRESS
+    numerics = cfg.dsv41_numerics
+    cfg.dsv41_numerics = "precise"
+    for T in Ts:
+        steps = schedule(T, 7)
+        res = {}
+        for fused in (False, True):
+            cache_dsv41.FUSED_COMPRESS = fused
+            try:
+                rig = Rig(cfg, model, A, devs, 0)
+                try:
+                    has = rig.cache.get_recurrent_layer((2, 0)).comp_buf_kv is not None
+                    assert has == fused, "the layer state did not follow FUSED_COMPRESS"
+                    got, _, _ = rig.cached(rig.inputs(T, 1000 + T), steps)
+                    res[fused] = (got, {L: rig.pools(L) for L in (2, 8)})
+                finally:
+                    rig.close()
+            finally:
+                cache_dsv41.FUSED_COMPRESS = default_fused
+        n = T // 2
+        errs = []
+        for L in (2, 8):
+            for name, a in res[False][1][L].items():
+                a = a.reshape(-1, a.shape[-1])[:n]
+                b = res[True][1][L][name].reshape(-1, a.shape[-1])[:n]
+                errs.append((f"L{L}.{name}", rel(b, a)))
+        outs = {L: rel(res[True][0][L], res[False][0][L]) for L in LAYERS}
+        # the outputs are printed, not gated: a pooled latent an ulp apart can swap one entry at
+        # a top-k near-tie (see above), which moves that row's output by far more
+        good = max(e for _, e in errs) <= 1e-3
+        ok &= good
+        print(f"  {'PASS' if good else 'FAIL'} [exl3] T={T} fused pooling vs torch pooling, chunk 7 + decode "
+              f"(precise): pools " + " ".join(f"{k} {e:.1e}" for k, e in errs) + "; layer outputs " +
+              " ".join(f"L{L} {e:.1e}" for L, e in outs.items()))
+    cfg.dsv41_numerics = numerics
 
     print(f"{'ALL PASS' if ok else 'FAILURES'}  ({time.time() - t_start:.0f}s)")
     sys.exit(0 if ok else 1)

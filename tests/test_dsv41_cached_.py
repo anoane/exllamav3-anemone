@@ -60,6 +60,30 @@ from dsv41_ref import ablate, model_dir, skip
 from dsv41_ref import deepseek
 
 
+def default_pooling():
+    """
+    These checks are of the default, torch-pooled layout: EXL3_DSV41_FUSED_COMPRESS=1, a valid
+    setting, gives the rate-2 sources two separate carry rings instead of comp_carry. Turn it off
+    for this file (the fused layout is checked by test_dsv41_fused_compress_). Returns the previous
+    value, or None where the package does not import
+    """
+    try:
+        import exllamav3.cache.dsv41 as cache_dsv41
+    except Exception:
+        return None
+    previous, cache_dsv41.FUSED_COMPRESS = cache_dsv41.FUSED_COMPRESS, False
+    return previous
+
+
+@pytest.fixture(autouse = True)
+def _default_pooling():
+    previous = default_pooling()
+    yield
+    if previous is not None:
+        import exllamav3.cache.dsv41 as cache_dsv41
+        cache_dsv41.FUSED_COMPRESS = previous
+
+
 def load_deepseek_ref(test):
     """DeepSeek's model.py, or None after reporting `test` as skipped when it is not configured."""
     if deepseek.ref_dir() is None:
@@ -900,6 +924,7 @@ def test_device_memo():
 
 
 def main(path):
+    default_pooling()
     cfg, model = build_model(path)
     test_cache(cfg, model)
     test_geometry()

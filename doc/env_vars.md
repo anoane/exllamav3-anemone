@@ -1112,7 +1112,8 @@ With `1` each operation below takes one arithmetic path at every row count, the 
   its strategy from the tensor shape, so a latent normalized in a call of another row count (a
   different chunk size, or a group closed by a decode step) can differ in the last bit (up to
   1.2e-7 was measured on real latents). Pooling and the carry of open groups are unchanged, and
-  CPU tensors keep the torch path.
+  CPU tensors keep the torch path. (With `EXL3_DSV41_FUSED_COMPRESS=1` the cached path pools and
+  normalizes the rate-2 groups with its own per-pair kernel instead; see there.)
 - DeepSeek-V4.1's engram gate (layers 1 and 14 of DeepSeek-V4.1-Flash) is computed by a Triton
   kernel with one program per token and residual stream (`modules/dsv41_engram_math.py`) instead
   of torch reductions over the whole call, whose strategy follows the tensor shape (on real layer
@@ -2246,6 +2247,106 @@ save_file(bias, "router_bias_fp32.safetensors")
 EXL3_DSV41_ROUTER_BIAS=router_bias_fp32.safetensors python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
 ```
 
+### `EXL3_DSV41_FUSED_COMPRESS` (default: `0`)
+
+Pools DeepSeek-V4.1's rate-2 compressed KV with one fused FP32 Triton kernel instead of torch
+operations, on the cached path. An alternative implementation of the same FP32 formula: its speed
+has never been measured and its effect on model output has not been isolated; off by default.
+
+What it changes: the kv sources at compression rate 2 (layers 2, 8 and 14 on DeepSeek-V4.1-Flash)
+turn every two positions into one compressed entry. The column softmax of the pair's two gate
+projections weights its two kv projections, and the weighted sum is RMS-normalized (the
+overflow-safe scaled form of `architecture/dsv41/compressor.py`), all in FP32 on the FP32
+projection outputs. By default the cached path does this with torch operations per chunk
+(`CompressCarry.step`: the carried row prepended, softmax, product, sum and norm as separate
+kernels and temporaries). With the switch on, one Triton kernel does it with one program per pair
+(`modules/dsv41_compress.py`, `fused_compress`), followed by the update of the carry rings. The
+formula and its safeguards are those of the torch pooling (`group_pool` in
+`architecture/dsv41/compressor.py`): where the smaller of a pair's two softmax weights is
+subnormal in FP32 both paths multiply by the weight's square root twice, and both clamp the
+weighted sum back between the pair's two values. The kernel differs from the torch path in:
+
+- one fused launch per chunk and rate-2 source, plus the two ring updates, instead of several
+  torch kernels and their temporaries;
+- the exponential (Triton's against torch's) and the order of the norm's reduction: last-bit
+  differences, which cancellation in a pair of opposite-sign values can magnify on single
+  near-zero results;
+- the norm itself under the default arithmetic: the kernel normalizes each row on its own, where
+  the default torch norm's reduction follows the row count of the call;
+- with `EXL3_DSA_DEBUG_BOUNDS=1` only (the kernel's device assertions are compiled in then, see
+  that variable), a nonfinite projection, gate, carried row, norm weight or result stops the
+  kernel with a CUDA device-side assertion instead of storing NaN or infinity in the cache. That
+  leaves the process's CUDA context unusable: restart the process. Without it (the default) the
+  kernel does not check its operands, like the torch path.
+
+Results therefore differ from the default in the last bits (magnified by cancellation on single
+near-zero results); only nonfinite inputs under `EXL3_DSA_DEBUG_BOUNDS=1` behave differently
+beyond that.
+Rate-1 kv sources (layers 20-39 on Flash) do not pool and are unaffected, and so is the stateless
+path (a forward without a Cache), which always pools with torch.
+
+Carry rings: a pair left open at the end of a chunk (a chunk that ends on an odd position) keeps
+its raw FP32 rows for the next chunk or decode step, indexed by position. By default one ring
+per rate-2 source and sequence slot holds `[kv | gate]` rows (`comp_carry`, 258 rows x 1024 FP32
+on Flash, 1 MiB per slot); with the switch two rings hold them separately (`comp_buf_kv` and
+`comp_buf_gate`, 258 x 512 FP32 each), the same bytes with the same position indexing, so
+rewinds, checkpoints, restore and batching behave identically.
+
+Values: `0` off (default), any other value on. Read once when `exllamav3` is imported: set it
+before the import. It is consulted when a Cache is built: it decides which carry rings each
+rate-2 kv source's layer state allocates, and every forward follows the rings the state holds,
+so a sequence never switches between the two pooling implementations and a Cache keeps the one
+it was built with. Python, for an A/B in one process: set
+`exllamav3.cache.dsv41.FUSED_COMPRESS` before building each Cache.
+
+Refusals: the kernel's arguments come from the model config (row width 512, epsilon 1e-20); a
+config outside what it accepts (a row width over 4096, an epsilon outside the positive normal
+FP32 range) raises `ValueError` at the first compression. A nonfinite value stops the process as
+described above.
+
+Interactions:
+
+- `EXL3_STABLE_ARITHMETIC=1`: the kernel computes each pair on its own, so the cached results
+  stay independent of the chunk size and of decode versus prefill (chunked calls equal one call
+  bitwise, see Tests). But the cached path then pools with this kernel while the stateless path
+  keeps torch pooling with the profile's row-local norm, so the two paths no longer store bitwise
+  equal entries. The profile's validated runs did not use this switch.
+- The attention numerics (`EXL3_DSV41_NUMERICS`), a quantized Cache (`-cq`), pool replicas and
+  the pipelined prefill act on the pooled entries or around them and are independent of it.
+
+Performance and memory: the same carry-ring memory; no other allocation beyond the kernel's
+output, which the torch path also allocates. The kernel replaces several torch kernels per chunk
+and per rate-2 source with one launch plus the two ring updates; the effect on prefill and decode
+speed has never been measured.
+
+Tests and measurements: `tests/test_dsv41_compress_gpu_.py` (every GPU) holds the kernel to an
+FP64 oracle within its gate of 3e-5 relative plus 3e-5 absolute, on projections from zero to
+about 4e30 (random values at scales up to 1e30) and pair gates up to 140,000 apart, and checks
+that chunked calls from odd positions and a rewind replayed from the ring equal one call bitwise
+and that extreme finite pairs (FLT_MAX) stay finite; it has not run on this revision of the
+kernel yet. `tests/test_dsv41_fused_compress_.py` runs the same kernel on Triton's CPU
+interpreter and compares it with the torch pooling; there this revision's largest absolute error
+against the oracle was 6.6e-7, its only measurement so far. An earlier revision of this kernel
+measured 7.8e-7 against the oracle on an sm_80 and an sm_120 GPU (unpublished). At the model
+level it was only run together with other options (an FP32 router bias and the BF16 crossing, in
+unpublished 20K-token teacher-forced controls that all failed the same early-position agreement
+gates), so its effect on quality has not been isolated.
+
+When to use it: to time or study the pooling implementation. Keep it off otherwise.
+
+```sh
+EXL3_DSV41_FUSED_COMPRESS=1 python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+```
+
+```python
+import exllamav3.cache.dsv41 as cache_dsv41
+for fused in (False, True):
+    cache_dsv41.FUSED_COMPRESS = fused      # read when the Cache below builds its layer states
+    cache = Cache(model, max_num_tokens = 65536)
+    ...
+    cache.detach_from_model()
+```
+
 ### `EXL3_DSV41_ABLATE` (default: unset; tests and validation only)
 
 A comma-separated list of deliberate errors in DeepSeek-V4.1's function. Each token makes the
@@ -2374,8 +2475,10 @@ leaves the process's CUDA context unusable; restart the process). These are the 
 of `EXL3_STABLE_ARITHMETIC`: the compressor RMSNorm (`modules/dsv41_compress.py`, checking the
 projection, the norm weight and the normalized latent) and the engram gate
 (`modules/dsv41_engram_math.py`, checking the residual stream, the n-gram key, the gate weight and
-the gate). Unset or `0` (the default), they are compiled without assertions, like the DSA
-kernels, and do not check their operands.
+the gate); and the fused rate-2 pooling of `EXL3_DSV41_FUSED_COMPRESS` (`modules/dsv41_compress.py`,
+checking the projections, the gates, the carried rows, the norm weight and the result). Unset or
+`0` (the default), they are compiled without assertions, like the DSA kernels, and do not check
+their operands.
 
 ## Quantization
 

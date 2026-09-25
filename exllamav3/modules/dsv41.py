@@ -57,6 +57,7 @@ from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
 from ..cache.dsv41_replica import sync_pool_replica
 from .dsv41_select import select_topk, INT32_LIMIT
 from .dsv41_ablation import ablated
+from .dsv41_compress import fused_compress
 from . import dsv41_rounding as rounding
 from ..architecture.dsv41 import numerics as dsv41_numerics
 from .dsv41_cached import emission_range, entry_rows, rope_positions, CompressCarry, ring_update
@@ -1077,8 +1078,10 @@ class DSV41Attention(DSV4Attention):
 
         Rate 1: latent = rms_norm(wkv(x)) per token, no state. Rate 2: raw wkv/wgate rows,
         the open group's pending row prepended from the fp32 carry ring, column softmax over
-        each pair, rms_norm (CompressCarry). Both yield the PRE-RoPE latents of entries
-        [pos0 // m, (pos0 + seq) // m); _store_entries ropes and stores them.
+        each pair, rms_norm -- in torch (CompressCarry) by default, in one fused FP32 kernel
+        (dsv41_compress.fused_compress) when the layer state was built with
+        EXL3_DSV41_FUSED_COMPRESS=1 and so holds that kernel's rings. Both yield the PRE-RoPE
+        latents of entries [pos0 // m, (pos0 + seq) // m); _store_entries ropes and stores them.
         """
         comp = self.compressor
         m = self.compress_ratio
@@ -1087,6 +1090,11 @@ class DSV41Attention(DSV4Attention):
         if m == 1:
             kvr = comp.wkv.forward(x, params)[0].float()
             latent, first = CompressCarry.step(None, kvr, None, pos0, 1, comp.norm.weight, comp.rms_norm_eps)
+        elif rsl.comp_buf_kv is not None:
+            kvr = comp.wkv.forward(x, params)[0].float()
+            gr = comp.wgate.forward(x, params)[0].float()
+            latent, first = fused_compress(
+                kvr, gr, pos0, comp.norm.weight, comp.rms_norm_eps, rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot])
         else:
             kvr = comp.wkv.forward(x, params)[0].float()
             gr = comp.wgate.forward(x, params)[0].float()

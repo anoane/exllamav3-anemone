@@ -20,7 +20,9 @@ set of compressor rings (DSV4LayerState). Neither fits V4.1:
     [kv | score] row of a group still open at a chunk boundary. It is kept in a
     position-indexed fp32 ring of PAGE_SIZE + m rows per slot (comp_carry), so a rewind is
     pure cursor arithmetic: the row a rewound position needs is still in the ring for any
-    rollback this state class reports as safe.
+    rollback this state class reports as safe. With EXL3_DSV41_FUSED_COMPRESS=1 the same rows
+    live in two fp32 rings, kv and score (comp_buf_kv / comp_buf_gate), the layout the fused
+    pooling kernel (modules/dsv41_compress.py) reads and writes.
 
 The SWA ring (768 rows, raw roped K=V) is identical to V4's and exists on every layer,
 sliding and compressed alike: each V4.1 layer keeps its own window.
@@ -32,6 +34,8 @@ placement (whose pool replica is cache/dsv41_replica.py).
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -63,6 +67,12 @@ def check_pool_addressing(layer: CacheLayer_dsa, what: str):
             f"{what}: {layer.capacity:,} pool entries x {width} values reach the kernels' int32 "
             f"row addressing (2^31); max_num_tokens can be at most {pages * PAGE_SIZE:,} for "
             f"this pool")
+
+# EXL3_DSV41_FUSED_COMPRESS=1: the rate-2 kv sources pool on the cached path with the fused FP32
+# kernel instead of torch. Read once at import and consulted when a layer state is built: it
+# decides which carry rings the state allocates, and the forward follows whichever rings exist,
+# so a sequence never switches between the two
+FUSED_COMPRESS = os.environ.get("EXL3_DSV41_FUSED_COMPRESS", "0") != "0"
 
 
 def _nbytes(obj) -> int:
@@ -124,6 +134,9 @@ class DSV41LayerState(DSV4LayerState):
       ring          (B, 768, 512) fp16   every layer: raw roped K=V of the sliding window
       comp_carry    (B, PAGE_SIZE + 2, 1024) fp32   rate-2 kv sources: raw [kv | score]
                                          rows, row = abs position % rows
+      comp_buf_kv / comp_buf_gate  (B, PAGE_SIZE + 2, 512) fp32   the same rows as two rings,
+                                         instead of comp_carry, when the state is built with
+                                         EXL3_DSV41_FUSED_COMPRESS=1
 
     Fields of V4's layer state that a V4.1 layer does not allocate stay None. _tensors and
     _set_tensors skip None fields, and the methods inherited from V4 (alloc, free, clear,
@@ -166,7 +179,11 @@ class DSV41LayerState(DSV4LayerState):
             # after a forward ending at P it holds rows [P - buf_rows, P), so a rewind to T
             # finds row T - 1 while P - T <= buf_rows - 1 (see rollback_limit)
             self.buf_rows = PAGE_SIZE + m
-            self.comp_carry = mk(B, self.buf_rows, 2 * D, dtype = torch.float)
+            if FUSED_COMPRESS:
+                self.comp_buf_kv = mk(B, self.buf_rows, D, dtype = torch.float)
+                self.comp_buf_gate = mk(B, self.buf_rows, D, dtype = torch.float)
+            else:
+                self.comp_carry = mk(B, self.buf_rows, 2 * D, dtype = torch.float)
 
     def _tensors(self):
         return [t for t in (getattr(self, n) for n in self._NAMES) if t is not None]

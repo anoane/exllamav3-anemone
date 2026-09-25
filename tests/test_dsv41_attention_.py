@@ -162,6 +162,7 @@ def _install_stubs():
     _pkg(f"{_P}.modules.rmsnorm", RMSNorm = _StubNorm)
     _pkg(f"{_P}.modules.dsv4", DSV4Attention = _StubBase, _ext_rope = _torch_rope)
     _pkg(f"{_P}.modules.attention_fn.dsa_triton", dsa_attn = lambda *a, **kw: None)
+    _pkg(f"{_P}.modules.dsv41_compress", fused_compress = None)
     _pkg(f"{_P}.util.tensor", get_for_device = None)
     _pkg(f"{_P}.util.rope", RopeStyle = types.SimpleNamespace(GPTJ = 1))
     _pkg(f"{_P}.ext", exllamav3_ext = None)
