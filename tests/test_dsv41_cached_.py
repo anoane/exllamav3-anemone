@@ -211,10 +211,24 @@ def _packed_pool_refusals(cfg, model):
     import gc
     from exllamav3.cache.cache import Cache
     from exllamav3.cache.quant import CacheLayer_quant
+    from exllamav3.model.math_policy import STABLE_ARITHMETIC
     saved = cfg.dsv41_numerics
     attached = set(model.cache_weakrefs)
     quant = lambda: Cache(model, max_num_tokens = 65536, max_batch_size = 1,
                           layer_type = CacheLayer_quant, k_bits = 6, v_bits = 6)
+    if STABLE_ARITHMETIC:
+        # EXL3_STABLE_ARITHMETIC=1 refuses every quantized V4.1 Cache when it is built, whatever
+        # the numerics, so the checks below need the default environment; check the refusal
+        try:
+            quant()
+        except ValueError as e:
+            assert "EXL3_STABLE_ARITHMETIC=1" in str(e), e
+        else:
+            raise AssertionError("built a quantized V4.1 Cache under EXL3_STABLE_ARITHMETIC=1")
+        assert set(model.cache_weakrefs) == attached, "a refused Cache stayed attached"
+        print("  OK  numerics vs a quantized Cache: under EXL3_STABLE_ARITHMETIC=1 the quantized Cache "
+              "itself is refused (the numerics checks run in the default environment)")
+        return
     try:
         cfg.dsv41_numerics = "deepseek:index"
         qc = quant()

@@ -41,6 +41,7 @@ from ..util.file import no_default
 from ..model.config import Config
 from ..model.model import Model
 from ..model.placement import parse as parse_placement
+from ..model.math_policy import STABLE_ARITHMETIC
 from .dsv41 import numerics, pipeline
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
@@ -341,9 +342,19 @@ class DeepseekV41Config(Config):
     def register_packed_pool(self, layer):
         """
         Called by each V4.1 kv-source pool built in the packed (quantized) format, when the
-        Cache is constructed. Refuses the pool if the current numerics round compressed entries,
-        and keeps a weak reference so that the setting cannot switch to them while it exists.
+        Cache is constructed. Refuses the pool under EXL3_STABLE_ARITHMETIC or if the current
+        numerics round compressed entries, and keeps a weak reference so that the setting cannot
+        switch to them while it exists.
         """
+        if STABLE_ARITHMETIC:
+            # dsa_attn stages a packed pool back to FP16 in the original domain for calls of 64 or
+            # more query rows (EXL3_DSA_QC_STAGE_MIN_R) and reads it packed, in the rotated domain,
+            # below that: the two round different quantities, so decode would differ from prefill
+            raise ValueError(
+                "EXL3_STABLE_ARITHMETIC=1: DeepSeek-V4.1's attention reads a quantized Cache (-cq) "
+                "with arithmetic that depends on the number of query rows (from 64 rows the packed "
+                "pool is staged back to FP16, below that it is read packed), so decode would differ "
+                "from prefill; use an FP16 Cache")
         n = self._dsv41_numerics
         if n.compressed:
             raise ValueError(

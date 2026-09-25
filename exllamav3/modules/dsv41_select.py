@@ -57,6 +57,7 @@ from typing import NamedTuple
 
 import torch
 
+from ..model.math_policy import STABLE_ARITHMETIC
 from ..architecture.dsv41.candidates import (
     visible_counts,
     topk_total_order,
@@ -465,14 +466,19 @@ class _ExtSlabs(_Slabs):
         q = self.q[r0 : r0 + rows]
         w = self.w[r0 : r0 + rows]
         qp = self.pos0 + r0 - t0 * self.m
+        # EXL3_STABLE_ARITHMETIC=1: score every row count with the query-tiled kernel, so a
+        # decoded row selects exactly what the same row selects inside a prefill chunk (the
+        # few-query kernel that decode would take reduces over the heads in another order)
+        few_query = not STABLE_ARITHMETIC
         if self.bt is None:
             self.scores_fn(q, w, self.pool_flat[t0 : t1], qp, self.m, t1 - t0,
-                           scores = sc, scale = self.scale)
+                           scores = sc, scale = self.scale, few_query = few_query)
         else:
             e = self.epp
             bt = self.bt[t0 // e : -(-t1 // e)]
             self.scores_fn(q, w, self.pool_flat, qp, self.m, t1 - t0,
-                           scores = sc, block_table = bt, epp = e, scale = self.scale)
+                           scores = sc, block_table = bt, epp = e, scale = self.scale,
+                           few_query = few_query)
         W = t1 - t0
         if W8 > W:
             sc[:, W : W8].fill_(_NEG_INF)

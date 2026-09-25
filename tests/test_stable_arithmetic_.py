@@ -25,11 +25,17 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def function(path, cls, name):
+    """The AST of one method of a production class, or of a module-level function (cls None)"""
+    tree = ast.parse((ROOT / path).read_text())
+    body = tree.body if cls is None else \
+        next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls).body
+    return next(n for n in body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
 def method(path, cls, name, ns):
     """Compile one method of a production class into `ns` (without its module's imports)"""
-    tree = ast.parse((ROOT / path).read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
-    fn = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    fn = function(path, cls, name)
     fn.decorator_list = []
     future = ast.parse("from __future__ import annotations").body
     exec(compile(ast.Module(body = future + [fn], type_ignores = []), str(path), "exec"), ns)
@@ -38,18 +44,14 @@ def method(path, cls, name, ns):
 
 def condition(path, cls, name, marker):
     """The test of the one `if`/`elif` in a production method whose source contains `marker`"""
-    tree = ast.parse((ROOT / path).read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
-    fn = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    fn = function(path, cls, name)
     tests = [n.test for n in ast.walk(fn) if isinstance(n, ast.If) and marker in ast.unparse(n.test)]
     assert len(tests) == 1, (name, marker, len(tests))
     return compile(ast.Expression(tests[0]), str(path), "eval")
 
 
 def assignment(path, cls, name, target):
-    tree = ast.parse((ROOT / path).read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
-    fn = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    fn = function(path, cls, name)
     value = next(n.value for n in ast.walk(fn) if isinstance(n, ast.Assign)
                  and any(isinstance(t, ast.Name) and t.id == target for t in n.targets))
     return compile(ast.Expression(value), str(path), "eval")
@@ -158,6 +160,57 @@ class CpuHostTests(unittest.TestCase):
         self.assertIn("model.layers.3.mlp", str(cm.exception))
 
 
+class DeepseekV41AttentionTests(unittest.TestCase):
+
+    def test_one_softmax_partition_in_every_attention_call(self):
+        tree = ast.parse((ROOT / "exllamav3/modules/dsv41.py").read_text())
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == "dsa_attn"]
+        self.assertTrue(calls)
+        for call in calls:
+            keyword = next((k for k in call.keywords if k.arg == "n_splits"), None)
+            self.assertIsNotNone(keyword, f"dsa_attn call at line {call.lineno} without n_splits")
+            code = compile(ast.Expression(keyword.value), "exllamav3/modules/dsv41.py", "eval")
+            self.assertEqual(eval(code, dict(STABLE_ARITHMETIC = False)), 0)
+            self.assertEqual(eval(code, dict(STABLE_ARITHMETIC = True)), 1)
+
+    def test_quantized_cache_is_refused(self):
+        # A packed pool is read with row-count-dependent arithmetic (staged to FP16 from 64 rows)
+        n = NS(compressed = False, contract = "deepseek")
+        for stable in (False, True):
+            register = method("exllamav3/architecture/deepseek_v41.py", "DeepseekV41Config",
+                              "register_packed_pool", dict(STABLE_ARITHMETIC = stable))
+            config = NS(_dsv41_numerics = n, _dsv41_packed_pools = set())
+            if stable:
+                with self.assertRaisesRegex(ValueError, "quantized Cache"):
+                    register(config, "pool")
+                self.assertEqual(config._dsv41_packed_pools, set())
+            else:
+                register(config, "pool")
+                self.assertEqual(config._dsv41_packed_pools, {"pool"})
+
+    def test_index_scores_take_the_tiled_kernel_at_every_row_count(self):
+        for stable in (False, True):
+            ns = dict(torch = torch, STABLE_ARITHMETIC = stable, _NEG_INF = float("-inf"))
+            score = method("exllamav3/modules/dsv41_select.py", "_ExtSlabs", "score", ns)
+            slabs = NS(backing = torch.zeros(4 * 256), s_stride = 256, q = torch.zeros(4, 2, 8),
+                       w = torch.zeros(4, 2), pos0 = 300, m = 1, pool_flat = torch.zeros(320, 8),
+                       scale = 1.0, scores_fn = Mock())
+            for bt, epp in ((None, 0), (torch.arange(5, dtype = torch.int32), 64)):
+                slabs.bt, slabs.epp = bt, epp
+                for rows in (1, 4):
+                    score(slabs, 0, rows, 0, 300, 304)
+            self.assertEqual(slabs.scores_fn.call_count, 4)
+            for call in slabs.scores_fn.call_args_list:
+                self.assertIs(call.kwargs["few_query"], not stable)
+        code = condition("exllamav3/modules/attention_fn/dsa_triton.py", None, "dsa_indexer_scores",
+                         "few_query")
+        for rows in range(1, 9):
+            for few_query in (True, False):
+                self.assertEqual(bool(eval(code, dict(R = rows, few_query = few_query))),
+                                 rows <= 4 and few_query)
+
+
 def _extension_missing():
     """
     Why the package test cannot run here, or None. It needs the prebuilt extension (importing
@@ -185,11 +238,12 @@ class PackageTests(unittest.TestCase):
             "from exllamav3.modules import mlp, block_sparse_mlp",
             "from exllamav3.modules.quant import exl3, fp16",
             "from exllamav3.model import moe_cpu_host",
-            "from exllamav3.modules import dsv4, dsv41_block",
+            "from exllamav3.modules import dsv4, dsv41, dsv41_block, dsv41_select",
             "print(mlp.STABLE_ARITHMETIC, block_sparse_mlp.STABLE_ARITHMETIC, block_sparse_mlp.FUSED_PREFILL,",
             "      exl3.STABLE_ARITHMETIC, fp16.HGEMM_FIXED_ROWS, moe_cpu_host.STABLE_ARITHMETIC,",
             "      moe_cpu_host.TUNING.fused_prefill, ext.stable_arithmetic(), ext.hgemm_fixed_rows(),",
-            "      dsv4.STABLE_ARITHMETIC, dsv41_block.STABLE_ARITHMETIC)",
+            "      dsv4.STABLE_ARITHMETIC, dsv41.STABLE_ARITHMETIC, dsv41_block.STABLE_ARITHMETIC,",
+            "      dsv41_select.STABLE_ARITHMETIC)",
         ])
         names = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL",
                  "EXL3_MOE_FUSED_DET", "EXL3_NO_FUSED_RECONSTRUCT")
@@ -199,7 +253,7 @@ class PackageTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True,
                            cwd = ROOT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 2)
+        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 4)
 
 
 if __name__ == "__main__":

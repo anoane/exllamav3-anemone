@@ -1094,6 +1094,18 @@ With `1` each operation below takes one arithmetic path at every row count, the 
   (`EXL3_BC_DSA`, on by default) keeps the grouped GEMM and runs all its projections through the
   direct quantized kernels, and V4 attention is otherwise not covered. It is the only
   DeepSeek-V4.1 attention or mixing change that also reaches DeepSeek-V4.
+- DeepSeek-V4.1 attention, cached and stateless, takes one softmax pass at every row count. By
+  default `dsa_attn` gives calls of up to 8 query rows (decode, short chunks) a flash-decoding
+  split: the keys are divided into 8 or 16 partitions whose partial softmax results are combined
+  afterwards, in another order than the one-pass softmax of longer calls. Under the profile V4.1
+  passes `n_splits = 1` at every row count.
+- DeepSeek-V4.1's lightning indexer scores every row count with the query-tiled kernel. By
+  default `dsa_indexer_scores` scores calls of up to 4 rows with a few-query kernel that reduces
+  over the index heads in another order, so a decoded row's FP16 scores can differ in the last
+  bit from the same row's scores in a prefill chunk; at a near-tie on the top-512 boundary the
+  row then selects different entries, and decode and prefill of the same tokens diverge. Under the
+  profile V4.1's selector calls `dsa_indexer_scores(..., few_query = False)`. (`few_query`
+  defaults to `True`, the automatic choice, for every other caller.)
 
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported. It
 may be combined with `EXL3_HGEMM_FIXED_ROWS` and `EXL3_MOE_FUSED_PREFILL` left unset or set to
@@ -1118,7 +1130,11 @@ Refused, as an error rather than a partial profile:
 - at load, with an extension built with `EXLLAMA_NO_WHOLE_K_MOE` set, every MoE layer whose
   experts the fused kernel computes (GPU-resident or streamed from system RAM; dense models are
   not affected): a `ValueError` names the layer, the whole-K kernels this build lacks and the build
-  option, and the launcher refuses the same call with a `RuntimeError` if it is reached another way.
+  option, and the launcher refuses the same call with a `RuntimeError` if it is reached another way;
+- when a Cache is built, a quantized DeepSeek-V4.1 Cache (`-cq`): its cached attention stages the
+  packed pool back to FP16 for calls of 64 or more query rows and reads it packed, in the rotated
+  domain, below that, so decode and short chunks would round other quantities than long prefill
+  chunks. The profile covers DeepSeek-V4.1 with an FP16 Cache.
 
 What it does not cover: operations not listed above keep their row-count-dependent dispatch,
 among them the attention kernels of most architectures (prefill and decode kernels differ); the
@@ -1143,8 +1159,9 @@ allocates and the autosplit already measures.
 
 Performance: slower, in prefill and much more in decode. Every decoded token reconstructs the
 weights of every EXL3 linear that `LinearEXL3.forward` dispatches and runs the MoE layers through
-the prefill kernels, without native CUDA graphs; DeepSeek-V4.1 decode also gives up the
-multi-chunk mHC mix (one 64-thread block per row streams the whole FP32 mixing matrix, about
+the prefill kernels, without native CUDA graphs; DeepSeek-V4.1 decode also gives up the fast
+paths for calls of a few rows: the flash-decoding attention split, the few-query index scorer,
+the multi-chunk mHC mix (one 64-thread block per row streams the whole FP32 mixing matrix, about
 2 MB, at both mixing sites of every layer, instead of 80 blocks per row below 7 rows) and the
 grouped `wo_a` GEMM (8 per-group linears and a concatenation instead of one launch), whose share
 was not measured separately; prefill pays the fixed-row GEMM tiles (2.6x-3.1x
@@ -1689,9 +1706,10 @@ Interactions and refusals:
   (`Cache(model, layer_type = CacheLayer_quant, ...)`), and assigning such a setting is refused
   while a quantized Cache built for a model of this config exists (call
   `cache.detach_from_model()` and drop the Cache first). `index` and `window` combine with `-cq`
-  freely. Both are configuration-time errors: neither refusal happens inside a forward pass (the
-  operand checks above do). The error suggests the setting without its `compressed` part, or
-  the default when no other part is left.
+  freely, except under `EXL3_STABLE_ARITHMETIC=1`, which refuses a quantized V4.1 Cache. Both
+  are configuration-time errors: neither refusal happens inside a forward pass (the operand
+  checks above do). The error suggests the setting without its `compressed` part, or the default
+  when no other part is left.
 - A pool replica (the split of an explicit placement, placement.md, "DeepSeek-V4.1") copies the
   stored, already rounded entries bitwise.
 - The setting applies to the cached (generation) path and to the stateless path alike.

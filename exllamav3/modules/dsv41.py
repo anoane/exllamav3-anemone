@@ -52,6 +52,7 @@ from .attention_fn.dsa_triton import dsa_attn
 from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
 from ..constants import PAGE_SIZE
+from ..model.math_policy import STABLE_ARITHMETIC
 from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
 from ..cache.dsv41_replica import sync_pool_replica
 from .dsv41_select import select_topk, INT32_LIMIT
@@ -875,6 +876,11 @@ class DSV41Attention(DSV4Attention):
                 compress_rate = m, scale = self.sm_scale,
                 derot_inv_freq = self._rope_type_neg(), groups = self.o_groups,
                 group_major = True,
+                # dsa_attn's automatic choice gives calls of up to 8 query rows (decode) a split
+                # softmax over key partitions, whose partial results combine in another order
+                # than the one-pass softmax of longer calls; EXL3_STABLE_ARITHMETIC=1 keeps one
+                # partition at every row count
+                n_splits = 1 if STABLE_ARITHMETIC else 0,
                 out = torch.empty((self.o_groups, seq, hpg * hd), dtype = torch.half,
                                   device = device),
                 nc_chunk = bool(params.get("nc_chunk", False)),
@@ -1051,6 +1057,9 @@ class DSV41Attention(DSV4Attention):
             indices = indices, k_len = k_len, pool_len = pool_len, q_pos0 = pos0,
             compress_rate = m or 1, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
+            # one softmax partition at every row count under EXL3_STABLE_ARITHMETIC=1, as in
+            # the stateless path
+            n_splits = 1 if STABLE_ARITHMETIC else 0,
             page_size = page, qc = qc,
             out = torch.empty((self.o_groups, seq, hpg * hd), dtype = torch.half, device = device),
         )

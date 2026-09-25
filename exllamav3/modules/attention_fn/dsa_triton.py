@@ -1156,9 +1156,16 @@ def dsa_indexer_scores(
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
+    few_query = True,        # False: the query-tiled kernel at every row count
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
-    min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
+    min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk.
+
+    Calls of up to 4 rows take the few-query kernel, longer calls the query-tiled one. The two
+    reduce over the heads in different orders, so the same row can score differently in the
+    last bit in a decode and in a prefill call. With few_query = False every row count takes
+    the query-tiled kernel, in which a row's scores do not depend on the other rows of the
+    call."""
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
@@ -1188,7 +1195,7 @@ def dsa_indexer_scores(
             and scores.stride(1) == 1 and scores.stride(0) == S_stride, \
             "dsa_indexer_scores: score backing must be a row-contiguous (>= R, >= T rounded to the tile) view"
     with torch.cuda.device(q_idx.device):
-        if R <= 4:
+        if R <= 4 and few_query:
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
             # the query-tiled kernel degenerates to a serial head loop over padding here
             f_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0)

@@ -166,7 +166,10 @@ def _install_stubs():
     _pkg(f"{_P}.util.rope", RopeStyle = types.SimpleNamespace(GPTJ = 1))
     _pkg(f"{_P}.ext", exllamav3_ext = None)
     _pkg(f"{_P}.constants", PAGE_SIZE = 256)
+    _pkg(f"{_P}.model")
     load_package_file("exllamav3/util/device_copy.py", f"{_P}.util.device_copy")
+    # the arithmetic policy the attention and the selection import is the real file
+    load_package_file("exllamav3/model/math_policy.py", f"{_P}.model.math_policy", f"{_P}.model")
     # the attention numerics and their rounding kernels are the real files
     load_package_file("exllamav3/architecture/dsv41/numerics.py", f"{_P}.architecture.dsv41.numerics",
                       f"{_P}.architecture.dsv41")
