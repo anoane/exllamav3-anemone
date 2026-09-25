@@ -432,7 +432,7 @@ def plan_component(model, placement, memory: HostMemory | None = None) -> Compon
                              f"component at {cap}")
         if static > req.nbytes:
             raise ValueError(f"placement: the stream / cpu layers keep {human(static)} of routed experts in RAM, "
-                             f"more than ram experts={req}; raise it, or keep fewer layers' experts in RAM")
+                             f"more than ram experts={req}; raise it or move layers to experts=cache")
     elif req is not None and req.is_all and cap is not None and static > cap.nbytes:
         raise ValueError(f"placement asks ram experts=all ({human(static)}) but {flag} caps this component at {cap}")
     elif cap is not None and static > cap.nbytes:

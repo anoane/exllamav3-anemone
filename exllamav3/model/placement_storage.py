@@ -59,7 +59,7 @@ DEVICE = re.compile(r"^cuda:([0-9]+)$")      # ASCII digits only
 # placement using one is refused at parse time (refuse_pending) after every other check, so its
 # text is validated already; the commit that makes a word runnable removes its entry
 PENDING = {
-    "experts=cache": "the expert tier runtime (a VRAM expert cache per GPU over the RAM tier and the disk)",
+    "disk experts=<dir>": "expert reads from a copy in another directory (the cache reads the model's own shards)",
     "prefetch=": "prefill read-ahead of the experts that only the disk holds",
     "profile=": "expert profiles that seed the hot and cached experts",
     "disk ngram=<dir>": "n-gram tables read from a copy in another directory",
@@ -431,14 +431,14 @@ def pending_words(placement) -> list[str]:
     """The PENDING words a placement uses, in PENDING's order"""
     used = set()
     for r in placement.rules:
-        if r.experts.mode == "cache":
-            used.add("experts=cache")
         if r.experts.prefetch is not None:
             used.add("prefetch=")
         if r.experts.profile is not None:
             used.add("profile=")
     disk = placement.disk
     if disk is not None:
+        if disk.experts not in ("model", "off"):
+            used.add("disk experts=<dir>")
         if disk.ngram not in ("model", "off"):
             used.add("disk ngram=<dir>")
         if disk.io != IO[0]:

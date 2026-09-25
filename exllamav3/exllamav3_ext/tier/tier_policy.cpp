@@ -330,7 +330,11 @@ Record VramDirectory::lookup(int32_t lc, const int32_t* ids, int64_t n, int mode
                     placed = true;
                 }
             }
-            if (!placed) ++*starved;
+            if (!placed)
+            {
+                ++*starved;
+                x.starved = 1;
+            }
         }
         if (!placed)
         {
@@ -543,6 +547,32 @@ Record TierCore::lookup(int32_t lc, const int32_t* ids, int64_t n, int mode)
         else ++c[kTransients];
     }
     return rec;
+}
+
+void TierCore::process(const Record& rec, std::vector<Action>& acts)
+{
+    if (rec.lc < 0 || rec.lc >= L) fail("record of layer " + std::to_string(rec.lc) + " out of range");
+    seq = rec.seq;
+    const uint32_t inc = rec.mode == kDecode ? kQ16 : cfg.prefill_inc;
+    ++c[kCalls];
+    for (const Entry& x : rec.entries)
+    {
+        heat.add(x.key, (uint64_t) x.cnt * inc);
+        if (x.kind == kHit) ++c[kHits];
+        else if (x.kind == kAdmitted)
+        {
+            ++c[kAdmits];
+            if (x.vkey >= 0) ++c[kRetires];
+            if (x.inplace) ++c[kInplace];
+        }
+        else
+        {
+            ++c[kTransients];
+            if (x.starved) ++c[kStarved];
+        }
+    }
+    vram.apply(rec);
+    host(rec, acts);
 }
 
 void TierCore::layer_call(int32_t lc, const int32_t* ids, int64_t n, std::vector<Action>& acts)

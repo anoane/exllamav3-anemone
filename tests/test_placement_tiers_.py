@@ -48,15 +48,15 @@ EXAMPLES = [
      "0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1", True),
     ("T5", "V4.1, CMP + PRO, layers 12-39 cached over RAM that holds the rest, no disk reads",
      "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off",
-     "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off", False),
+     "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off", True),
     ("T6", "V4.1 on the PRO alone: 75 GiB cache, 96 GiB RAM tier, n-gram budget",
      "*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB ngram=6GiB",
-     "*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB ngram=6GiB", False),
+     "*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB ngram=6GiB", True),
     ("T7", "RAM-limited box: 16 pinned per layer, the tier takes what is free after 24 GiB of page cache",
      "*=cuda:0 experts=cache hot=16; ram experts=auto pagecache=24GiB",
-     "*=cuda:0 experts=cache hot=16; ram experts=auto pagecache=24GiB", False),
+     "*=cuda:0 experts=cache hot=16; ram experts=auto pagecache=24GiB", True),
     ("T8", "no RAM tier: the VRAM cache straight over the SSD", "*=cuda:0 experts=cache; ram experts=0",
-     "*=cuda:0 experts=cache; ram experts=0", False),
+     "*=cuda:0 experts=cache; ram experts=0", True),
     ("T9", "per-layer overrides with profiles and prefetch",
      "0-2,39=cuda:1; 3-29=cuda:1 experts=cache hot=10% profile=code:3,wiki:1; "
      "30-38=cuda:1 experts=cache prefetch=layer:2+router; ram experts=64GiB",
@@ -64,17 +64,17 @@ EXAMPLES = [
      "30-38=cuda:1 experts=cache prefetch=layer:2+router; ram experts=64GiB", False),
     ("T10", "big-RAM host: inclusive RAM, whole n-gram tables",
      "*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive",
-     "*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive", False),
+     "*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive", True),
     ("T11", "every policy knob",
      "*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; "
      "ram experts=64GiB pagecache=16GiB policy=exclusive demote=heat evict=lru; disk io=direct",
      "*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; "
      "ram experts=64GiB pagecache=16GiB policy=exclusive demote=heat evict=lru; disk io=direct", False),
     ("T12", "no D2H at all", "*=cuda:0 experts=cache; ram experts=48GiB demote=off",
-     "*=cuda:0 experts=cache; ram experts=48GiB demote=off", False),
+     "*=cuda:0 experts=cache; ram experts=48GiB demote=off", True),
     ("T13", "CPU-computed layers on one GPU, cached layers on the other",
      "0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB",
-     "0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB", False),
+     "0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB", True),
     ("T14", "experts and engram tables read from other drives",
      '*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"',
      '*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"', False),
@@ -84,20 +84,20 @@ EXAMPLES = [
      cuda:1 cache=auto spare=8 evict=lru admit=adaptive
      ram experts=52GiB pagecache=auto policy=lazy-exclusive demote=swap evict=lfu
      disk experts=model ngram=model io=auto
-     """, "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB", False),
+     """, "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB", True),
     ("T16", "GPU streaming with a resident slice (-mcs k -mcm stream_only)",
      "*=cuda:1 experts=stream hot=64", "*=cuda:1 experts=stream hot=64", True),
     ("T17", "units", "*=cuda:0 experts=cache; cuda:0 cache=1.5; ram experts=48GB ngram=512mi",
-     "*=cuda:0 experts=cache; cuda:0 cache=1536MiB; ram experts=48GB ngram=512MiB", False),
+     "*=cuda:0 experts=cache; cuda:0 cache=1536MiB; ram experts=48GB ngram=512MiB", True),
     ("T18", "n-gram budget only, for a PLE model", "*=cuda:0; ram ngram=12GiB", "*=cuda:0; ram ngram=12GiB", True),
     # the three test configurations of doc/expert_tiers.md
     ("a", "PRO + RAM for every non-VRAM expert", "*=cuda:0 experts=cache; ram experts=all; disk experts=off",
-     "*=cuda:0 experts=cache; ram experts=all; disk experts=off", False),
+     "*=cuda:0 experts=cache; ram experts=all; disk experts=off", True),
     ("b", "PRO + RAM <= 128 GiB + SSD tier", "*=cuda:0 experts=cache; ram experts=96GiB",
-     "*=cuda:0 experts=cache; ram experts=96GiB", False),
+     "*=cuda:0 experts=cache; ram experts=96GiB", True),
     ("c", "PRO + CMP resident + RAM, no expert SSD reads",
      "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off",
-     "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off", False),
+     "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off", True),
     # runnable storage words
     ("R1", "a request on stream layers, page cache kept for auto", "0-11=cuda:0; 12-22=cuda:1 experts=stream; "
      "23-39=cuda:1; ram experts=64GiB pagecache=16GiB",
@@ -289,7 +289,7 @@ class RefusalTests(unittest.TestCase):
 
     def test_pending_words(self):
         cases = (
-            ("*=cuda:0 experts=cache", "experts=cache", "the expert tier runtime"),
+            ("*=cuda:0 experts=cache; disk experts=/mnt/x", "disk experts=<dir>", "expert reads from a copy"),
             ("*=cuda:0 experts=stream prefetch=layer", "prefetch=", "prefill read-ahead"),
             ("*=cuda:0 experts=cpu profile=code", "profile=", "expert profiles"),
             ("*=cuda:0; disk ngram=/mnt/x", "disk ngram=<dir>", "n-gram tables read from a copy"),
@@ -302,8 +302,8 @@ class RefusalTests(unittest.TestCase):
             self.assertTrue(msg.startswith(f"placement '{text}': "), msg)
             self.assertIn(f": {word} is not available in this build yet; it needs {need}", msg)
             self.assertTrue(msg.endswith("(see doc/expert_tiers.md)"), msg)
-        self.assertEqual(PS.pending_words(P.Placement((P.Rule("rest", (), "cuda:0", P.Experts("cache")),))),
-                         ["experts=cache"])
+        # experts=cache runs in this build
+        self.assertEqual(PS.pending_words(P.Placement((P.Rule("rest", (), "cuda:0", P.Experts("cache")),))), [])
         # every other check comes first: a malformed pending word gets its own message
         with self.assertRaisesRegex(ValueError, "spare=0 leaves no free slot"):
             P.parse("*=cuda:0 experts=cache; cuda:0 spare=0")

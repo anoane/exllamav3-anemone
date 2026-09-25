@@ -404,6 +404,10 @@ class Model(Model_TPMixin, Model_LSMixin):
     def unload(self):
         for module in self.modules:
             module.unload()
+        tiers = getattr(self.config, "expert_tiers", None)
+        if tiers is not None and getattr(self, "component", "text") == "text":
+            tiers.unload()
+            self.config.expert_tiers = None
         # The loader's open slab blocks must not outlive the tensors sliced from them
         self.config.stc.release_arena()
         self.active_devices = []
@@ -590,6 +594,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         budget = plan_component(self, placement)
         if budget.worth_reporting():
             print(budget.summary())
+        # experts=cache layers: their GPUs' expert caches, sized and filled at the end of the split
+        # (model/expert_tier.py)
+        if getattr(self, "component", "text") == "text":
+            self.config.expert_tiers = None
+            if budget.tier is not None:
+                from .expert_tier import ExpertTierSet
+                self.config.expert_tiers = ExpertTierSet(self.config, placement, budget)
 
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."

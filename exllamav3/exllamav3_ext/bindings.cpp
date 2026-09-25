@@ -72,6 +72,7 @@
 #include "ngram.cuh"
 #include "disk/disk_ext.h"
 #include "tier/tier_ext.h"
+#include "tier/tier_gpu_ext.h"
 
 #include "attention.cuh"
 
@@ -121,6 +122,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     #include "disk/disk_bc.h"
     #include "tier/tier_bc.h"
+    #include "tier/tier_gpu_bc.h"
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");

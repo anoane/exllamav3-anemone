@@ -113,4 +113,7 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
 .def_readonly("sh_coop", &BC_BlockSparseMLP::sh_coop)
 .def("run_bszN", &BC_BlockSparseMLP::run_bszN)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)
-.def("run_single_expert_dq", &BC_BlockSparseMLP::run_single_expert_dq);
+.def("run_single_expert_dq", &BC_BlockSparseMLP::run_single_expert_dq)
+.def("run_single_expert_dq_views", &BC_BlockSparseMLP::run_single_expert_dq_views,
+     py::arg("y"), py::arg("expert_idx"), py::arg("g_trellis"), py::arg("u_trellis"), py::arg("d_trellis"),
+     py::arg("yh"), py::arg("interm"), py::arg("interm_a"), py::arg("out"));

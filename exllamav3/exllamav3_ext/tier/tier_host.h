@@ -62,6 +62,8 @@ struct HostConfig
     int fill_inflight = 8;                      // cold fill reads in flight
     int staging_slots = 0;                      // per staging half (E - hot); 0 = experts per layer
     bool deterministic = true;                  // finish every read and copy before a call returns
+    bool compact_fill = false;                  // move the cold-filled RAM slots to the compact layout (one
+                                                // aligned copy per promotion instead of three unaligned ones)
 };
 
 // Device-side copies. dst / src device addresses are uint64_t (HostCopier: host pointers). `after`:
@@ -133,6 +135,7 @@ struct HostStats
     int64_t hazard_waits = 0;                   // a write into a slot waited for a read or write of it
     int64_t slab_waits = 0;                     // the slab was full and a read waited for a slot
     int64_t cold_ram = 0, cold_vram = 0, cold_bytes = 0, cold_ns = 0;
+    int64_t compacted = 0, compact_ns = 0;      // RAM slots moved to the compact layout at the cold fill
     int64_t arena_ns = 0;                       // mapping, faulting in and registering the RAM tier
 };
 
@@ -147,13 +150,20 @@ public:
     TierHost& operator=(const TierHost&) = delete;
 
     // Load: place the keys in priority order (pool, then RAM tier) and read them: RAM slots in
-    // place, pool slots through the slab (or from their RAM copy when RAM holds one too)
-    void cold_fill(const std::vector<int32_t>& order);
+    // place, pool slots through the slab (or from their RAM copy when RAM holds one too). `pins`
+    // go to the hot-pin slots after the pool first (read through the slab); `order` leaves them out
+    void cold_fill(const std::vector<int32_t>& order, const std::vector<int32_t>& pins = {});
+    // Give the disk slab back once nothing reads the SSD at runtime (disk experts=off, after the
+    // cold fill)
+    void release_slab();
     // One call decided by the reference directory (CPU replay): lookup, then process
     Record call(int32_t lc, const int32_t* ids, int64_t n, int mode);
     // The host side of a record decided elsewhere (the lookup kernel): apply it to the mirror, add
     // its heat and counters, then run the policy's host step and execute its actions
     void process(const Record& rec);
+    // Production mode (defer_returns): the demoted pool slots whose copy to RAM has landed, handed
+    // back to the directory mirror; the caller returns them to the lookup kernel
+    std::vector<int32_t> return_landed();
     // A layer-mode prefill call: stage every cached expert of the layer that the pool does not
     // hold into staging half `half` (RAM copies, prefetched or fresh SSD reads), then refills
     void layer_call(int32_t lc, const int32_t* ids, int64_t n, int half);
@@ -168,6 +178,10 @@ public:
     void drain();
     // Retire what completed without waiting (refills)
     void poll();
+
+    // Hand the copies to another Copier (the runtime: from the copy engines of the load to the fetch
+    // kernel's plan). Only when nothing is in flight (after cold_fill() or drain())
+    void set_copier(Copier* c) { copier_ = c; }
 
     // The trellis bytes of a RAM slot in projection order (compact), for checks
     void ram_trellis(int32_t r, uint8_t* out) const;
@@ -210,6 +224,7 @@ private:
     void finish_read(int32_t key, uint8_t* slot, exl3_disk::TicketId t);
     void pread_extent(int32_t key, uint8_t* slot);
     void ram_ready_for_write(int32_t r);
+    void compact_ram(const std::vector<int32_t>& slots);
     void ram_ready_for_read(int32_t r);
     int32_t slab_take();
     void slab_release(int32_t i);

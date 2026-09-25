@@ -26,7 +26,9 @@ def load_ext(build_dir: str | None = None, verbose: bool = False):
     src = os.path.abspath(os.path.join(here, "..", "..", "exllamav3", "exllamav3_ext"))
     sources = [os.path.join(src, "disk", f)
                for f in ("disk_config.cpp", "disk_engine.cpp", "disk_uring.cpp", "disk_ext.cpp")]
-    sources += sorted(glob.glob(os.path.join(src, "tier", "*.cpp")))
+    # the GPU runtime (tier_gpu*) needs the CUDA toolkit and the rest of the extension
+    sources += sorted(f for f in glob.glob(os.path.join(src, "tier", "*.cpp"))
+                      if not os.path.basename(f).startswith("tier_gpu"))
     sources += [os.path.join(here, "mini_ext_module.cpp")]
     build_dir = build_dir or os.environ.get("EXL3_TIER_MINI_BUILD_DIR")
     if build_dir:

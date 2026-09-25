@@ -41,7 +41,7 @@ disk <attributes>               # where experts and n-gram rows are read from at
 | `experts=<mode>` | Where an MoE layer's routed experts live. Default `vram`. See below. |
 | `hot=<k>` or `hot=<p>%` | With `experts=cache`, `stream` or `cpu`: routed experts per layer kept resident in VRAM, a count or a share of the layer's routed experts (rounded half up). `hot=0` is the default. At least one expert must stay non-resident (`hot=E` asks for `experts=vram`). |
 | `cpu=<k>` | With `experts=split` only, and required there: routed experts per layer held in system RAM. |
-| `prefetch=` | With `experts=cache` or `stream`: `auto` (default), `off`, or methods joined by `+`: `layer[:<depth>]` (read the next layers' experts during prefill), `router[:<depth>]` (fetch predicted experts during decode). Not available in this build yet (see below). |
+| `prefetch=` | With `experts=cache` or `stream`: `auto` (default), `off`, or methods joined by `+`: `layer[:<depth>]` (read the next layers' experts during prefill), `router[:<depth>]` (fetch predicted experts during decode). Not available in this build yet (see below): writing it is refused. |
 | `profile=` | Not with `vram`: an expert profile (names or paths with weights, e.g. `code:3,wiki:1`) that seeds the hot and cached experts. Not available in this build yet. |
 
 The expert modes, with the older settings each one corresponds to:
@@ -49,7 +49,7 @@ The expert modes, with the older settings each one corresponds to:
 | `experts=` | Storage | Computation | Older equivalent |
 |---|---|---|---|
 | `vram` | GPU memory of the layer's device | that GPU | no offload |
-| `cache` | the GPU's expert cache, over the RAM tier and the disk ([expert_tiers.md](expert_tiers.md)) | the layer's GPU, from VRAM | new; not available in this build yet |
+| `cache` | the GPU's expert cache, over the RAM tier and the disk ([expert_tiers.md](expert_tiers.md)); `hot=<k>` pins `k` experts per layer | the layer's GPU, from VRAM, bit-identical to `vram` | new |
 | `stream` | system RAM | every expert a call selects is streamed to the layer's GPU and computed there, one-token decode included; no CPU expert arithmetic | `-mcl` with `-mcm stream_only` (`EXL3_MOE_CPU_MODE`) |
 | `stream hot=<k>` | `k` routed experts per layer in GPU memory, the rest in system RAM | the resident ones on the GPU, the others streamed to it; dynamic placement (`EXL3_MOE_CPU_SWAP`) re-chooses the resident ones between generations | `-mcs E-k` with `-mcm stream_only` |
 | `cpu` | system RAM | the CPU expert worker; during prefill the experts with at least `EXL3_MOE_STREAM_T` assignments in a chunk of at least `EXL3_MOE_STREAM_MIN_ROWS` rows are streamed to the GPU | `-mcl` |
@@ -65,9 +65,9 @@ The storage rules, in short (each is described in full, with its defaults and ch
 
 | Rule | Attributes | In this build |
 |---|---|---|
-| `cuda:<n>` | `cache=auto\|0\|<size>`, `spare=<k>`, `evict=lru\|lfu`, `admit=adaptive\|heat\|always`: the expert cache of that GPU | needs `experts=cache` (not yet) |
+| `cuda:<n>` | `cache=auto\|0\|<size>`, `spare=<k>`, `evict=lru\|lfu`, `admit=adaptive\|heat\|always`: the expert cache of that GPU | with `experts=cache` layers on that GPU |
 | `ram` | `experts=auto\|all\|<size>`, `ngram=auto\|all\|<size>`, `pagecache=auto\|<size>`: the component's RAM budgets; `policy=`, `demote=`, `evict=`: the RAM tier of `cache` layers | `experts=`, `ngram=` and `pagecache=` apply to `stream` / `cpu` / `split` layers and n-gram tables; the tier words need `experts=cache` |
-| `disk` | `experts=model\|off\|<dir>`, `ngram=model\|off\|<dir>`, `io=auto\|direct\|buffered` | `ngram=off` (with `ram ngram=all`); the rest needs `experts=cache` or is not yet available |
+| `disk` | `experts=model\|off\|<dir>`, `ngram=model\|off\|<dir>`, `io=auto\|direct\|buffered` | `experts=model\|off` (with `experts=cache`), `ngram=off` (with `ram ngram=all`); `<dir>` and `io=` are not yet available |
 
 Sizes are written as for the RAM budgets: `48GiB` (binary), `48GB` (decimal), `48` (GiB), never
 the ambiguous `48G`; see [expert_tiers.md](expert_tiers.md).
@@ -111,11 +111,11 @@ Details:
   "disk": {...}}`), the same as a JSON object in a string, or `@<path>` to a file holding the rule
   text (comments and newlines included) or the JSON. `parse()` takes all of them, and
   `config.infer_params.placement` accepts a dict too.
-- Words the grammar has but this build cannot run yet (`experts=cache` and the storage words that
-  need it, `prefetch=`, `profile=`, `disk ngram=<dir>`, `disk io=`) are checked like any other
-  word, then refused with their own message, e.g. `placement '*=cuda:0 experts=cache':
-  experts=cache is not available in this build yet; it needs the expert tier runtime (a VRAM
-  expert cache per GPU over the RAM tier and the disk) (see doc/expert_tiers.md)`.
+- Words the grammar has but this build cannot run yet (`prefetch=`, `profile=`, `disk
+  experts=<dir>`, `disk ngram=<dir>`, `disk io=`) are checked like any other word, then refused
+  with their own message, e.g. `placement '*=cuda:0 experts=cache; disk experts=/nvme1/v41': disk
+  experts=<dir> is not available in this build yet; it needs expert reads from a copy in another
+  directory (the cache reads the model's own shards) (see doc/expert_tiers.md)`.
 
 ## No placement
 

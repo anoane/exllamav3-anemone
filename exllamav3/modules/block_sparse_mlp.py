@@ -14,6 +14,7 @@ from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
+from .block_sparse_mlp_tier import BlockSparseMLP_Tier
 from .moe_batch_recon import PAD_MAX
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
@@ -112,7 +113,7 @@ def _routing_check_compare(key, local_sel, local_w, sel, w):
         st["w_maxdiff"] = max(st["w_maxdiff"], float((lw.float() - bw.float()).abs().max().item()))
 
 
-class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
 
     def __init__(
         self,
@@ -477,6 +478,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.fused_rows = TEMP_ROWS_FUSED
         self.batch_recon = None
         self._cpu_init_state()
+        self._tier_init_state()
 
     @override
     def optimizer_targets(self):
@@ -806,6 +808,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_maybe_offload_load(device, **kwargs):
             return
         self.cpu_maybe_split_load(device, **kwargs)
+        # experts=cache (block_sparse_mlp_tier.py): the routed experts live in the GPU's expert cache
+        self.tier_maybe_attach(device, **kwargs)
         super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
@@ -846,6 +850,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
+            self.tier_register()
 
 
     def _batch_recon_layer(self, y):
@@ -982,6 +987,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     @override
     def unload(self):
+        self.tier_unload()
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
@@ -1085,6 +1091,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
         cpu_partial = None
         cpu_pending = None
+        # Expert cache (experts=cache): the call's experts into VRAM, the pointer tables at them
+        if self.tier is not None:
+            self.tier_resolve(selected_experts, bsz, params)
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
@@ -1312,6 +1321,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if self.bc is not None and self.support_quant_paths:
                         # Graph path
                         if count <= TEMP_ROWS_GRAPH:
+                            if self.tier is not None: self.tier_guard("graph")
                             self.bc.run_single_expert(current_state, expert_idx)
                             current_state = self.experts_cfg.out_d2[:count]
 
@@ -1336,11 +1346,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 interm_a_ = interm_a[:count]
 
                             yh = torch.empty((count * 2, self.expert_size), dtype = torch.half, device = self.device)
-                            self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
+                            if self.tier is not None:
+                                # expert cache: the trellis where the lookup put it
+                                self.bc.run_single_expert_dq_views(current_state, expert_idx, *self.tier_trellis_views(expert_idx),
+                                                                   yh, interm_, interm_a_, out_state)
+                            else:
+                                self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
                             current_state = out_state_
                     else:
 
                         # Torch path
+                        if self.tier is not None: self.tier_guard("torch")
                         def mlp(exp_i, xc):
                             u = self.ups[exp_i].forward(xc, params)
                             if self.gated:

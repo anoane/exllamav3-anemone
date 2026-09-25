@@ -193,4 +193,32 @@ struct BC_BlockSparseMLP
         at::Tensor& interm_a,
         at::Tensor& out
     );
+
+    // run_single_expert_dq with the expert's trellis tensors given (gate: none for gateless experts)
+    void run_single_expert_dq_views
+    (
+        const at::Tensor& y,
+        const int expert_idx,
+        const c10::optional<at::Tensor>& g_trellis,
+        const at::Tensor& u_trellis,
+        const at::Tensor& d_trellis,
+        at::Tensor& yh,
+        at::Tensor& interm,
+        at::Tensor& interm_a,
+        at::Tensor& out
+    );
+
+private:
+    void dq_impl
+    (
+        const at::Tensor& y,
+        const int expert_idx,
+        const at::Tensor* g_trellis,
+        const at::Tensor& u_trellis,
+        const at::Tensor& d_trellis,
+        at::Tensor& yh,
+        at::Tensor& interm,
+        at::Tensor& interm_a,
+        at::Tensor& out
+    );
 };

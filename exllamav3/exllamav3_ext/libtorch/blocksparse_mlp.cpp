@@ -488,6 +488,53 @@ void BC_BlockSparseMLP::run_single_expert_dq
     at::Tensor& out
 )
 {
+    dq_impl(y, expert_idx, gated ? &gates[expert_idx]->trellis : nullptr, ups[expert_idx]->trellis,
+            downs[expert_idx]->trellis, yh, interm, interm_a, out);
+}
+
+// The expert's trellis tensors given by the caller (the expert tier's VRAM slots, exllamav3_ext/tier:
+// the module's own per-expert trellis tensors only stand in for the shapes there); suh / svh and
+// everything else as run_single_expert_dq. Same kernels, same arguments: the same bits for the
+// same trellis bytes wherever they live
+void BC_BlockSparseMLP::run_single_expert_dq_views
+(
+    const at::Tensor& y,
+    const int expert_idx,
+    const c10::optional<at::Tensor>& g_trellis,
+    const at::Tensor& u_trellis,
+    const at::Tensor& d_trellis,
+    at::Tensor& yh,
+    at::Tensor& interm,
+    at::Tensor& interm_a,
+    at::Tensor& out
+)
+{
+    TORCH_CHECK(expert_idx >= 0 && expert_idx < (int) ups.size(), "run_single_expert_dq_views: expert out of range");
+    TORCH_CHECK(!gated || g_trellis, "run_single_expert_dq_views: gated experts need the gate trellis");
+    auto same = [] (const at::Tensor& a, const at::Tensor& b, const char* what)
+    {
+        TORCH_CHECK(a.sizes() == b.sizes() && a.scalar_type() == b.scalar_type() && a.is_contiguous() &&
+                    a.device() == b.device(), "run_single_expert_dq_views: ", what, " trellis shape, type or device");
+    };
+    if (gated) same(*g_trellis, gates[expert_idx]->trellis, "gate");
+    same(u_trellis, ups[expert_idx]->trellis, "up");
+    same(d_trellis, downs[expert_idx]->trellis, "down");
+    dq_impl(y, expert_idx, gated ? &*g_trellis : nullptr, u_trellis, d_trellis, yh, interm, interm_a, out);
+}
+
+void BC_BlockSparseMLP::dq_impl
+(
+    const at::Tensor& y,
+    const int expert_idx,
+    const at::Tensor* g_trellis,
+    const at::Tensor& u_trellis,
+    const at::Tensor& d_trellis,
+    at::Tensor& yh,
+    at::Tensor& interm,
+    at::Tensor& interm_a,
+    at::Tensor& out
+)
+{
     int bsz = y.size(0);
 
     at::Tensor yh1 = yh.slice(0, 0, bsz);
@@ -500,9 +547,9 @@ void BC_BlockSparseMLP::run_single_expert_dq
         had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
                        y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
 
-        reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
+        reconstruct(dq_temp_up, *g_trellis, gate_K, gate_mcg, gate_mul1);
         hgemm_recon(yh1, dq_temp_up, interm1);
-        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        reconstruct(dq_temp_up, u_trellis, up_K, up_mcg, up_mul1);
         hgemm_recon(yh2, dq_temp_up, interm2);
 
         had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
@@ -511,7 +558,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
     else
     {
         had_r_128(y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
-        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        reconstruct(dq_temp_up, u_trellis, up_K, up_mcg, up_mul1);
         hgemm_recon(yh2, dq_temp_up, interm2);
         had_r_128(interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
     }
@@ -530,7 +577,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
         relu2_mul(interm1, interm2, interm_a, act_limit);
 
     had_r_128(interm_a, interm_a, downs[expert_idx]->suh, c10::nullopt, 1.0);
-    reconstruct(dq_temp_down, downs[expert_idx]->trellis, down_K, down_mcg, down_mul1);
+    reconstruct(dq_temp_down, d_trellis, down_K, down_mcg, down_mul1);
     hgemm_recon(interm_a, dq_temp_down, out);
     had_r_128(out, out, c10::nullopt, downs[expert_idx]->svh, 1.0);
 }

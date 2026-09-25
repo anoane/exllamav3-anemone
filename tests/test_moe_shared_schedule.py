@@ -35,7 +35,7 @@ def test_shared_schedule(rows, pending, tp, offload):
         events.append('tp')
 
     layer = SimpleNamespace(
-        alt_residual_channel=False, hidden_size=4, expert_size=4, bc=None,
+        alt_residual_channel=False, hidden_size=4, expert_size=4, tier=None, bc=None,
         router_pre_norm=None, routed_pre_norm=None, latent_in=None, latent_out=None,
         routing_gate=object(), routing_cfg=None,
         routing_fn=lambda *args: (torch.zeros(rows, 1, dtype=torch.long), torch.ones(rows, 1)),
@@ -73,7 +73,7 @@ def test_fused_shared_expert_is_not_run_twice():
         pytest.fail('shared expert was already evaluated by the fused path')
 
     layer = SimpleNamespace(
-        alt_residual_channel=False, hidden_size=4, expert_size=4,
+        alt_residual_channel=False, hidden_size=4, expert_size=4, tier=None,
         bc=SimpleNamespace(run_bszN=fused), bc_sh_exp=True,
         experts_cfg=SimpleNamespace(out_bszn=output), f_threshold=128,
         is_quantized=True, config=SimpleNamespace(infer_params=SimpleNamespace(no_reconstruct=False)),

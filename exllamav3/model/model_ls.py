@@ -350,6 +350,11 @@ class Model_LSMixin(ABC):
             if generator: yield len(modules), len(modules)
 
             dummy_state = None
+            # The expert caches of experts=cache layers: each GPU's pool from what the placed modules
+            # left, still under the memory fraction; then the cold fill (model/expert_tier.py)
+            tiers = getattr(config, "expert_tiers", None)
+            if tiers is not None:
+                tiers.finalize(device_budget, max_transient, autosplit_margin)
             unset_memory_fraction(touched_devices)
 
         if recurrent_states is not None:

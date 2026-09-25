@@ -434,13 +434,15 @@ Each is a `ValueError`, prefixed with `placement rule <n> '<rule>': ` where one 
 
 ## The expert tier
 
-**Not available in this build yet**: `experts=cache` is parsed and checked, then refused. This
-section describes what the words ask for, how a load sizes the tier and what it refuses, as
-`model/expert_tier_config.py` implements it (its tests, `tests/test_expert_tier_config_.py`, run
-every number below), and the parts of the tier that exist in this build: the extent index, the
-policy (reference and native), and the RAM tier host with its reads, refills, read-ahead and cold
-fill, which a CPU replay of a routing trace drives today and the GPU runtime will drive (a lookup
-kernel inside the MoE layer and a tier thread doing the copies with the copy engines).
+`experts=cache` runs in this build: a VRAM expert cache per GPU (a lookup kernel inside the MoE
+dispatch, a tier thread doing the copies on the copy engines), over the RAM tier, over the model's
+own shards on the SSD. This section describes what the words ask for, how a load sizes the tier and
+what it refuses (`model/expert_tier_config.py`; its tests, `tests/test_expert_tier_config_.py`, run
+every number below), the extent index, the policy (reference and native), the RAM tier host, and
+the VRAM cache itself. Not in this build yet: the whole-layer double-buffered prefill (every prefill
+call runs in routed mode, see "The VRAM cache"), the prefill read-ahead (`prefetch=`), profiles and
+the heat file, hot pins re-chosen by heat, reading experts from another directory
+(`disk experts=<dir>`), `disk io=`.
 
 ### Where a routed expert of a `cache` layer lives
 
@@ -747,6 +749,307 @@ fallback serves them); a shard cut short (the error names the expert); the arena
 registrations; the real V4.1 shards. The C++ driver runs under AddressSanitizer,
 UndefinedBehaviorSanitizer and ThreadSanitizer.
 
+### The VRAM cache: lookup, copies and the tier thread
+
+A `cache` layer is a resident layer in every respect but one: its routed experts' trellis tensors
+are not loaded with it. Its expert `Linear`s get their EXL3 inner at load with `suh`, `svh`, `mcg` /
+`mul1` and `bias` resident (about 44.5 KB per V4.1 expert) and a trellis that is a view of one
+zeroed *sentinel* slot per GPU (`modules/block_sparse_mlp_tier.py`), so the layer builds its
+`MultiLinear` pointer tables, bound classes and fused buffers exactly as a resident layer does. The
+tier then owns one thing of the layer: its per-expert trellis pointer tables (gate, up, down), which
+every quantized MoE path reads on the device (the fused decode kernels, the fused MoE kernel, the
+batched reconstruct tier). The per-expert dequant path (an expert with more rows than the batched
+tier takes, 455 for V4.1) gets the trellis tensors where the tables point
+(`BC_BlockSparseMLP.run_single_expert_dq_views`, same kernels and arguments as
+`run_single_expert_dq`). The graph and torch per-expert paths read an expert's own trellis tensor:
+a `cache` layer must be one the fused MoE kernel covers (refused at load otherwise) and raises should
+one of those paths be reached anyway.
+
+**One MoE call** (`BlockSparseMLP.forward`, right after routing), two kernels on the compute stream:
+
+```
+compute stream                                   tier thread (native, one per GPU, no CUDA calls)
+--------------------------------------------     -------------------------------------------------
+lookup kernel (1 CTA of 1,024 threads):          reads the record from the ring in mapped memory
+  harvest the slots the host returned            applies it to its mirror of the directory
+  dedup, heat, stamp the hits (decode)           runs the policy's host step (sources, RAM side,
+  decide every miss (admit / transient),           demotions, RAM admission, refills)
+  retire victims                                 appends the call's copy commands to the plan ring:
+  point the layer's tables at the slots            promotions (RAM -> VRAM, slab -> VRAM after an
+  publish the call's record                        SSD read), rescues (a retiring VRAM slot ->
+fetch kernel (cooperative, half the SMs + 1):      VRAM), demotions (VRAM -> RAM), then END
+  all hits: returns at once                      polls the completion flags; a demoted slot goes
+  else runs the call's commands with the SMs  <--  back through the return ring once its copy is done
+    until END
+the unchanged MoE kernels
+```
+
+- The tier thread **never calls the CUDA API** once the model runs: records, commands, completion
+  flags and returned slots are plain loads and stores on mapped memory. This is what makes the
+  design safe next to any other code in the process: a thread that holds the driver's locks in a
+  synchronous call (a pageable copy such as `.tolist()` waiting for the stream) cannot hold up the
+  copies the stream is waiting for. (A first version issued the copies with `cudaMemcpyAsync` from
+  the tier thread and deadlocked exactly there: the caller's `.tolist()` waited for the stream while
+  holding a driver lock the tier thread's next copy needed.) The copy engines serve the cold fill,
+  before the tier thread starts.
+- The SMs copy as fast as the copy engines here: on the AI VM (RTX PRO 6000) 13.3 MB from
+  page-locked memory to VRAM at 50-52 GB/s with 94 CTAs of 256 threads (the copy engines: 52.7),
+  VRAM to page-locked memory at 30-37 GB/s (the copy engines: 55). Host memory is read uncached
+  (`ld.global.cv`): a RAM slot the host rewrote is never served stale. Sources at odd offsets (the
+  extent layout of an SSD fill) are read as aligned words and shifted.
+- An all-hit call's fetch returns at once: the decode path has **no host synchronization**, and a
+  call with misses waits on the GPU for its own copies only.
+- The lookup decides exactly what the policy core decides (`VramDirectory::lookup`): the same
+  records for the same calls. The tier thread's mirror applies those records; it never re-decides.
+- Commands run in order per worker CTA; a command that must wait for another (a demotion into the
+  RAM slot a promotion of the same call reads, the in-place replacement of `spare=0`) names it and
+  waits for it and for every command before it: a command's chunks are spread over the CTAs, so one
+  command being done says nothing of the ones before it (a promotion is three copies, one per
+  projection, and a demotion into its RAM slot that waited for the last one alone could overwrite
+  the slot while the first two still read it). A victim is only ever an expert the call does not use; a pool slot is only reused
+  after its demotion is done; a copy for call `n` runs in `n`'s fetch, after every earlier kernel
+  on the stream, so nothing a kernel may still read is overwritten.
+- Calls up to `EXL3_MOE_TIER_DECODE_ROWS` rows (8) are **decode** calls (stamps, admission); larger
+  calls are **routed**: hits keep their slots, misses are staged as transients for the call, no
+  stamps, no admission, no demotion. This build runs every prefill call in routed mode (the
+  whole-layer double-buffered prefill of `EXL3_MOE_TIER_PREFILL_ROWS` is not in it yet): the
+  misses of a layer are copied before its MoE computes, without overlap. One staging area of
+  `max(E - hot)` slots is allocated (9.49 GiB is what `EXL3_MOE_TIER_STAGING=double` will reserve;
+  the sizing uses one half until the whole-layer prefill lands).
+- **Hot pins** (`hot=<k>` or `hot=<p>%` on `cache` layers): the first `k` experts of each layer are
+  placed in pin slots after the pool at load and are hits forever (never victims, never in the RAM
+  tier). Choosing them by heat between generations is not in this build.
+- **Heat** advances one decode token per decode call of the GPU's first cache layer.
+
+**Memory** (per GPU with `cache` layers):
+
+| Part | Where | V4.1 3.0 bpw |
+|---|---|---|
+| pool | `S` slots of the compact VRAM slot (256-byte aligned), in allocations of at most 4 GiB, allocated by torch at the end of the layer split (still under the `-gs` fraction) | 13,271,040 B per slot |
+| pin slots | `hot` per layer, after the pool | |
+| staging | `max over cache layers of (E - hot)` slots | 384 slots, 4.75 GiB |
+| sentinel | one slot, zeroed | 12.7 MiB |
+| directory | slot state, key, stamp, address; per key slot, heat; free bitmap; counters (`cudaMalloc`) | ~0.3 MB at S = 6,000 |
+| control page | mapped pinned host memory: flags, the return ring (a power of two above `S + pins`), the record ring (4 MiB), the plan ring (65,536 commands of 32 bytes) and its completion flags | 6.3 MiB |
+| fetch state | the plan's device mirror, completion flags and counters (`cudaMalloc`) | 3.1 MiB |
+
+The RAM tier's chunks are page-locked and mapped (`cudaHostRegister`, portable and mapped: the fetch
+kernel reads and writes them at their host addresses) once the cold fill has filled them; the disk
+slab is page-locked at creation, and released after the cold fill when `disk experts=off` (nothing
+reads the SSD afterwards).
+
+**Load.** At the end of the layer split, per GPU with `cache` layers: its room (what is left inside
+the `-gs` budget and physically, after the placed modules, the Cache, the largest transient and
+`EXL3_AUTOSPLIT_MARGIN_MB`; minus the pin slots), its host link (a 64 MiB page-locked copy; the
+`EXL3_MOE_TIER_MIN_LINK_GBS` refusal), then `size_tiers` with those rooms (the sizing summary is
+printed), the extents of every expert of its cache layers (`build_for_modules`), the native runtime,
+the cold fill, and the tier thread. With cache layers on several GPUs the component's RAM tier is
+split between them by what each pool does not hold. The load prints:
+
+```
+ -- expert cache cuda:<n>: cold fill of <pool + pins> VRAM and <R> RAM experts, <bytes> read in <t> s; <bytes> of RAM page-locked in <t> s
+```
+
+**Modes.** Production (default): an all-hit call's fetch returns at once, the thread returns demoted
+slots when their copy is done, and a slot returned late only makes an admission use a transient
+(counted as *starved*). `EXL3_MOE_TIER_DETERMINISTIC=1`: every call's fetch waits until the thread
+has applied its record, run its copies and returned its slots, so the directory is exactly the
+policy core's after every call (the tests; a debugging aid). Logits never depend on the mode.
+`EXL3_MOE_TIER_VERIFY=1` synchronizes after every call and checks that the device directory equals
+the mirror. The tier thread spins while calls keep coming (`EXL3_MOE_TIER_SPIN_US=-1`: until 2 ms
+after the last call; `0`: never, a sleeping thread is woken by the next call; `N`: N us) and runs
+on `EXL3_MOE_TIER_AFFINITY` when set.
+
+**Failures.** A read that fails twice (disk engine, then `pread`), a policy error or a lookup error (an
+expert id outside the layer, more transients than staging slots) puts the tier in an error state: the
+fetch kernels stop waiting (the abort flag), and the next call raises `RuntimeError` with the
+message. At most the token in flight is affected. A fetch that waits a minute without a command
+gives up the same way (`kErrPlan`).
+
+**Statistics** (`TierHost.stats()`): `ssd_reads`, `ssd_bytes`, `pread_fallbacks`, `h2d` / `d2h` /
+`d2d` (copies, a three-piece promotion counts once) and their bytes, `staged`, `prefetch_issued`,
+`prefetch_used`, `prefetch_starved`, `prefetch_dropped`, `refill_reads`, `hazard_waits` (a write
+waited for a reader or writer of its slot), `slab_waits`, `cold_ram`, `cold_vram`, `cold_bytes`,
+`cold_ns`, `arena_ns` (mapping, faulting in and registering the tier), and the policy's counters (`policy_hits`, `policy_admits`, ... as in "Policies").
+
+**Python.**
+
+```python
+from exllamav3.model.expert_extents import build_extent_index
+from exllamav3.model.expert_tier_policy import PolicyConfig, round_robin_order, DECODE, ROUTED
+from exllamav3.model.expert_tier_host import TierHost
+
+index = build_extent_index(stc, keys)             # keys[lc * E + e] = (gate, up, down) projection keys
+tier = TierHost(index, layers = L, experts = E, policy = PolicyConfig(spare = 8), pool_slots = S,
+                ram_slots = R, slab_slots = 8)
+tier.cold_fill()                                  # round robin across layers
+tier.tick()                                       # one decode pass
+entries = tier.call(lc, ids)                      # [(key, kind, dst, cnt, heat, vkey, vslot, ...)]
+tier.prefetch(lc + 1); tier.promote(lc + 1)       # layer-mode read-ahead, then its layer is next
+tier.layer(lc + 1, ids, half = 1)                 # stage the layer into staging half 1
+tier.stats(); tier.state(); tier.arena()
+# or from a load's placement and sizing: TierHost.from_placement(stc, cache_modules, placement,
+#     "cuda:1", tier_config, pool_slots = S, ram_slots = R)
+```
+
+`call()` runs the policy's own lookup (the CPU replay of a routing trace); `process(record)` takes a
+record decided elsewhere (the GPU lookup kernel's) and applies it to the host's mirror of the
+directory before the same host step.
+
+**Checked in the tests** (`tests/test_expert_tier_ram_.py`, `tests/expert_tier/tier_host_test.cpp`):
+after every call of scripted and random traces over every policy x demote x admit x evict, with the
+disk on and off, `spare=0`, deferred returns and asynchronous refills, the host's records, actions
+and state equal the reference policy's, and every pool slot, retiring slot, RAM tier slot and
+staging slot holds exactly the checkpoint bytes of the expert the policy says it holds; the cold
+fill with every engine backend; the read-ahead; refills; every engine read failing (the `pread`
+fallback serves them); a shard cut short (the error names the expert); the arena's chunks and
+registrations; the real V4.1 shards. The C++ driver runs under AddressSanitizer,
+UndefinedBehaviorSanitizer and ThreadSanitizer.
+
+### The VRAM cache: lookup, copies and the tier thread
+
+A `cache` layer is a resident layer in every respect but one: its routed experts' trellis tensors
+are not loaded with it. Its expert `Linear`s get their EXL3 inner at load with `suh`, `svh`, `mcg` /
+`mul1` and `bias` resident (about 44.5 KB per V4.1 expert) and a trellis that is a view of one
+zeroed *sentinel* slot per GPU (`modules/block_sparse_mlp_tier.py`), so the layer builds its
+`MultiLinear` pointer tables, bound classes and fused buffers exactly as a resident layer does. The
+tier then owns one thing of the layer: its per-expert trellis pointer tables (gate, up, down), which
+every quantized MoE path reads on the device (the fused decode kernels, the fused MoE kernel, the
+batched reconstruct tier). The per-expert dequant path (an expert with more rows than the batched
+tier takes, 455 for V4.1) gets the trellis tensors where the tables point
+(`BC_BlockSparseMLP.run_single_expert_dq_views`, same kernels and arguments as
+`run_single_expert_dq`). The graph and torch per-expert paths read an expert's own trellis tensor:
+a `cache` layer must be one the fused MoE kernel covers (refused at load otherwise) and raises should
+one of those paths be reached anyway.
+
+**One MoE call** (`BlockSparseMLP.forward`, right after routing), two kernels on the compute stream:
+
+```
+compute stream                                   tier thread (native, one per GPU, no CUDA calls)
+--------------------------------------------     -------------------------------------------------
+lookup kernel (1 CTA of 1,024 threads):          reads the record from the ring in mapped memory
+  harvest the slots the host returned            applies it to its mirror of the directory
+  dedup, heat, stamp the hits (decode)           runs the policy's host step (sources, RAM side,
+  decide every miss (admit / transient),           demotions, RAM admission, refills)
+  retire victims                                 appends the call's copy commands to the plan ring:
+  point the layer's tables at the slots            promotions (RAM -> VRAM, slab -> VRAM after an
+  publish the call's record                        SSD read), rescues (a retiring VRAM slot ->
+fetch kernel (cooperative, half the SMs + 1):      VRAM), demotions (VRAM -> RAM), then END
+  all hits: returns at once                      polls the completion flags; a demoted slot goes
+  else runs the call's commands with the SMs  <--  back through the return ring once its copy is done
+    until END
+the unchanged MoE kernels
+```
+
+- The tier thread **never calls the CUDA API** once the model runs: records, commands, completion
+  flags and returned slots are plain loads and stores on mapped memory. This is what makes the
+  design safe next to any other code in the process: a thread that holds the driver's locks in a
+  synchronous call (a pageable copy such as `.tolist()` waiting for the stream) cannot hold up the
+  copies the stream is waiting for. (A first version issued the copies with `cudaMemcpyAsync` from
+  the tier thread and deadlocked exactly there: the caller's `.tolist()` waited for the stream while
+  holding a driver lock the tier thread's next copy needed.) The copy engines serve the cold fill,
+  before the tier thread starts.
+- The SMs copy as fast as the copy engines here: on the AI VM (RTX PRO 6000) 13.3 MB from
+  page-locked memory to VRAM at 50-52 GB/s with 94 CTAs of 256 threads (the copy engines: 52.7),
+  VRAM to page-locked memory at 30-37 GB/s (the copy engines: 55). Host memory is read uncached
+  (`ld.global.cv`): a RAM slot the host rewrote is never served stale. Sources at odd offsets (the
+  extent layout of an SSD fill) are read as aligned words and shifted.
+- An all-hit call's fetch returns at once: the decode path has **no host synchronization**, and a
+  call with misses waits on the GPU for its own copies only.
+- The lookup decides exactly what the policy core decides (`VramDirectory::lookup`): the same
+  records for the same calls. The tier thread's mirror applies those records; it never re-decides.
+- Commands run in order per worker CTA; a command that must wait for another (a demotion into the
+  RAM slot a promotion of the same call reads, the in-place replacement of `spare=0`) names it and
+  waits for it. A victim is only ever an expert the call does not use; a pool slot is only reused
+  after its demotion is done; a copy for call `n` runs in `n`'s fetch, after every earlier kernel
+  on the stream, so nothing a kernel may still read is overwritten.
+- Calls up to `EXL3_MOE_TIER_DECODE_ROWS` rows (8) are **decode** calls (stamps, admission); larger
+  calls are **routed**: hits keep their slots, misses are staged as transients for the call, no
+  stamps, no admission, no demotion. This build runs every prefill call in routed mode (the
+  whole-layer double-buffered prefill of `EXL3_MOE_TIER_PREFILL_ROWS` is not in it yet): the
+  misses of a layer are copied before its MoE computes, without overlap. One staging area of
+  `max(E - hot)` slots is allocated (9.49 GiB is what `EXL3_MOE_TIER_STAGING=double` will reserve;
+  the sizing uses one half until the whole-layer prefill lands).
+- **Hot pins** (`hot=<k>` or `hot=<p>%` on `cache` layers): the first `k` experts of each layer are
+  placed in pin slots after the pool at load and are hits forever (never victims, never in the RAM
+  tier). Choosing them by heat between generations is not in this build.
+- **Heat** advances one decode token per decode call of the GPU's first cache layer.
+
+**Memory** (per GPU with `cache` layers):
+
+| Part | Where | V4.1 3.0 bpw |
+|---|---|---|
+| pool | `S` slots of the compact VRAM slot (256-byte aligned), in allocations of at most 4 GiB, allocated by torch at the end of the layer split (still under the `-gs` fraction) | 13,271,040 B per slot |
+| pin slots | `hot` per layer, after the pool | |
+| staging | `max over cache layers of (E - hot)` slots | 384 slots, 4.75 GiB |
+| sentinel | one slot, zeroed | 12.7 MiB |
+| directory | slot state, key, stamp, address; per key slot, heat; free bitmap; counters (`cudaMalloc`) | ~0.3 MB at S = 6,000 |
+| control page | mapped pinned host memory: flags, the return ring (a power of two above `S + pins`), the record ring (4 MiB), the plan ring (65,536 commands of 32 bytes) and its completion flags | 6.3 MiB |
+| fetch state | the plan's device mirror, completion flags and counters (`cudaMalloc`) | 3.1 MiB |
+
+The RAM tier's chunks are page-locked and mapped (`cudaHostRegister`, portable and mapped: the fetch
+kernel reads and writes them at their host addresses) once the cold fill has filled them; the disk
+slab is page-locked at creation, and released after the cold fill when `disk experts=off` (nothing
+reads the SSD afterwards).
+
+**Load.** At the end of the layer split, per GPU with `cache` layers: its room (what is left inside
+the `-gs` budget and physically, after the placed modules, the Cache, the largest transient and
+`EXL3_AUTOSPLIT_MARGIN_MB`; minus the pin slots), its host link (a 64 MiB page-locked copy; the
+`EXL3_MOE_TIER_MIN_LINK_GBS` refusal), then `size_tiers` with those rooms (the sizing summary is
+printed), the extents of every expert of its cache layers (`build_for_modules`), the native runtime,
+the cold fill, and the tier thread. With cache layers on several GPUs the component's RAM tier is
+split between them by what each pool does not hold. The load prints:
+
+```
+ -- expert cache cuda:<n>: cold fill of <pool + pins> VRAM and <R> RAM experts, <bytes> read in <t> s; <bytes> of RAM page-locked in <t> s
+```
+
+**Modes.** Production (default): an all-hit call's fetch returns at once, the thread returns demoted
+slots when their copy is done, and a slot returned late only makes an admission use a transient
+(counted as *starved*). `EXL3_MOE_TIER_DETERMINISTIC=1`: every call's fetch waits until the thread
+has applied its record, run its copies and returned its slots, so the directory is exactly the
+policy core's after every call (the tests; a debugging aid). Logits never depend on the mode.
+`EXL3_MOE_TIER_VERIFY=1` synchronizes after every call and checks that the device directory equals
+the mirror. The tier thread spins while calls keep coming (`EXL3_MOE_TIER_SPIN_US=-1`: until 2 ms
+after the last call; `0`: never, a sleeping thread is woken by the next call; `N`: N us) and runs
+on `EXL3_MOE_TIER_AFFINITY` when set.
+
+**Failures.** A read that fails twice (disk engine, then `pread`), an unexpected CUDA error or a
+lookup error (an expert id outside the layer, more transients than staging slots) puts the tier in
+an error state: the waiting stream is released, and the next call raises `RuntimeError` with the
+message. At most the token in flight is affected.
+
+**Statistics** (`TierDevice.stats()`, `ExpertTierSet.stats()`): `records`, `host_records` (calls
+with misses), `returns`, `max_lag` (records waiting when the thread picked one up), `idle_sleeps`,
+`work_ns`, `overflow` (all-hit records dropped on a full ring: heat and stamps of the mirror only),
+`device_error`, the fetch kernel's copy counts and bytes (`h2d_*`, `d2h_*`, `d2d_*`), `plan_commands`,
+`plan_full_waits`, `plan_deps_done` (dependencies already met when a command was written), the load's
+(`cold_h2d_bytes`, `pinned_bytes`, `pin_ns`, `compacted`, `compact_ns`), the
+RAM tier host's (`ssd_reads`, `cold_*`, ...) and the policy's (`policy_hits`, `policy_admits`,
+`policy_d2h`, ...).
+
+**Measured on the AI VM** (RTX PRO 6000, sm_120):
+
+| | |
+|---|---|
+| one lookup at the V4.1 shape (28 layers x 384, 6,000 slots), production mode, event to event | median 9.4-11 us for 0, 1, 6 and 48 misses (p99 26-35 us) |
+| a V4.1 decode call with one expert promoted from RAM (lookup to ready, swap demotions running) | median 403 us; 478 us per expert with six |
+| cold fill of two V4.1 layers (432 experts) | 5.65 GB in 0.71 s; 5.06 GiB page-locked in 0.22 s |
+
+**Checked in the tests** (GPU; on the AI VM through `/root/rnd/gpu_window.sh`):
+`tests/expert_tier/tier_kernel_gpu_.py` (the kernel's records, the mirror state and the device
+directory against the policy core's replay, exactly: the micro-scenarios, hot pins, `spare=0`,
+routed calls, heat across ticks, two-projection experts, and seeded random replays up to the V4.1
+shape at batch sizes 1 to 8 with every `admit` x `evict`, the adaptive probability live and
+pinned; the layer's pointer tables after the calls); `tests/expert_tier/tier_runtime_gpu_.py` (a
+synthetic checkpoint with unaligned and split experts: records against the replay and every pool,
+staging and RAM slot byte-checked against the checkpoint after every call, over every `policy` x
+`demote` x `admit`, the disk off, hot pins, `spare=0`; production mode with the thread, with stream
+memory operations and with the fallback kernels, byte checks after a drain, and the data path of
+1,500 calls checked as the MoE kernels would read it; the V4.1 promotion cost);
+`tests/expert_tier/tier_bitwise_gpu_.py` (real V4.1 layers resident and cached give bit-identical
+outputs, see below).
+
 ### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
 
 | | (a) PRO + RAM for every expert outside VRAM | (b) PRO + 96 GiB RAM tier + SSD | (c) CMP resident + PRO cache + RAM, no expert SSD reads |
@@ -806,6 +1109,7 @@ did-you-mean hint) and prints the ones that differ from their default.
 | `EXL3_MOE_TIER_REFILL_INFLIGHT` | `2` | 1 .. 64 |
 | `EXL3_MOE_TIER_DISK_SLAB` | `auto` | slots, 1 .. 4096 |
 | `EXL3_MOE_TIER_HUGEPAGE` | `0` | `1`: transparent huge pages for the RAM tier and the slab |
+| `EXL3_MOE_TIER_COMPACT` | `1` | `0` keeps the cold-filled RAM slots in the extent layout |
 | `EXL3_MOE_TIER_HEADROOM_MB` | `1024` | MiB |
 | `EXL3_MOE_TIER_MIN_LINK_GBS` | `2.0` | GB/s; `0` allows any link |
 | `EXL3_MOE_TIER_SPIN_US` | `-1` | `-1` while a pass is active, `0` never, N us |

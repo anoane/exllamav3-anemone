@@ -96,7 +96,8 @@ class ConfigTests(unittest.TestCase):
                "EXL3_MOE_HEAT_FILE": "/var/lib/exl3/v41.heat", "EXL3_MOE_TIER_ADMIT_P": "0.5",
                "EXL3_MOE_TIER_ADAPT_EVERY": "4096", "EXL3_MOE_TIER_ADMIT_PMIN": "0.01", "EXL3_MOE_TIER_SAMPLE": "32",
                "EXL3_MOE_TIER_RAM_ADMIT": "heat", "EXL3_MOE_TIER_REFILL": "0", "EXL3_MOE_TIER_REFILL_INFLIGHT": "4",
-               "EXL3_MOE_TIER_DISK_SLAB": "64", "EXL3_MOE_TIER_HUGEPAGE": "1", "EXL3_MOE_TIER_HEADROOM_MB": "512",
+               "EXL3_MOE_TIER_DISK_SLAB": "64", "EXL3_MOE_TIER_HUGEPAGE": "1", "EXL3_MOE_TIER_COMPACT": "0",
+               "EXL3_MOE_TIER_HEADROOM_MB": "512",
                "EXL3_MOE_TIER_MIN_LINK_GBS": "0",
                "EXL3_MOE_TIER_SPIN_US": "0", "EXL3_MOE_TIER_AFFINITY": "16-19,23, 21", "EXL3_MOE_TIER_DETERMINISTIC": "1",
                "EXL3_MOE_TIER_VERIFY": "1", "EXL3_MOE_TIER_TRACE": "/tmp/t.bin", "UNRELATED": "x"}
@@ -107,6 +108,7 @@ class ConfigTests(unittest.TestCase):
                          (0.125, 8192, "/var/lib/exl3/v41.heat", 0.5, 4096, 0.01))
         self.assertEqual((c.sample, c.ram_admit, c.refill, c.refill_inflight, c.disk_slab, c.hugepage, c.headroom_mb),
                          (32, "heat", False, 4, 64, True, 512))
+        self.assertFalse(c.compact)
         self.assertEqual((c.min_link_gbs, c.spin_us, c.affinity, c.deterministic, c.verify, c.trace),
                          (0.0, 0, (16, 17, 18, 19, 21, 23), True, True, "/tmp/t.bin"))
         self.assertEqual(len(c.changed()), len(T.SETTINGS))
@@ -196,6 +198,27 @@ class SizingTests(unittest.TestCase):
                       static_bytes = static)
         self.assertEqual(msg, "placement: the stream / cpu layers keep 47.6 GiB of routed experts in RAM, more than ram "
                               "experts=40GiB; raise it or move layers to experts=cache")
+
+    def test_held_at_the_end_of_the_load(self):
+        # the second sizing reads the host after the load allocated the stream / cpu arenas: held gives
+        # them back, so a placement that fitted at the start of the load still fits at its end, the same
+        static = 10 * 384 * 13_315_584
+        text = "0-9=cuda:0 experts=stream; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=64GiB"
+        lay = layers(range(10, 40), device = lambda i: "cuda:1")
+        start = size(text, lay, memory(80), {"cuda:1": room(41)}, static_bytes = static)
+        after = T.HostMemory(80 * GiB - static, 80 * GiB - static, MEM_TOTAL, 0)
+        end = size(text, lay, after, {"cuda:1": room(41)}, static_bytes = static, held = static)
+        self.assertEqual((end.tier_slots, end.ram_bytes, end.disk_only, end.slab_slots),
+                         (start.tier_slots, start.ram_bytes, start.disk_only, start.slab_slots))
+        self.assertEqual(end.left_unpinned, start.left_unpinned)
+        msg = refused(self, RuntimeError, text, lay, after, {"cuda:1": room(41)}, static_bytes = static)
+        self.assertTrue(msg.startswith("placement: ram experts=") and "of host memory, but" in msg, msg)
+        # auto: the same tier as at the start
+        auto = text.replace("ram experts=64GiB", "ram experts=auto")
+        a0 = size(auto, lay, memory(126), {"cuda:1": room(41)}, static_bytes = static)
+        a1 = size(auto, lay, T.HostMemory(126 * GiB - static, 126 * GiB - static, MEM_TOTAL, 0), {"cuda:1": room(41)},
+                  static_bytes = static, held = static)
+        self.assertEqual(a1.tier_slots, a0.tier_slots)
 
     def test_flags_are_caps(self):
         cap = T.Size("bytes", 48 * GiB)

@@ -11,10 +11,12 @@
 
 #include "tier_policy.h"
 #include "tier_host.h"
+#include "tier_py.h"
 
 using namespace exl3_tier;
+using namespace tier_py;
 
-namespace
+namespace tier_py
 {
 
 int choice(const py::dict& d, const char* key, std::initializer_list<const char*> names, int dflt)
@@ -28,13 +30,6 @@ int choice(const py::dict& d, const char* key, std::initializer_list<const char*
         ++i;
     }
     throw std::invalid_argument(std::string("expert tier: ") + key + "=" + v + " is not a known value");
-}
-
-template <typename T>
-T value(const py::dict& d, const char* key, T dflt)
-{
-    if (!d.contains(key) || d[key].is_none()) return dflt;
-    return d[key].cast<T>();
 }
 
 PolicyConfig config_of(const py::dict& d)
@@ -153,7 +148,7 @@ py::dict core_counters(const TierCore& core)
     return cn;
 }
 
-}  // namespace
+}  // namespace tier_py
 
 py::dict tier_policy_replay(const py::dict& config, int64_t layers, int64_t experts, int64_t slots, int64_t ram_slots,
                             int64_t pins, bool defer_returns, const py::list& script)
@@ -199,7 +194,7 @@ py::dict tier_policy_replay(const py::dict& config, int64_t layers, int64_t expe
 
 // ---------------------------------------------------------------------------------------- host
 
-namespace
+namespace tier_py
 {
 
 at::Tensor bytes_tensor(const uint8_t* p, int64_t n)
@@ -219,6 +214,7 @@ HostConfig host_config_of(const py::dict& d)
     h.staging_slots = value<int>(d, "staging_slots", h.staging_slots);
     h.prefault_threads = value<int>(d, "prefault_threads", h.prefault_threads);
     h.deterministic = value<bool>(d, "deterministic", h.deterministic);
+    h.compact_fill = value<bool>(d, "compact_fill", h.compact_fill);
     if (h.chunk_bytes <= 0 || h.slab_slots < 0 || h.fill_inflight < 1)
         throw std::invalid_argument("expert tier: chunk_bytes > 0, slab_slots >= 0, fill_inflight >= 1");
     return h;
@@ -281,7 +277,7 @@ Record record_of(const py::tuple& t)
     return r;
 }
 
-}  // namespace
+}  // namespace tier_py
 
 TierHostHandle::TierHostHandle(const py::dict& policy, int64_t layers, int64_t experts, int64_t pool_slots,
                                int64_t ram_slots, int64_t pins, const py::dict& geometry,

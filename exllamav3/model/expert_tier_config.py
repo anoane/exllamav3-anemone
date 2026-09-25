@@ -15,7 +15,7 @@ experts live in a VRAM cache per GPU, over a RAM tier, over the checkpoint on th
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import difflib
 import os
 import re
@@ -90,6 +90,9 @@ SETTINGS = (
     Setting("EXL3_MOE_TIER_HUGEPAGE", "hugepage", False, "bool",
             help = "transparent huge pages for the RAM tier and the disk slab (off: faulting 2 MiB pages in "
                    "can stall for seconds when the page cache is large)"),
+    Setting("EXL3_MOE_TIER_COMPACT", "compact", True, "bool",
+            help = "move the cold-filled RAM tier slots to the compact layout (one aligned copy per promotion: "
+                   "49 against 40 GB/s from the odd offsets of the extent layout on the AI VM)"),
     Setting("EXL3_MOE_TIER_HEADROOM_MB", "headroom_mb", 1024, "int", 0, 1 << 20,
             help = "VRAM (MiB) left free on each GPU after its expert cache"),
     Setting("EXL3_MOE_TIER_MIN_LINK_GBS", "min_link_gbs", 2.0, "float", 0.0, 1e6,
@@ -168,6 +171,7 @@ class TierConfig:
     refill_inflight: int = 2
     disk_slab: int | None = None
     hugepage: bool = False
+    compact: bool = True
     headroom_mb: int = 1024
     min_link_gbs: float = 2.0
     spin_us: int = -1
@@ -281,7 +285,7 @@ def pagecache_auto(mem_total: int | None) -> int:
 def size_tiers(placement, layers: TierLayers, cfg: TierConfig, memory: HostMemory, *,
                vram_room: dict | None = None, static_bytes: int = 0, ngram_bytes: int = 0,
                expert_cap: Size | None = None, reserve: int = 2 * GiB, already_pinned: int = 0,
-               link_gbs: dict | None = None, platform: str | None = None) -> TierSizing:
+               held: int = 0, link_gbs: dict | None = None, platform: str | None = None) -> TierSizing:
     """
     Size the expert tier of one component and check it, before anything of the tier is allocated.
 
@@ -292,6 +296,10 @@ def size_tiers(placement, layers: TierLayers, cfg: TierConfig, memory: HostMemor
       static_bytes  the arenas of the component's stream / cpu / split layers (ram_budget)
       ngram_bytes   the n-gram tables the component holds in RAM (ram_budget)
       expert_cap    --expert_ram / --draft_expert_ram
+      held          the bytes of static_bytes and ngram_bytes the component holds already: at the end of
+                    the load its stream / cpu arenas and n-gram tables are allocated, and `memory`, read
+                    then, no longer counts them; they are given back to it here, so the ledger, which
+                    counts them, does not take them twice (0 at the start of the load)
       link_gbs      per cache GPU, its measured host link (GB/s); None: not measured
       platform      sys.platform (tests pass another)
 
@@ -301,6 +309,10 @@ def size_tiers(placement, layers: TierLayers, cfg: TierConfig, memory: HostMemor
     ram = placement.ram_store()
     disk = placement.disk_store()
     out = TierSizing(static_bytes = static_bytes, ngram_bytes = ngram_bytes, final = vram_room is not None)
+    if held > 0 and memory.available is not None:
+        memory = replace(memory, available = memory.available + held,
+                         mem_available = None if memory.mem_available is None else memory.mem_available + held,
+                         cgroup_room = None if memory.cgroup_room is None else memory.cgroup_room + held)
     if not (platform or sys.platform).startswith("linux"):
         raise RuntimeError("placement: experts=cache needs the disk engine, which is Linux-only")
     if not cfg.demote and disk.experts == "off" and ram.policy != "inclusive":

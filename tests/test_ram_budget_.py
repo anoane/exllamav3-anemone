@@ -348,7 +348,7 @@ class PlacementRequestTests(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             self.plan(model(moes, stc), "0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1; ram experts=48GiB")
         self.assertEqual(str(cm.exception), "placement: the stream / cpu layers keep 52.4 GiB of routed experts in RAM, "
-                                            "more than ram experts=48GiB; raise it, or keep fewer layers' experts in RAM")
+                                            "more than ram experts=48GiB; raise it or move layers to experts=cache")
         with self.assertRaisesRegex(ValueError, "more than ram experts=0; raise it"):
             self.plan(model(moes, stc), "*=cuda:0 experts=cpu; ram experts=0")
         # all is what the layers need, and still within the cap

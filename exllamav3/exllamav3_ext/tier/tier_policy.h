@@ -97,6 +97,7 @@ struct Entry
     int32_t key = -1;
     uint8_t kind = kHit;
     uint8_t inplace = 0;
+    uint8_t starved = 0;                // a transient that was admitted but found no free slot
     uint32_t cnt = 0;
     int32_t dst = -1;                   // VRAM slot (hit, admit) or staging slot (transient)
     uint32_t heat = 0;
@@ -221,6 +222,10 @@ public:
     void tick(uint64_t tokens) { heat.tokens += tokens; }
     Record lookup(int32_t lc, const int32_t* ids, int64_t n, int mode);
     void host(const Record& rec, std::vector<Action>& acts);
+    // A record decided elsewhere (the lookup kernel): its counters and heat, the directory mirror
+    // (apply), then host(). Heat is added at the epoch of heat.tokens, which the caller sets to the
+    // tokens the lookup saw
+    void process(const Record& rec, std::vector<Action>& acts);
     void layer_call(int32_t lc, const int32_t* ids, int64_t n, std::vector<Action>& acts);
     void complete(std::vector<Action>& acts);
     // Throws TierError naming the first invariant that fails

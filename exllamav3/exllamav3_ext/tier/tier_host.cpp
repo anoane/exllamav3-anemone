@@ -693,31 +693,34 @@ Record TierHost::call(int32_t lc, const int32_t* ids, int64_t n, int mode)
 void TierHost::process(const Record& rec)
 {
     throw_if_failed();
-    if (rec.lc < 0 || rec.lc >= core.L) fail("record of layer " + std::to_string(rec.lc) + " out of range");
-    core.seq = rec.seq;
-    const uint32_t inc = rec.mode == kDecode ? kQ16 : core.cfg.prefill_inc;
-    ++core.c[kCalls];
-    for (const Entry& x : rec.entries)
-    {
-        core.heat.add(x.key, (uint64_t) x.cnt * inc);
-        if (x.kind == kHit) ++core.c[kHits];
-        else if (x.kind == kAdmitted)
-        {
-            ++core.c[kAdmits];
-            if (x.vkey >= 0) ++core.c[kRetires];
-            if (x.inplace) ++core.c[kInplace];
-        }
-        else ++core.c[kTransients];
-    }
-    core.vram.apply(rec);
     std::vector<Action> acts;
     poll();
     core.refill_busy = (int) refills_.size();
-    core.host(rec, acts);
+    core.process(rec, acts);
     execute(&rec, acts);
     if (hcfg.deterministic) drain();
     else poll();
     throw_if_failed();
+}
+
+std::vector<int32_t> TierHost::return_landed()
+{
+    std::vector<int32_t> out;
+    std::vector<int32_t>& p = core.pending;
+    size_t w = 0;
+    for (int32_t s : p)
+    {
+        uint64_t t = pool_busy_[(size_t) s];
+        if (!t || copier_->done(t))
+        {
+            pool_busy_[(size_t) s] = 0;
+            core.vram.return_slot(s);
+            out.push_back(s);
+        }
+        else p[w++] = s;
+    }
+    p.resize(w);
+    return out;
 }
 
 void TierHost::layer_call(int32_t lc, const int32_t* ids, int64_t n, int half)
@@ -855,10 +858,56 @@ void TierHost::poll()
     refills_.resize(w);
 }
 
-void TierHost::cold_fill(const std::vector<int32_t>& order)
+// Extent-layout RAM slots (their reads landed, nothing reads them) to the compact layout: the three
+// trellis tensors back to back from the slot's start, as in a VRAM slot. The sources lie at odd
+// offsets and in the checkpoint's tensor order, which need not be the slot order, so each slot goes
+// through a scratch buffer. Several threads (prefault_threads)
+void TierHost::compact_ram(const std::vector<int32_t>& slots)
+{
+    int64_t t0 = mono_ns();
+    std::atomic<size_t> next { 0 };
+    auto work = [&]
+    {
+        std::vector<uint8_t> tmp((size_t) geo.vram_slot_bytes);
+        for (size_t i = next++; i < slots.size(); i = next++)
+        {
+            int32_t r = slots[i];
+            SlotIo& io = ram_io_[(size_t) r];
+            if (io.layout != 1 || io.ticket || io.read_tok || io.write_tok) continue;
+            uint8_t* s = arena_->slot(r);
+            for (int p = 0; p < geo.projections; ++p)
+                std::memcpy(tmp.data() + geo.proj_off[p], s + ram_slot_offset(r, p), (size_t) geo.proj_bytes[p]);
+            std::memcpy(s, tmp.data(), (size_t) geo.vram_slot_bytes);
+            io.layout = 2;
+        }
+    };
+    int nt = std::max(1, std::min(hcfg.prefault_threads, (int) std::max<size_t>(1, slots.size() / 16)));
+    std::vector<std::thread> th;
+    for (int t = 1; t < nt; ++t) th.emplace_back(work);
+    work();
+    for (auto& x : th) x.join();
+    for (int32_t r : slots)
+        if (ram_io_[(size_t) r].layout == 2) ++stats.compacted;
+    stats.compact_ns += mono_ns() - t0;
+}
+
+void TierHost::release_slab()
+{
+    for (size_t i = 0; i < slab_io_.size(); ++i) slab_release((int32_t) i);
+    slab_free_.clear();
+    slab_io_.clear();
+    slab_state_.clear();
+    slab_.reset(new Arena(0, geo.ram_slot_bytes, hcfg.chunk_bytes, false, eng_.get(), 0));
+    hcfg.slab_slots = 0;
+}
+
+void TierHost::cold_fill(const std::vector<int32_t>& order, const std::vector<int32_t>& pins)
 {
     throw_if_failed();
     int64_t t0 = mono_ns(), bytes0 = stats.ssd_bytes;
+    if ((int64_t) pins.size() > core.vram.pins)
+        fail(std::to_string(pins.size()) + " hot pins for " + std::to_string(core.vram.pins) + " pin slots");
+    for (size_t i = 0; i < pins.size(); ++i) core.vram.place(pins[i], core.vram.S + (int32_t) i, 0);
     std::vector<int32_t> vk, rk;
     core.cold_fill(order, &vk, &rk);
     // the RAM tier, read in place (class 2), fill_inflight at a time
@@ -884,7 +933,19 @@ void TierHost::cold_fill(const std::vector<int32_t>& order)
         ++stats.cold_ram;
     }
     while (!inflight.empty()) finish_one();
+    if (hcfg.compact_fill)
+    {
+        std::vector<int32_t> slots;
+        for (int32_t k : rk) slots.push_back(core.ram.of[(size_t) k]);
+        compact_ram(slots);
+    }
     for (size_t c = 0; c < arena_->base.size(); ++c) copier_->chunk_filled(arena_->base[c], arena_->bytes[c]);
+    // the hot pins, through the slab
+    for (size_t i = 0; i < pins.size(); ++i)
+    {
+        stage_from_ssd(pins[i], copier_->pool_addr(core.vram.S + (int32_t) i), 0, false, exl3_disk::kPrefetch);
+        ++stats.cold_vram;
+    }
     // the pool: from the RAM copy when RAM holds one (inclusive), else through the slab
     for (int32_t k : vk)
     {
