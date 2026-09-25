@@ -185,9 +185,11 @@ class PackageTests(unittest.TestCase):
             "from exllamav3.modules import mlp, block_sparse_mlp",
             "from exllamav3.modules.quant import exl3, fp16",
             "from exllamav3.model import moe_cpu_host",
+            "from exllamav3.modules import dsv4, dsv41_block",
             "print(mlp.STABLE_ARITHMETIC, block_sparse_mlp.STABLE_ARITHMETIC, block_sparse_mlp.FUSED_PREFILL,",
             "      exl3.STABLE_ARITHMETIC, fp16.HGEMM_FIXED_ROWS, moe_cpu_host.STABLE_ARITHMETIC,",
-            "      moe_cpu_host.TUNING.fused_prefill, ext.stable_arithmetic(), ext.hgemm_fixed_rows())",
+            "      moe_cpu_host.TUNING.fused_prefill, ext.stable_arithmetic(), ext.hgemm_fixed_rows(),",
+            "      dsv4.STABLE_ARITHMETIC, dsv41_block.STABLE_ARITHMETIC)",
         ])
         names = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL",
                  "EXL3_MOE_FUSED_DET", "EXL3_NO_FUSED_RECONSTRUCT")
@@ -197,7 +199,7 @@ class PackageTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True,
                            cwd = ROOT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"])
+        self.assertEqual(r.stdout.split(), ["True"] * 4 + ["128"] + ["True"] * 3 + ["128"] + ["True"] * 2)
 
 
 if __name__ == "__main__":

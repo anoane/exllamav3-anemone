@@ -1,7 +1,8 @@
 """
-EXL3_STABLE_ARITHMETIC=1: production linear and MLP dispatch executed on CPU tensors, with exact
-stand-ins for the native kernels. Checks which path every row count takes, not kernel arithmetic.
-No CUDA or compiled extension needed:
+EXL3_STABLE_ARITHMETIC=1: production linear, MLP, DeepSeek-V4.1 mHC mixing and grouped
+o-projection dispatch executed on CPU tensors, with exact stand-ins for the native kernels.
+Checks which path every row count takes, not kernel arithmetic. No CUDA or compiled extension
+needed:
 
     python -m pytest tests/test_stable_arithmetic_torch_.py
 """
@@ -68,6 +69,88 @@ class StableDispatchTests(unittest.TestCase):
         y = forward(layer, torch.ones((1, 1, 16), dtype = torch.half), {})
         layer.bc.run_bsz1.assert_called_once()
         self.assertTrue(bool((y == 6).all()))
+
+
+class DeepseekV41DispatchTests(unittest.TestCase):
+    """DeepSeek-V4.1 hyper-connection mixing and the grouped attention output projection"""
+
+    @staticmethod
+    def mix_fused(stable, chunks):
+        calls = []
+
+        def hc_mix(*args):
+            partials, post, comb = args[7:10]
+            calls.append(partials.shape[1])
+            for chunk in range(partials.shape[1]):
+                partials[:, chunk].fill_(0.01 * (chunk + 1))
+            post.fill_(2)
+            comb.fill_(3)
+
+        ext = NS(hc_mix_num_chunks = Mock(return_value = chunks), hc_mix = hc_mix)
+        ns = dict(torch = torch, STABLE_ARITHMETIC = stable, ext = ext,
+                  g_tensor_cache = NS(get_bucketed = lambda dev, n, dtype, tag: torch.empty(n, dtype = dtype, device = dev)))
+        forward = helpers.method("exllamav3/modules/dsv41_block.py", "DSV41HyperConnection", "mix_fused", ns)
+        layer = NS(fn = torch.zeros(24, 512), base = torch.zeros(24), scale = torch.ones(3),
+                   rms_eps = 1e-6, hc_eps = 1e-6, sinkhorn_iters = 20)
+        return lambda rows: forward(layer, torch.ones((1, rows, 4, 128))), ext, calls
+
+    def test_mhc_one_partition_at_every_row_count(self):
+        forward, ext, calls = self.mix_fused(True, 5)
+        reference = None
+        for rows in (1, 7, 17, 32, 33, 128, 145, 256, 600):
+            first = [v[:, 0] for v in forward(rows)]
+            if reference is None:
+                reference = first
+            self.assertTrue(all(torch.equal(a, b) for a, b in zip(reference, first)), rows)
+        ext.hc_mix_num_chunks.assert_not_called()
+        self.assertEqual(set(calls), {1})
+        p = torch.tensor(0.01)
+        self.assertTrue(torch.allclose(reference[2], torch.sigmoid(p * torch.rsqrt(p / 512 + 1e-6)) + 1e-6))
+
+    def test_mhc_default_partition_follows_the_row_count(self):
+        forward, ext, calls = self.mix_fused(False, 3)
+        post, comb, pre = forward(7)
+        ext.hc_mix_num_chunks.assert_called_once_with(7, 512)
+        self.assertEqual(calls, [3])
+        # the pre-mix is derived from the sum of the kernel's three partial dots
+        p = torch.tensor(0.01) + 0.02 + 0.03
+        self.assertTrue(torch.allclose(pre, torch.sigmoid(p * torch.rsqrt(p / 512 + 1e-6)) + 1e-6))
+
+    @staticmethod
+    def project_o_grouped(stable):
+        def mgemm(a, trellis, c, *args):
+            c.copy_(a * 2)
+
+        ext = NS(exl3_mgemm = Mock(side_effect = mgemm))
+        ns = dict(torch = torch, STABLE_ARITHMETIC = stable, ext = ext,
+                  g_tensor_cache = NS(get = lambda dev, shape, dtype, tag: torch.empty(shape, dtype = dtype)))
+        forward = helpers.method("exllamav3/modules/dsv4.py", "DSV4Attention", "_project_o_grouped", ns)
+        grouped = NS(out_features = 4, ptrs_trellis = None, ptrs_suh = None, ptrs_svh = None, K = 3,
+                     mcg = False, mul1 = False)
+        per_group = Mock(side_effect = lambda x, p: x * 2)
+        layer = NS(o_groups = 2, woa_multi_ready = True, device = None, wo_a_multi = grouped,
+                   woa_indices = None, wob_multi = None, out_dtype = torch.half,
+                   wo_a = [NS(forward = per_group) for _ in range(2)],
+                   wo_b = NS(forward = lambda x, p, out_dtype: x))
+        return lambda rows: forward(layer, torch.ones((2, 1, rows, 4)), {}, None), ext, per_group
+
+    def test_grouped_o_projection_per_group_at_every_row_count(self):
+        forward, ext, per_group = self.project_o_grouped(True)
+        for rows in (1, 7, 17, 32, 33, 128):
+            output = forward(rows)
+            self.assertEqual(output.shape, (1, rows, 8))
+            self.assertTrue(bool((output == 2).all()))
+        ext.exl3_mgemm.assert_not_called()
+        self.assertEqual(per_group.call_count, 12)
+
+    def test_grouped_o_projection_default_uses_the_grouped_gemm_up_to_32_rows(self):
+        forward, ext, per_group = self.project_o_grouped(False)
+        for rows in (1, 7, 32, 33, 128):
+            output = forward(rows)
+            self.assertEqual(output.shape, (1, rows, 8))
+            self.assertTrue(bool((output == 2).all()))
+        self.assertEqual(ext.exl3_mgemm.call_count, 3)
+        self.assertEqual(per_group.call_count, 4)
 
 
 if __name__ == "__main__":

@@ -1081,6 +1081,19 @@ With `1` each operation below takes one arithmetic path at every row count, the 
   GPU. With an explicit placement `-mcm` is refused, so the RAM-held experts of layers the
   placement does not cover (`-dmcl`: an MTP head or a draft model) stay CPU-computed and are
   refused under the profile: with a placement, keep those experts in VRAM.
+- DeepSeek-V4.1's hyper-connection mixing (mHC) reduces each row's mixing projection in one piece.
+  The fused `hc_mix` kernel splits a row's FP32 dot products over column chunks whose number
+  follows the row count of the call (with DeepSeek-V4.1-Flash's 4 x 5120 streams: 80 chunks for
+  1 to 6 rows, 40 for 7 to 12, 16 at 26 to 32, 2 at 171 to 256, one from 257 rows on), and the
+  chunk sums round differently. Under the profile every call takes the one-chunk partition of
+  large prefill chunks.
+- The grouped attention output projection of DeepSeek-V4 and V4.1 (`wo_a`, one linear per head
+  group) runs its per-group linears at every row count, instead of one grouped quantized GEMM
+  (`exl3_mgemm`) for single-sequence calls of up to 32 rows. On DeepSeek-V4 this holds only in
+  its Python attention paths (stateless and eager cached): V4's native decode step
+  (`EXL3_BC_DSA`, on by default) keeps the grouped GEMM and runs all its projections through the
+  direct quantized kernels, and V4 attention is otherwise not covered. It is the only
+  DeepSeek-V4.1 attention or mixing change that also reaches DeepSeek-V4.
 
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported. It
 may be combined with `EXL3_HGEMM_FIXED_ROWS` and `EXL3_MOE_FUSED_PREFILL` left unset or set to
@@ -1114,11 +1127,11 @@ projections inside the native decode blocks (attention and MLA with `EXL3_BC_ATT
 through the direct quantized kernels themselves, and the grouped q/k/v(/z) `exl3_mgemm` that
 attention, sliding-window attention and GatedDeltaNet use for calls of up to 32 rows, so on
 those architectures decode and prefill projections still differ; the GatedDeltaNet / KDA prefill
-path (its token-major convolution rounds the projection to BF16 only
-for calls of up to 32 rows), the n-gram embedding (PLE) projections (`at::matmul` in 1024-row
-slabs inside the extension), DeepSeek-V4's native attention block and hyper-connection head,
-tensor parallelism, and the CPU. Results also still differ between GPU types. The profile has
-only been validated end to end on DeepSeek-V4.1-Flash.
+path (its token-major convolution rounds the projection to BF16 only for calls of up to 32 rows),
+the n-gram embedding (PLE) projections (`at::matmul` in 1024-row slabs inside the extension),
+DeepSeek-V4's native attention block, hyper-connection mixing and hyper-connection head, tensor
+parallelism, and the CPU. Results also still differ between GPU types. The profile has only been
+validated end to end on DeepSeek-V4.1-Flash.
 
 Memory: the fixed-row GEMM tiles (two tiles per GEMM call), no reconstruct-tier slabs, and the
 router's FP32 split-K partials of large calls, up to `8 x rows x experts x 4` bytes (64 MiB for a
@@ -1130,7 +1143,11 @@ allocates and the autosplit already measures.
 
 Performance: slower, in prefill and much more in decode. Every decoded token reconstructs the
 weights of every EXL3 linear that `LinearEXL3.forward` dispatches and runs the MoE layers through
-the prefill kernels, without native CUDA graphs; prefill pays the fixed-row GEMM tiles (2.6x-3.1x
+the prefill kernels, without native CUDA graphs; DeepSeek-V4.1 decode also gives up the
+multi-chunk mHC mix (one 64-thread block per row streams the whole FP32 mixing matrix, about
+2 MB, at both mixing sites of every layer, instead of 80 blocks per row below 7 rows) and the
+grouped `wo_a` GEMM (8 per-group linears and a concatenation instead of one launch), whose share
+was not measured separately; prefill pays the fixed-row GEMM tiles (2.6x-3.1x
 on a large projection, see `EXL3_HGEMM_FIXED_ROWS`), fused-only experts, and the whole-column MoE
 partition. There each block of an expert's group owns whole output column tiles, so the group
 takes as long as its busiest block, `ceil(column tiles / group width)` whole columns, where the

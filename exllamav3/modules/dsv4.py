@@ -5,6 +5,7 @@ import torch
 import os
 import torch.nn.functional as F
 from ..model.config import Config
+from ..model.math_policy import STABLE_ARITHMETIC
 from ..model.model_tp_alloc import TPAllocation
 from .module import Module
 from .linear import Linear
@@ -1028,8 +1029,11 @@ class DSV4Attention(Module):
         if not self.woa_multi_ready and self.device is not None:
             self._build_woa_multi()
 
+        # EXL3_STABLE_ARITHMETIC=1: the grouped GEMM computes differently from the per-group
+        # linears that longer calls take, so a row's projection would depend on the call's row
+        # count; keep the per-group linears at every row count
         use_mg = (
-            self.wo_a_multi is not None and bsz == 1 and seq <= 32
+            not STABLE_ARITHMETIC and self.wo_a_multi is not None and bsz == 1 and seq <= 32
             and not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
         )
         if use_mg:

@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from typing_extensions import override
 
 from ..ext import exllamav3_ext as ext
+from ..model.math_policy import STABLE_ARITHMETIC
 from ..util.device_copy import to_device
 from ..util.tensor import g_tensor_cache, to2
 from . import Module
@@ -112,12 +113,19 @@ class DSV41HyperConnection(HyperConnection):
         fn stays fp32 at every row count (V4's mix switches to an fp16 copy at <= 32 rows, a
         precision step keyed on batch size). The partials workspace is sized by
         hc_mix_num_chunks: the kernel writes exactly that many chunks, which are summed here.
+        Under EXL3_STABLE_ARITHMETIC=1 the workspace has one chunk at every row count (see
+        below), and that chunk is the sum.
         """
         b, s, H, D = streams.shape
         R = b * s
         st = streams.view(R, H, D)
         M1 = 2 * H + H * H + 1
-        chunks = ext.hc_mix_num_chunks(R, H * D)
+        # hc_mix splits each row's projection over column chunks and the chunk count follows the
+        # row count (hc_mix_num_chunks: up to 128, 80 on DeepSeek-V4.1-Flash, one from 257 rows
+        # on), so the FP32 dot products of the same row are parenthesized differently in decode
+        # and prefill.
+        # Stable arithmetic keeps one chunk, the large-prefill partition, at every row count
+        chunks = 1 if STABLE_ARITHMETIC else ext.hc_mix_num_chunks(R, H * D)
         dev = streams.device
 
         # Decode-sized calls take bucketed static workspaces, as V4's mix does (tags of their
@@ -132,7 +140,7 @@ class DSV41HyperConnection(HyperConnection):
         unused = ws(R * D, torch.half, "dsv41_hc_coll").view(R, D)
         ext.hc_mix(st, self.fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                    self.sinkhorn_iters, partials, post, comb, unused)
-        p = partials.sum(dim = 1)
+        p = partials[:, 0] if STABLE_ARITHMETIC else partials.sum(dim = 1)
         rmr = torch.rsqrt(p[:, M1 - 1:] / (H * D) + self.rms_eps)
         pre = torch.sigmoid(p[:, :H] * rmr * self.scale[0] + self.base[:H]) + self.hc_eps
         return post.view(b, s, H), comb.view(b, s, H, H), pre.view(b, s, H)
