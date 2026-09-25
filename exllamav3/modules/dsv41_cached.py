@@ -17,8 +17,9 @@ Geometry, for one kv source at compression rate m (1 or 2):
   * Entry e lives at pool row bt[e // epp] * epp + e % epp, epp = PAGE_SIZE // m: token page i
     holds the entries its own tokens produce, so pools share the token page table.
 
-Selection (modules/dsv41_select.py) and the stateless path's per-forward device memo
-(cache/dsv41.py, DeviceMemo) are separate modules.
+Selection (modules/dsv41_select.py), the per-forward device memo (cache/dsv41.py, DeviceMemo)
+and the cross-device pool replica of an explicit placement's split (cache/dsv41_replica.py) are
+separate modules.
 """
 
 from __future__ import annotations

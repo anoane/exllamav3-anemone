@@ -15,8 +15,9 @@ This driver runs one prefill call as sub-chunks and overlaps them:
 
 Causality allows it: S1 of chunk k+1 reads only the first-half layers' caches, which S1 of
 chunk k finished; S2 of chunk k reads the second-half caches and the chunk-k products of
-the first half (streams and the carried pre-mix), all ordered after the event S1(k) records on
-the first GPU.
+the first half (streams, the carried pre-mix, and across the split of an explicit placement
+the pool replica rows [e0, e1) and the top-k selections that cross it), all ordered after the
+event S1(k) records on the first GPU.
 
 S1 keeps the caller's first-device stream (normally the default stream), avoiding a
 separate allocation pool for stage 1. S2 reads the first GPU's products on a side stream
@@ -374,7 +375,9 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
         if worker is not None:
             worker.join()
         # Order the caller's later work on the first GPU (e.g. a page-table defragmentation) after
-        # everything stage 2 read there on the side stream, after a failure too
+        # everything stage 2 read there on the side stream, after a failure too: across the split
+        # of an explicit placement that includes persistent Cache rows (the pool replica gathers),
+        # which the allocator records do not cover
         torch.cuda.current_stream(plan.dev1).wait_stream(plan.side1)
     if "e" in box:
         _invalidate_state(rs)

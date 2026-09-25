@@ -1090,9 +1090,12 @@ that no layer at or past `c` reads a pool, a top-k selection or candidate blocks
 | 20 | 0-19 | 20-39 |
 
 Every other layer lies inside a kv group. Without a Cache any layer works, at a cost (below).
-An explicit placement must change device at free cuts too, with or without a Cache: one that
-does not is refused when the model object is built ([placement.md](placement.md),
-"DeepSeek-V4.1").
+
+The one exception is the split of an explicit placement: a placement may put one change of
+device inside a kv group, and the layers past it then read a replica of the group's pool, which
+the Cache allocates when it is created. [placement.md](placement.md), "DeepSeek-V4.1", has that
+rule, what each replica costs and the examples. The autosplit cannot add a replica: it finds
+where a device fills up only while it loads, after the Cache may already have been sized.
 
 Steering the autosplit. The change of device falls where a budget runs out, so place it with the
 budgets: give each device room for the layers it should hold and their share of the Cache, and
@@ -1122,31 +1125,33 @@ What fails, and when:
   past a change of device that is not a free cut refuses to load, with a `RuntimeError` raised
   before anything of its MoE loads, e.g.
 
-  `DeepSeek-V4.1: the layer split put layers.12 on cuda:1, but layers 8-13 share the compressed-KV pool of layers.8, which is on cuda:0. With a Cache attached, a change of device can only fall where no pool, top-k selection or candidate list is shared across it: at layer 1, 2, 8, 14 or 20 on this model. Change the split budgets (-gs / use_per_device / reserve_per_device): less room on cuda:0, so that it holds layers up to 7 only, or room for layers 12-13 as well, so that the change falls at layer 14 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs")`
+  `DeepSeek-V4.1: the layer split put layers.12 on cuda:1, but layers 8-13 share the compressed-KV pool of layers.8, which is on cuda:0. With a Cache attached, a change of device can only fall where no pool, top-k selection or candidate list is shared across it: at layer 1, 2, 8, 14 or 20 on this model. Change the split budgets (-gs / use_per_device / reserve_per_device): less room on cuda:0, so that it holds layers up to 7 only, or room for layers 12-13 as well, so that the change falls at layer 14 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs"). An explicit placement (EXL3_PLACEMENT / --placement) can instead change device inside one kv group; the layers past it then read a replica of its pool (doc/placement.md, "DeepSeek-V4.1")`
 
   When no free cut lies above the change (layers 21-39 on Flash), the second way reads `room for
   layers <k>-39 as well, so that no change of device is left`. Load again with the budgets
-  changed, or with an explicit placement that changes device at a free cut.
+  changed, or write an explicit placement with the split there.
 - A Cache built after the load: the load succeeds and prints the note below, and the first cached
   forward of a layer whose pool is on another device raises a `RuntimeError`, e.g.
-  `layers.12.attn: the compressed-KV pool it reads (layers.8) is on cuda:0, but this layer is on cuda:1. A Cache needs the layers that share a pool on one device: reload with every change of device at layer 1, 2, 8, 14 or 20 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs")`.
+  `layers.12.attn: the compressed-KV pool it reads (layers.8) is on cuda:0, but this layer is on cuda:1. A Cache needs the layers that share a pool on one device: reload with every change of device at layer 1, 2, 8, 14 or 20 (doc/env_vars.md, DeepSeek-V4.1, "Loading across GPUs"). An explicit placement (EXL3_PLACEMENT / --placement) can instead change device inside one kv group; the layers past it then read a replica of its pool (doc/placement.md, "DeepSeek-V4.1")`.
 - No Cache: the load succeeds and prints
-  ` !! DSV41: layers 12-13 read a compressed-KV pool on another device; without a Cache each forward copies those pools whole, and a Cache would need every change of device at layer 1, 2, 8, 14 or 20`.
+  ` !! DSV41: layers 12-13 read a compressed-KV pool on another device; without a Cache each forward copies those pools whole, and a Cache would need every change of device at layer 1, 2, 8, 14 or 20. An explicit placement (EXL3_PLACEMENT / --placement) can instead change device inside one kv group; the layers past it then read a replica of its pool (doc/placement.md, "DeepSeek-V4.1")`.
   Each forward then copies the whole pool of a cut group to the other device, about 1.25 KiB per
   compressed entry of the sequence (about 40 MiB for a 64K-token sequence at rate 2), once per
   forward and device, plus the top-k selections (2 KiB per query row) and candidate blocks (8 KiB
   per row) that cross the change. A change of device at a free cut copies nothing but the hidden
   state, as for every model.
 - After every load the compressed layers are checked against their pool's device. With a Cache
-  attached a layer on another device than its pool is a `RuntimeError` (`DeepSeek-V4.1 load check
-  failed: layers 12-13 read a compressed-KV pool on another device, which the cached path cannot
-  do; reload with every change of device at layer 1, 2, 8, 14 or 20`): the check during the load
-  refuses such a split before it completes, so this catches only a load that went around it,
-  e.g. modules loaded one by one. Without a Cache it is the note above.
+  attached a layer on another device than its pool is a `RuntimeError`:
+
+  `DeepSeek-V4.1 load check failed: layers 12-13 read a compressed-KV pool on another device, which the cached path cannot do; reload with every change of device at layer 1, 2, 8, 14 or 20. An explicit placement (EXL3_PLACEMENT / --placement) can instead change device inside one kv group; the layers past it then read a replica of its pool (doc/placement.md, "DeepSeek-V4.1")`
+
+  The check during the load refuses such a split before it completes, so this catches only a
+  load that went around it, e.g. modules loaded one by one. Without a Cache it is the note above.
 
 Three or more devices: the same rule holds for every change of device. Budgets that put layers
 0-7, 8-19 and 20-39 on three devices load with a Cache; budgets that change device at 8 and 18
-fail at layer 18.
+fail at layer 18. (An explicit placement may put one of its changes of device inside a kv group,
+the others at free cuts; placement.md.)
 
 Other loads: a load on one device (`model.load(device = ...)`, one budget, or a single visible
 device) changes device nowhere and needs nothing. Tensor-parallel loading (`-tp`,
@@ -1181,7 +1186,9 @@ model.load(use_per_device = [36, 90])
 
 The same layout written as an explicit placement fixes the change of device whatever the budgets
 leave room for: `--placement "0-13=cuda:0 experts=split cpu=192; 14-39=cuda:1 experts=split cpu=192"`
-(the placement replaces `-mcs`, so the experts go in its rules).
+(the placement replaces `-mcs`, so the experts go in its rules). A change of device inside a kv
+group, e.g. at 12, needs the placement's split and its pool replica; placement.md,
+"DeepSeek-V4.1", has that example.
 
 ### `EXL3_DSV41_NUMERICS` (default: `deepseek:index`)
 
@@ -1312,6 +1319,8 @@ Interactions and refusals:
   freely. Both are configuration-time errors: neither refusal happens inside a forward pass (the
   operand checks above do). The error suggests the setting without its `compressed` part, or
   the default when no other part is left.
+- A pool replica (the split of an explicit placement, placement.md, "DeepSeek-V4.1") copies the
+  stored, already rounded entries bitwise.
 - The setting applies to the cached (generation) path and to the stateless path alike.
 
 Relation to other settings. `-cq` is the one setting that overlaps: it stores the compressed
@@ -1449,17 +1458,19 @@ calling thread (first GPU):    S1(0)  S1(1)  S1(2)  ...
 worker thread (second GPU):           S2(0)  S2(1)  S2(2)  ...
 ```
 
-Stage 2 of a sub-chunk waits, on the GPU, for an event its stage 1 recorded, so it reads the
-first half's products (the residual streams and the carried hyper-connection pre-mix) only once
-they are complete;
-tensors it reads from the first GPU are recorded on its side stream, so the caching allocator
-cannot hand them out again before the read is done. Stage 2 is queued on the caller's current
-stream of the second GPU, so work the caller queues after `prefill()` returns (decode, cache
-reads) is ordered after it without a device-wide synchronization. When the call returns, after
-a failure too, the caller's current stream of the first GPU waits for the side stream, so
-first-GPU work queued afterwards (a page-table defragmentation, for example) cannot overtake
-anything stage 2 still reads there. The job state's position is advanced
-after each stage 1; stage 2 runs on a snapshot of the sub-chunk's own start position.
+Stage 2 of a sub-chunk waits, on the GPU, for an event its stage 1 recorded, so it reads the first
+half's products (the residual streams, the carried hyper-connection pre-mix, and across the split
+of an explicit placement the pool replica rows and the top-k selections that cross it) only once
+they are complete; tensors it reads from the first GPU are recorded on its side stream, so the
+caching allocator cannot hand them out again before the read is done. Stage 2 is queued on the
+caller's current stream of the second GPU, so work the caller queues after `prefill()` returns
+(decode, cache reads) is ordered after it without a device-wide synchronization. On the first GPU,
+the side stream may also read persistent Cache rows (the pool replica gathers, across the split of
+an explicit placement), which the allocator records do not cover; so when the call returns, after a
+failure too, the caller's current stream of the first GPU waits for the side stream, and first-GPU
+work queued afterwards (a page-table defragmentation, for example) cannot overtake those reads. The
+job state's position is advanced after each stage 1; stage 2 runs on a snapshot of the sub-chunk's
+own start position.
 
 Values: `EXL3_DSV41_PIPELINE`: `0` off (default), any other value on. `EXL3_DSV41_PIPELINE_CHUNK`:
 the sub-chunk in tokens, a positive integer; it is read (and validated) only when the pipeline is
@@ -1536,17 +1547,19 @@ and this second half have finished (the calling thread and the worker both hold 
 residual streams, 80 KiB per token on DeepSeek-V4.1-Flash (4 streams x 5120 x FP32), 320 MiB at
 4096 tokens, and its params, which hold the top-k selections of the index sources before the
 split (2 KiB per row each), the candidate blocks when the candidate source (layer 20) is before
-it (8 KiB per row), the rope tables and block-table copies: with the split at layer 20 and 4096
-tokens, about 24 MiB more (the selections of layers 2, 8 and 14). Stage 2's own first-GPU buffers
-(index-select outputs) are allocated on its side stream and come from that stream's own
+it (8 KiB per row), the rope tables and block-table copies: with the split at layer 22 and 4096
+tokens, about 64 MiB more. Stage 2's own first-GPU buffers (the pool-replica staging of up to
+8 MiB across the split of an explicit placement, index-select outputs) are allocated on its side
+stream and come from that stream's own
 allocator pool, which the default stream does not reuse. The autosplit reserves none of this;
 leave that much headroom on the first GPU (its `-gs` budget or `EXL3_AUTOSPLIT_MARGIN_MB`). One
 extra CUDA stream on the first GPU, and one worker thread per sub-chunk.
 
 Performance: measured on DeepSeek-V4.1-Flash split at layer 12 across two GPUs, with the routed
 experts of layers 12-22 held in system RAM and streamed to the second GPU (past the split, so
-eligible; `-mcl` and `-mcs` cannot place experts that way), 4096-token sub-chunks, 65,024
-prompt tokens in four direct `model.prefill` calls of up to 16,384 tokens followed by a
+eligible: the explicit placement `0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1`; `-mcl`
+and `-mcs` cannot place experts that way), 4096-token sub-chunks, 65,024 prompt tokens in four
+direct `model.prefill` calls of up to 16,384 tokens followed by a
 512-token continuation: 82.4 s plain and 67.2 s pipelined (1.23x) with the split crossing as in
 this code (FP32 residual streams) and every GPU arithmetic path fixed to be independent of the
 row count; 54.4 s and 40.6 s (1.34x) in a build with other options on as well, among them
@@ -1566,11 +1579,11 @@ unset nothing changes: the plain path runs, at the cost of one failed-state chec
 
 The examples load every routed expert into VRAM, as the eligibility rules above require of the
 first half, and change device at the free cut 14 (with a Cache attached the change must fall at a
-free cut; "Loading across GPUs", above): at 3.0 bpw DeepSeek-V4.1-Flash's layers 0-13 take about
-68 GiB and layers 14-39 about 127 GiB, so on two 96 GiB-class cards this layout does not fit. There the second half has to keep
-part of its experts in system RAM without the first half doing so (the layout measured above
-streams the experts of layers 12-22 from RAM to the second GPU), or the checkpoint has to be
-smaller.
+free cut; "Loading across GPUs", above): at 3.0 bpw DeepSeek-V4.1-Flash's layers 0-13 take about 68
+GiB and layers 14-39 about 127 GiB, so on two 96 GiB-class cards this layout does not fit. There
+the second half has to keep part of its experts in system RAM without the first half doing so (the
+layout measured above streams the experts of layers 12-22 from RAM to the second GPU), or the
+checkpoint has to be smaller.
 
 ```sh
 EXL3_DSV41_PIPELINE=1 EXL3_DSV41_PIPELINE_CHUNK=4096 \

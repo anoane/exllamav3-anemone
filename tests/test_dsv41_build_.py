@@ -241,10 +241,15 @@ def check_assembly(model):
     assert all(p["mlp_kind"] == "DSV41MoE" and p["mlp"] == f"layers.{i}.ffn"
                for i, p in enumerate(blk))
     assert all(p["owns_ring"] for p in blk)
-    # pools: exactly the kv sources; every compressed layer reads its kv source's
+    # pools: the kv sources, plus a replica owner only where an explicit placement's split wires
+    # one (none without a placement); every compressed layer reads its route owner's pool
     pools = [i for i, p in enumerate(blk) if p["allocates_cache"]]
-    assert pools == sorted(c.kv_source_layer_ids), (pools, c.kv_source_layer_ids)
-    assert all(p["cache_owner"] == c.kv_source_for(i) for i, p in enumerate(blk))
+    wired = {i for i, r in model.pool_routes.items() if r[1] is not None}
+    assert wired == (set(model.placement.replicas) if model.placement else set()), wired
+    assert pools == sorted(set(c.kv_source_layer_ids) | wired), (pools, c.kv_source_layer_ids, wired)
+    assert all(p["cache_owner"] == (p["pool_route"][0] if p["pool_route"] else None) for p in blk)
+    if model.placement is None:
+        assert all(p["cache_owner"] == c.kv_source_for(i) for i, p in enumerate(blk))
     assert all(p["cache_owner"] is None for p in blk if p["layer_type"] == "sliding")
 
     print(f"  OK  assembly: {n} DSV41Block + DSV41MoE, DSV41HeadCollapse, recurrent_state_cls "

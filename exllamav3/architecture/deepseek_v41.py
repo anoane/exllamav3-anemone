@@ -376,7 +376,9 @@ class DeepseekV41Config(Config):
         (source, members) per compressed-KV group, in layer order.
 
         Every member reads the source's pool on its own device, so with a Cache
-        a layer split must not cut a group (architecture/dsv41/placement.py).
+        a layer split must not cut a group, except at the split of an explicit
+        placement, past which a replica of the pool is read
+        (architecture/dsv41/placement.py).
         For DeepSeek-V4.1-Flash this yields
         {2-7} {8-13} {14-19} {20-39}, the last being 20 layers.
         """
@@ -435,7 +437,9 @@ class DeepseekV41Model(Model):
         (modules/dsv41_block.py)
       - the routed MoE is DSV41MoE, whose load asks the load guard
         (dsv41/placement.py) whether a change of device falls where nothing
-        is shared across it. Which experts are kept in system RAM is -mcl /
+        is shared across it, or at the split of the explicit placement, where
+        a pool replica takes over; every compressed layer gets its pool route
+        before any Cache exists. Which experts are kept in system RAM is -mcl /
         -mcs or the explicit placement (EXL3_PLACEMENT), as for every MoE model
     """
 
@@ -444,7 +448,7 @@ class DeepseekV41Model(Model):
     def __init__(self, config: DeepseekV41Config, **kwargs):
         super().__init__(config, **kwargs)
         from .dsv41.cache_plan import CachePlan
-        from .dsv41.placement import DSV41LoadGuard, check_placement
+        from .dsv41.placement import DSV41Placement, DSV41LoadGuard, default_routes
         from ..modules import Embedding, RMSNorm, Linear, GatedMLP, ExpandStreams
         from ..modules.dsv41 import DSV41Attention
         from ..modules.dsv41_engram import DSV41Engram
@@ -457,19 +461,24 @@ class DeepseekV41Model(Model):
         c = config
 
         # The explicit placement (EXL3_PLACEMENT / --placement / config.infer_params.placement),
-        # checked now, before a Cache can be built for this model, and again at load: every
-        # change of device it makes must be a free cut (architecture/dsv41/placement.py)
-        placement = parse_placement(getattr(c.infer_params, "placement", None))
-        if placement is not None:
-            check_placement(placement, c)
-        # Every compressed layer reads its kv source's pool
-        self.cache_plan = CachePlan(c.compress_ratios, c.kv_source_layer_ids)
+        # read now, or None: its changes of device must be free cuts, except at most one, the
+        # split, past which the first layer owns a replica of its kv group's pool. The Cache sizes
+        # itself from those pool routes, so they must exist before any Cache is built
+        # (architecture/dsv41/placement.py). Without one every layer reads its own kv source
+        self.placement = DSV41Placement.from_generic(
+            parse_placement(getattr(c.infer_params, "placement", None)), c)
+        self.pool_routes = self.placement.routes if self.placement is not None \
+            else default_routes(c)
+        self.cache_plan = CachePlan(c.compress_ratios, c.kv_source_layer_ids,
+                                    routes = self.pool_routes)
         # Shared by every DSV41MoE: while load_gen runs, fails fast when the autosplit
         # changes device where a pool, a selection or candidate blocks would be shared
-        # across the change and a Cache is attached; inert outside it
+        # across the change and a Cache is attached (the placement's split excepted,
+        # whose replica the Cache holds); inert outside it
         self_ref = weakref.ref(self)
         self.load_guard = DSV41LoadGuard(
             c, cache_attached = lambda: (m := self_ref()) is not None and m._cache_attached(),
+            split_at = self.placement.split_at if self.placement is not None else None,
         )
         # Pipelined prefill (dsv41/pipeline.py): the cached split plan, and the max_chunk_size
         # of the current load, which bounds its sub-chunk. Both are reset by every load/unload
@@ -631,7 +640,8 @@ class DeepseekV41Model(Model):
 
         # As in V4, all attention state is recurrent-style (sliding rings plus
         # compressed pools); V4.1 adds that a pool is shared by a whole kv
-        # group, so with a Cache a layer split must not cut one (placement.py)
+        # group, so with a Cache a layer split must not cut one, except at the
+        # split of an explicit placement, with a pool replica (placement.py)
         self.caps.update({
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
@@ -646,6 +656,11 @@ class DeepseekV41Model(Model):
         # the rate-2 compressor carry and the engram lookback ring (cache/dsv41.py)
         from ..cache.dsv41 import DSV41State
         self.recurrent_state_cls = DSV41State
+
+        # Pool routes go to the attention modules now, before any Cache exists:
+        # Cache() sizes its layers from the modules' caps at construction, and a
+        # replica owner must already be one by then
+        self._apply_pool_routes()
 
     def module_plan(self) -> list[dict]:
         """
@@ -672,11 +687,12 @@ class DeepseekV41Model(Model):
                 "mlp": f"{k}.ffn",
                 "mlp_kind": "DSV41MoE",
                 "hc": [f"{k}.hc_attn", f"{k}.hc_ffn"],
-                # every layer owns an SWA ring; only kv sources own a paged pool, and a
-                # consumer reads its kv source's
+                # every layer owns an SWA ring; only kv sources and replica owners
+                # own a paged pool, and a consumer reads its route owner's
                 "owns_ring": self.cache_plan.owns_ring(i),
                 "cache_owner": self.cache_plan.owner[i],
                 "allocates_cache": self.cache_plan.owns_pool(i),
+                "pool_route": self.pool_routes.get(i),
                 "is_kv_source": c.is_kv_source(i),
                 "is_index_source": c.is_index_source(i),
                 "index_owns_k": c.index_owns_k(i),
@@ -750,17 +766,23 @@ class DeepseekV41Model(Model):
     def _cache_attached(self) -> bool:
         return any(ref() is not None for ref in self.cache_weakrefs.values())
 
+    def _apply_pool_routes(self):
+        """Hand every compressed layer its pool route."""
+        attns = [b.attn for b in self._blocks()]
+        for i, (owner, replica_of, with_index_k) in sorted(self.pool_routes.items()):
+            attns[i].set_pool_route(owner, replica_of = replica_of, with_index_k = with_index_k)
+
     @override
     def load_gen(self, *args, **kwargs):
         """
         Model.load_gen (Model.load goes through here too), with V4.1's load checks around
-        it: tensor-parallel loading and an explicit placement that changes device where it may
-        not are refused before anything loads; while the autosplit runs, the load guard refuses
-        a change of device that is not a free cut when a Cache is attached
-        (architecture/dsv41/placement.py); afterwards every compressed layer is checked against
-        the device of the pool it reads.
+        it: tensor-parallel loading and an explicit placement that needs other pool routes than
+        the model was built with are refused before anything loads; while the autosplit runs,
+        the load guard refuses a change of device that is neither a free cut nor the explicit
+        placement's split when a Cache is attached (architecture/dsv41/placement.py); afterwards
+        every compressed layer is checked against the device of the pool it reads.
         """
-        from .dsv41.placement import TP_REFUSAL, check_placement
+        from .dsv41.placement import TP_REFUSAL, DSV41Placement, default_routes
         a = inspect.signature(Model.load_gen).bind(self, *args, **kwargs)
         a.apply_defaults()
         a = a.arguments
@@ -782,10 +804,24 @@ class DeepseekV41Model(Model):
                     f"{chunk}, or lower EXL3_DSV41_PIPELINE_CHUNK")
         if a["tensor_p"]:
             raise NotImplementedError(TP_REFUSAL)
-        # the explicit placement set now, which may have changed since the model was built
-        placement = parse_placement(getattr(self.config.infer_params, "placement", None))
-        if placement is not None:
-            check_placement(placement, self.config)
+        # The pool routes were fixed when the model was built, from the explicit placement set
+        # then, and the Cache is sized from them. The placement set now is checked again (it
+        # may have changed since) and must need the same routes; its devices, expert storage
+        # and free cuts may differ
+        now = DSV41Placement.from_generic(
+            parse_placement(getattr(self.config.infer_params, "placement", None)), self.config)
+        now_routes = now.routes if now is not None else default_routes(self.config)
+        if now_routes != self.pool_routes:
+            was = self.placement.needs() if self.placement is not None else "no pool replica"
+            raise ValueError(
+                f"DeepSeek-V4.1: the model was built for {was}, but config.infer_params.placement "
+                f"is now {repr(now.spec) if now is not None else 'None'}, which needs "
+                f"{now.needs() if now is not None else 'no pool replica'}. The cross-device pool "
+                f"routes are fixed when the model object is built (the Cache is sized from them): "
+                f"set the placement before Model.from_config, or build a new model to change it")
+        # the placement this load follows, whose split the guard lets through
+        self.placement = now
+        self.load_guard.split_at = now.split_at if now is not None else None
         self.load_guard.begin()
         try:
             yield from super().load_gen(*args, **kwargs)
@@ -803,12 +839,15 @@ class DeepseekV41Model(Model):
 
     def _check_split(self):
         """
-        After a load: the compressed layers that read a pool on another device. With a Cache
-        attached that is an error (the cached path reads every pool on the reading layer's
-        device; the load guard refuses such a split while it loads, so this is a safety net);
-        without one, a note, since each forward then copies those pools whole.
+        After a load: the compressed layers that read a pool on another device than their own
+        (the pool of their route's owner: their kv source, or past an explicit placement's
+        split the replica owner). With a Cache attached that is an error (the cached path reads
+        every pool on the reading layer's device; the load guard refuses such a split while it
+        loads, so this is a safety net); without one, a note, since each forward then copies
+        those pools whole. With an explicit placement, first one line: where the modules landed
+        and what crosses between the devices.
         """
-        from .dsv41.placement import format_cuts, format_layer_ranges
+        from .dsv41.placement import REPLICA_HINT, format_cuts, format_layer_ranges
         c = self.config
         blocks = self._blocks()
         if len(blocks) != c.num_hidden_layers:
@@ -816,8 +855,11 @@ class DeepseekV41Model(Model):
         devs = [None if b.device is None else torch.device(b.device) for b in blocks]
         if any(d is None for d in devs):
             return
-        crossing = [i for i in range(c.num_hidden_layers)
-                    if (s := c.kv_source_for(i)) is not None and devs[s] != devs[i]]
+        if self.placement is not None:
+            print(f" -- DSV41 placement [{self.placement.spec}]: {self._where()} | "
+                  f"{self.placement.crossings()}", flush = True)
+        crossing = [i for i, (owner, _, _) in sorted(self.pool_routes.items())
+                    if devs[owner] != devs[i]]
         if not crossing:
             return
         free = format_cuts(self.load_guard.free)
@@ -826,10 +868,44 @@ class DeepseekV41Model(Model):
             raise RuntimeError(
                 f"DeepSeek-V4.1 load check failed: layers {ranges} read a compressed-KV pool on "
                 f"another device, which the cached path cannot do; reload with every change of "
-                f"device at {free}")
+                f"device at {free}. {REPLICA_HINT}")
         print(f" !! DSV41: layers {ranges} read a compressed-KV pool on another device; without a "
               f"Cache each forward copies those pools whole, and a Cache would need every change "
-              f"of device at {free}", flush = True)
+              f"of device at {free}. {REPLICA_HINT}", flush = True)
+
+    def _where(self) -> str:
+        """Where the top-level modules landed, as runs of one device: 'cpu embed | cuda:0 ...'"""
+        from .dsv41.placement import format_layer_ranges
+        runs = []
+        for m in self.modules:
+            d = "none" if m.device is None else str(torch.device(m.device))
+            if runs and runs[-1][0] == d:
+                runs[-1][1].append(m.key)
+            else:
+                runs.append((d, [m.key]))
+        def span(names):
+            out, lay = [], []
+            for x in names + [None]:
+                if x is not None and x.startswith("layers."):
+                    lay.append(int(x.split(".")[1]))
+                    continue
+                if lay:
+                    out.append(f"layers.{format_layer_ranges(lay)}")
+                    lay = []
+                if x is not None:
+                    out.append(x)
+            return ",".join(out)
+        def devname(d):
+            # CUDA_VISIBLE_DEVICES can reorder the cards, so name them. Only asked of an
+            # initialized runtime, so a check run without a load stays off the GPU
+            try:
+                dv = torch.device(d)
+                if dv.type == "cuda" and torch.cuda.is_initialized():
+                    return f"{d} ({torch.cuda.get_device_name(dv)})"
+            except Exception:
+                pass
+            return d
+        return " | ".join(f"{devname(d)} {span(names)}" for d, names in runs)
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:

@@ -11,8 +11,10 @@ selection checks read the rounded values.
 
 Loads single attention layers 2 (rate-2 kv + index source), 3 (its consumer), 8 (rate-2
 source), 12 (consumer of 8), 20 (rate-1 kv + index + candidate source) and 24 (index source
-borrowing 20's K; a candidate user) on one card, and repeats on every visible card. Never the
-full model; a few GiB per card. Each layer gets the same synthetic hidden
+borrowing 20's K; a candidate user) on one card, and repeats on every visible card. With two
+or more cards it then repeats the same checks with layer 12 on the other card, reading a replica
+of 8's pool (the split of an explicit placement at 12), with each of the first two cards as home.
+Never the full model; a few GiB per card. Each layer gets the same synthetic hidden
 states. For T = 700 and 3000 tokens the cached path runs chunked prefill at chunk sizes 2048,
 1000 and 7 with token-by-token decode spliced in -- across the rate-1 top-k threshold (512 ->
 513 entries) at 700, across the rate-2 one (1025 -> 1026 tokens) at 3000, and from an odd
@@ -125,12 +127,17 @@ def schedule(T, chunk):
 
 
 class Rig:
-    """The six layers loaded on one card under one Cache."""
+    """The six layers loaded on one card under one Cache; with replica, layer 12 on the other
+    card, routed to a replica of 8's pool (the split of an explicit placement at 12)."""
 
-    def __init__(self, cfg, model, A, devs, home, batch = 1):
+    def __init__(self, cfg, model, A, devs, home, batch = 1, replica = False):
         from exllamav3.cache.cache import Cache
         self.cfg, self.model, self.A = cfg, model, A
         self.dev = {L: devs[home] for L in LAYERS}
+        self.replica = replica
+        if replica:
+            self.dev[12] = devs[1 - home]
+            A[12].set_pool_route(12, replica_of = 8)
         model.__dict__.pop("_get_cache_layers", None)
         self.cache = Cache(model, max_num_tokens = 4096 * batch, max_batch_size = batch)
         for L in LAYERS:
@@ -143,6 +150,8 @@ class Rig:
             self.A[L].unload()
         self.cache.detach_from_model()
         self.model.__dict__.pop("_get_cache_layers", None)
+        if self.replica:
+            self.A[12].set_pool_route(8)
         torch.cuda.empty_cache()
 
     def set_mode(self, mode):
@@ -255,7 +264,7 @@ class Rig:
             for p0, qq, ww in parts:
                 q[p0:p0 + qq.shape[0]] = qq
                 w[p0:p0 + ww.shape[0]] = ww
-            kl = self.cache.layers[(self.A[L].kv_source_layer, 0)]
+            kl = self.cache.layers[(self.A[L].pool_owner_layer, 0)]
             K = kl.pool_idx.reshape(-1, kl.pool_idx.shape[-1]).float().cpu()
             crec[L] = (q, w, K)
         return {L: torch.cat(v, dim = 0) for L, v in outs.items()}, sels, crec
@@ -716,7 +725,7 @@ def candidates_active(rig, cfg, X, n_blocks = 72, block = 8):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs = "?", default = model_dir())
-    ap.add_argument("--quick", action = "store_true", help = "T=700 only, cuda:0 only")
+    ap.add_argument("--quick", action = "store_true", help = "T=700 only, home cuda:0 only")
     ap.add_argument("--numerics", default = "precise", help = "config.dsv41_numerics for the run")
     args = ap.parse_args()
     if not args.path:
@@ -740,12 +749,19 @@ def main():
 
     Ts = (700,) if args.quick else (700, 3000)
     homes = (0,) if args.quick else tuple(range(len(devs)))
+    runs = [(home, False) for home in homes]
+    if len(devs) >= 2:
+        runs += [(home, True) for home in ((0,) if args.quick else (0, 1))]
     ok = True
     t_start = time.time()
-    for home in homes:
-        rig = Rig(cfg, model, A, devs, home)
+    for home, replica in runs:
+        rig = Rig(cfg, model, A, devs, home, replica = replica)
         try:
-            print(f"== cuda:{home}: layers {', '.join(map(str, LAYERS))}")
+            if replica:
+                print(f"== home cuda:{home}, layer 12 + replica of 8 on cuda:{1 - home} (an explicit "
+                      f"placement's split at 12)")
+            else:
+                print(f"== cuda:{home}: layers {', '.join(map(str, LAYERS))}")
             for T in Ts:
                 xs = rig.inputs(T, 1000 + T)
                 for mode in ("exact", "exl3"):
@@ -770,7 +786,7 @@ def main():
                             print(f"      exl3 projection difference, worst step size <= 144: " +
                                   " ".join(f"L{L} {pnoise[L]:.1e}" for L in LAYERS))
 
-                    if mode == "exact" and home == 0:
+                    if mode == "exact" and home == 0 and not replica:
                         # negative controls: each must FAIL the exact gate
                         steps = schedule(T, 7)
                         def clear_carry(rig_, st, pos):

@@ -136,6 +136,11 @@ def _pkg(name, **attrs):
     return m
 
 
+class _Replica:
+    def __init__(self, *a, **kw):
+        pass
+
+
 class _DeviceMemo:
     @staticmethod
     def get(params, key, t, device):
@@ -152,6 +157,7 @@ def _install_stubs():
     _pkg(f"{_P}.cache", CacheLayer_quant = _CacheLayerQuant)
     _pkg(f"{_P}.cache.dsv41", CacheLayer_dsv41 = type("CacheLayer_dsv41", (), {}),
          DSV41LayerState = type("DSV41LayerState", (), {}), DeviceMemo = _DeviceMemo)
+    _pkg(f"{_P}.cache.dsv41_replica", CacheLayer_dsv41_replica = _Replica, sync_pool_replica = None)
     _pkg(f"{_P}.modules.linear", Linear = _StubLinear)
     _pkg(f"{_P}.modules.rmsnorm", RMSNorm = _StubNorm)
     _pkg(f"{_P}.modules.dsv4", DSV4Attention = _StubBase, _ext_rope = _torch_rope)
@@ -261,6 +267,7 @@ def main(path = None):
         assert bool(a.caps.get("kv_cache")) == (i in kvs), f"layer {i}: kv_cache cap"
         assert a.layer_state_cls.__name__ == "DSV41LayerState", f"layer {i}: layer state class"
         assert a.kv_source_layer == kv_src(i), f"layer {i}: the pool it reads"
+        assert a.pool_owner_layer == kv_src(i), f"layer {i}: default pool route"
         assert a.is_candidate_source == (i == cand), f"layer {i}: candidate source flag"
     lt, kw = layers[2].cache_layer_type(object, {})
     assert lt.__name__ == "CacheLayer_dsv41" and kw == {}
@@ -273,6 +280,23 @@ def main(path = None):
         pass
     else:
         raise AssertionError("a consumer was given a pool of its own")
+    # replica route across an explicit placement's split at 12: 12 owns a replica of 8, 13 reads it
+    layers[12].set_pool_route(12, replica_of = 8)
+    layers[13].set_pool_route(12)
+    assert layers[12].caps["kv_cache"] and not layers[13].caps["kv_cache"]
+    lt, kw = layers[12].cache_layer_type(object, {})
+    assert lt is _Replica and kw == {"with_index_k": False}, (lt, kw)
+    for bad in (lambda: layers[13].set_pool_route(13), lambda: layers[12].set_pool_route(12, replica_of = 2),
+                lambda: layers[1].set_pool_route(1)):
+        try:
+            bad()
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("an invalid pool route was accepted")
+    layers[12].set_pool_route(8)
+    layers[13].set_pool_route(8)
+    assert not layers[12].caps["kv_cache"] and layers[12].replica_of is None
 
     # stateless source resolution: every consumer reads the source below it, and a pool
     # published by the wrong source is refused
@@ -440,7 +464,7 @@ def main(path = None):
     print(f"  OK  attention topology: {len(layers)} layers, kv groups {gs}; "
           f"{len(kvs)} compressors, {len(ixs)} indexers, "
           f"{sum(1 for i in ixs if i in kvs)} own K; a missing source refused; int32 rows, position > 0 "
-          f"and a stateless batch refused; pool ownership and "
+          f"and a stateless batch refused; pool ownership, replica routes and "
           f"cache classes; pool rope at (first + i) * m (old positions fail); cached store keeps "
           f"the latent and derives K pre-RoPE; candidates routed; head weights unpadded")
 

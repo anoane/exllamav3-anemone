@@ -53,6 +53,7 @@ from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
 from ..constants import PAGE_SIZE
 from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
+from ..cache.dsv41_replica import sync_pool_replica
 from .dsv41_select import select_topk, INT32_LIMIT
 from .dsv41_ablation import ablated
 from . import dsv41_rounding as rounding
@@ -337,8 +338,12 @@ class DSV41Attention(DSV4Attention):
       in a position-indexed carry ring); index sources select and publish
       ``params["dsv41_topk"][(layer, row)]``, consumers reuse it. Every layer
       that reads a pool, a selection or candidate blocks sits on the device of
-      their producer: the load guard (architecture/dsv41/placement.py) refuses
-      a layer split that would separate them while a Cache is attached.
+      their producer (the load guard, architecture/dsv41/placement.py, refuses
+      a layer split that would separate them while a Cache is attached), except
+      across the split of an explicit placement: a consumer past it reads a
+      replica of its source's pool that the first layer past the split owns
+      and refreshes (set_pool_route), and the selections and candidate blocks
+      it reads move once per forward.
 
     Both paths apply the attention numerics (config.dsv41_numerics, architecture/dsv41/
     numerics.py), read on every call: the index query and keys are rounded after RoPE, the
@@ -455,21 +460,60 @@ class DSV41Attention(DSV4Attention):
         self.candidate_topk_blocks = (getattr(config, "candidate_topk_blocks", 0) or 2048) if config is not None else 2048
 
         # Cached-path state. Every layer keeps its own sliding ring (V4.1's state class,
-        # which never dereferences a compressor on consumers); only kv sources own a pool,
-        # and every other compressed layer reads its kv source's Cache entry
+        # which never dereferences a compressor on consumers); only kv sources own a
+        # pool. pool_owner_layer is the layer whose Cache entry this one reads: its kv
+        # source by default, or a replica owner past a device split (set_pool_route)
         self.layer_state_cls = DSV41LayerState
         self.caps["kv_cache"] = bool(is_kv_source)
+        self.pool_owner_layer = kv_source_layer
+        self.replica_of = None
+        self.replica_with_index_k = False
+
+    def set_pool_route(self, owner_layer: int, replica_of: int | None = None,
+                       with_index_k: bool = False) -> None:
+        """
+        Which Cache pool this compressed layer reads. Called before the Cache is built
+        (Cache discovers owners through caps['kv_cache'], and the model memoizes that list
+        on first use).
+
+          set_pool_route(L, replica_of = S)   layer L owns a replica of kv source S's pool,
+                                              on L's device, refreshed by L each forward
+                                              with the entries S wrote in that forward
+          set_pool_route(L)                   read layer L's pool (a replica owner's, or the
+                                              kv source's when L is the source)
+
+        with_index_k: the replica also mirrors pool_idx (needed when an index source sits
+        past the split and borrows the source's index K; with the split at 12 on
+        DeepSeek-V4.1-Flash, layers 12 and 13 only consume and the replica carries no index K).
+        """
+        assert self.compress_ratio, f"{self.key}: a sliding layer reads no pool"
+        if replica_of is not None:
+            assert owner_layer == self.layer_idx, \
+                f"{self.key}: a replica is owned by the layer that refreshes it"
+            assert replica_of == self.kv_source_layer, \
+                f"{self.key}: replica of {replica_of}, but the kv source is {self.kv_source_layer}"
+            assert not self.is_kv_source, f"{self.key}: a kv source reads its own pool"
+        elif owner_layer == self.layer_idx:
+            assert self.is_kv_source, \
+                f"{self.key}: routes to itself without a replica, but it owns no pool"
+        self.pool_owner_layer = owner_layer
+        self.replica_of = replica_of
+        self.replica_with_index_k = bool(with_index_k) if replica_of is not None else False
+        self.caps["kv_cache"] = bool(self.is_kv_source or replica_of is not None)
 
     def cache_layer_type(self, default, kwargs: dict):
         """
-        CacheLayer_dsv41 for kv sources. A quantized Cache request packs the pool's nope part
-        at k_bits, as V4 does.
+        CacheLayer_dsv41 for kv sources, CacheLayer_dsv41_replica for a replica owner.
+        A quantized Cache request packs the pool's nope part at k_bits, as V4 does.
         """
         from ..cache import CacheLayer_quant
         kw = {}
         if issubclass(default, CacheLayer_quant) and (self.head_dim - self.rope_head_dim) % 32 == 0:
             kw = {"k_bits": kwargs["k_bits"], "v_bits": kwargs.get("v_bits")}
-        assert self.is_kv_source, f"{self.key}: only kv sources own a pool"
+        if self.replica_of is not None:
+            from ..cache.dsv41_replica import CacheLayer_dsv41_replica
+            return CacheLayer_dsv41_replica, dict(kw, with_index_k = self.replica_with_index_k)
+        assert self.is_kv_source, f"{self.key}: only kv sources and replica owners own a pool"
         return CacheLayer_dsv41, kw
 
     def load(self, device: torch.device, **kwargs):
@@ -700,16 +744,15 @@ class DSV41Attention(DSV4Attention):
         """
         The source's pools, on this layer's device.
 
-        A layer split may put a consumer on a different card from its kv
-        source. In the stateless path the pool is rebuilt every forward, so
+        A layer split without a Cache may put a consumer on a different card
+        from its kv source. In the stateless path the pool is rebuilt every forward, so
         the fix is a copy -- made once per (source, device) per forward and
         shared by every consumer on that device. At prefill scale that is
         small (entries x 1.3 KiB), but it is NOT the answer for decode at long
         context: a rate-1 pool at 1M tokens is ~1.3 GiB, and recopying it each
-        step would dominate. The cached path therefore reads every pool on its
-        own device only: with a Cache attached, the load guard
-        (architecture/dsv41/placement.py) refuses a layer split that cuts a kv
-        group.
+        step would dominate. The cached path instead keeps every pool on its
+        readers' device, and across the split of an explicit placement mirrors
+        only the entries appended since the last step (cache/dsv41_replica.py).
         """
         dev = self.device
         if dev is None or src.pool_c.device == dev:
@@ -914,10 +957,13 @@ class DSV41Attention(DSV4Attention):
         params.setdefault("dsv41_topk", {})
         params.setdefault("dsv41_candidates", {})
 
-        kl = bt = None
+        kl = bt = src_kl = bt_src = None
         if self.compress_ratio:
             kl = self._pool_layer(rsg[0], inst)
             bt = self._block_table(params, kl, rsg, bsz)
+            if self.replica_of is not None:
+                src_kl = rsg[0].cache.layers[(self.replica_of, inst)]
+                bt_src = self._block_table(params, src_kl, rsg, bsz)
 
         outs = []
         for b in range(bsz):
@@ -926,24 +972,24 @@ class DSV41Attention(DSV4Attention):
             outs.append(self._forward_cached_row(
                 x[b:b + 1], params, rs, rsl, out_dtype, b,
                 kl, bt[b:b + 1] if bt is not None else None,
+                src_kl, bt_src[b:b + 1] if bt_src is not None else None,
             ))
         return torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
 
     def _pool_layer(self, rs, inst):
-        """This layer's pool: its kv source's Cache entry, which must be on this device."""
-        src = self.kv_source_layer
-        kl = rs.cache.layers.get((src, inst))
+        """This layer's pool: its route owner's Cache entry, which must be on this device."""
+        kl = rs.cache.layers.get((self.pool_owner_layer, inst))
         if kl is None:
             raise RuntimeError(
-                f"{self.key}: the Cache has no pool for layer {src} (instance {inst}); only kv "
-                f"sources allocate one")
+                f"{self.key}: the Cache has no pool for layer {self.pool_owner_layer} (instance "
+                f"{inst}); only kv sources and replica owners allocate one")
         if kl.device is None or torch.device(kl.device) != torch.device(self.device):
-            from ..architecture.dsv41.placement import DOC_REF, format_cuts, free_cuts
+            from ..architecture.dsv41.placement import DOC_REF, REPLICA_HINT, format_cuts, free_cuts
             raise RuntimeError(
-                f"{self.key}: the compressed-KV pool it reads (layers.{src}) is on {kl.device}, "
-                f"but this layer is on {self.device}. A Cache needs the layers that share a pool "
-                f"on one device: reload with every change of device at "
-                f"{format_cuts(free_cuts(self.config))} ({DOC_REF})")
+                f"{self.key}: the compressed-KV pool it reads (layers.{self.pool_owner_layer}) is on "
+                f"{kl.device}, but this layer is on {self.device}. A Cache needs the layers that "
+                f"share a pool on one device: reload with every change of device at "
+                f"{format_cuts(free_cuts(self.config))} ({DOC_REF}). {REPLICA_HINT}")
         return kl
 
     @staticmethod
@@ -955,7 +1001,7 @@ class DSV41Attention(DSV4Attention):
         sbt = kl.slot_bt(rsg[0].cache.num_slots)
         return sbt[[rsg[i].slot for i in range(bsz)]]
 
-    def _forward_cached_row(self, x, params, rs, rsl, out_dtype, b, kl, bt_row):
+    def _forward_cached_row(self, x, params, rs, rsl, out_dtype, b, kl, bt_row, src_kl, bt_src):
         _, seq, _ = x.shape
         device = x.device
         pos0 = rs.position
@@ -984,6 +1030,10 @@ class DSV41Attention(DSV4Attention):
             # closing at p is visible to p), so they are stored before attention
             if self.is_kv_source:
                 self._compress_store(x, params, rsl, slot, kl, bt_row, pos0)
+            elif self.replica_of is not None:
+                e0, e1 = emission_range(pos0, seq, m)
+                if e1 > e0:
+                    sync_pool_replica(src_kl, kl, bt_src, bt_row, e0, e1)
             indices, k_len = self._select_cached(x, params, q_res, kl, bt_row, ec, pos0, b)
             pool_c, pool_r, bt, qc, page, pool_len = \
                 kl.pool_c_view(), kl.pool_r, bt_row, kl.qc(), kl.epp, ec
@@ -1086,8 +1136,7 @@ class DSV41Attention(DSV4Attention):
         (indices, k_len) for row b. At ec <= index_topk every visible entry is selected, which
         is dsa_attn's dense-pool mode (vLLM's short-context fill). Past it, index sources
         select and publish params["dsv41_topk"][(layer, b)]; consumers reuse their index
-        source's entry, which is on their device: the index source sits between their kv
-        source and them, and the pool check (_pool_layer) keeps that whole range on one device.
+        source's entry (moved once per forward when it lives on another device).
         """
         if ec <= self.index_topk:
             return None, 0
@@ -1095,7 +1144,7 @@ class DSV41Attention(DSV4Attention):
         if self.is_index_source:
             if kl.pool_idx is None:
                 raise RuntimeError(f"{self.key}: index source reads a pool with no index keys "
-                                   f"(layer {self.kv_source_layer})")
+                                   f"(layer {self.pool_owner_layer})")
             r = self._index_select(x, params, q_res, kl.pool_idx, bt_row, kl.epp, pos0, ec, b)
             reg[(self.layer_idx, b)] = (r.indices, r.k_len)
             return r.indices, r.k_len
@@ -1107,4 +1156,7 @@ class DSV41Attention(DSV4Attention):
                 f"{self.key}: index source layer {self.index_source_layer} has not published a "
                 f"top-k selection for row {b} this forward pass")
         indices, k_len = sel
+        if indices is not None:
+            indices = DeviceMemo.get(
+                params, ("dsv41_topk", self.index_source_layer, b), indices, self.device)
         return indices, k_len

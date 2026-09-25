@@ -3,15 +3,17 @@ DeepSeek-V4.1 routed MoE: BlockSparseMLP plus the model's load guard
 (architecture/dsv41/placement.py).
 
 Where the routed experts live is decided exactly as for every other MoE model:
--mcl / --moe_cpu_offload and -mcs / --moe_cpu_split go through BlockSparseMLP
-unchanged. What V4.1 adds is a check of the layer split: a compressed layer
-reads the paged pool of its kv source on its own device, so with a Cache
-attached the autosplit may change device only at a layer where no pool, top-k
-selection or candidate list is shared across the change (a free cut). Every
-DSV41MoE asks the shared load guard at the top of its load whether its block
-may land on the offered device; a change of device that is not a free cut
-raises RuntimeError there, before anything of this module is loaded or handed
-to the CPU worker.
+-mcl / --moe_cpu_offload, -mcs / --moe_cpu_split and the experts= of an
+explicit placement (EXL3_PLACEMENT) go through BlockSparseMLP unchanged. What
+V4.1 adds is a check of the layer split: a compressed layer reads the paged
+pool of its kv source on its own device, so with a Cache attached the
+autosplit may change device only at a layer where no pool, top-k selection or
+candidate list is shared across the change (a free cut), or at the split of
+the explicit placement the model was built with, where a pool replica takes
+over. Every DSV41MoE asks the shared load guard at the top of its load whether
+its block may land on the offered device; any other change of device raises
+RuntimeError there, before anything of this module is loaded or handed to the
+CPU worker.
 
 Only DeepseekV41Model builds this class, and outside its load the guard
 accepts every device.

@@ -5,7 +5,8 @@ cleared before torch loads, and the run fails if a CUDA context appears anyway.
 
 1. Cache for the real V4.1 graph (built lazily from the checkpoint config, nothing loaded):
    exactly the four kv-source pools, their byte sizes at 1M tokens, 40 V4.1 layer states,
-   the rate-2 carry rings.
+   the rate-2 carry rings; then the pool route of an explicit placement's split at 12 adds
+   exactly one replica pool.
 2. emission_range / rope_positions / entry_rows vs brute force of the (p + 1) % m == 0 rule
    through random block tables; emission_range, the range the cached forward stores, against
    the range DeepSeek's reference Compressor writes (its model.py) and the range exllamav3's
@@ -25,13 +26,14 @@ cleared before torch loads, and the run fails if a CUDA context appears anyway.
 6. ring_update vs a naive full history over random chunk sequences with shifts, rebases and
    rewinds bounded by DSV41State.rollback_capacity; V4's looser bound must fail.
 7. DSV41LayerState stash/unstash round trip, and the check that a layer's pool is on its
-   device (the error names the free cuts).
+   device (the error names the free cuts and the explicit placement's split).
 8. Checkpoint bytes on the real graph: a DSV41State checkpoint declares exactly the bytes it
    stashes (the generator budgets host RAM by that figure), the SWA ring keeps only its
    position - window_beg history rows, and a trimmed checkpoint restores into another slot.
-9. The int32 pool limit: a source pool at the largest addressable max_num_tokens builds, one
-   page more is refused, for fp16 pools and for quantized (-cq) pools at their packed widths.
-10. DeviceMemo (the stateless path's per-forward moves to another device): a tensor moves once
+9. The int32 pool limit: a source pool (and a replica) at the largest addressable
+   max_num_tokens builds, one page more is refused, for fp16 pools and for quantized (-cq) pools
+   at their packed widths.
+10. DeviceMemo (the per-forward moves to another device): a tensor moves once
    per (key, device) and forward, a republished one is moved again, and the move is the
    engine's to_device.
 
@@ -149,10 +151,37 @@ def test_cache(cfg, model):
     # a consumer owns no pool: it is never asked for a cache layer class
     assert not any(A[i].caps.get("kv_cache") for i in range(cfg.num_hidden_layers)
                    if not cfg.is_kv_source(i))
+    # a route without a replica must not claim a pool it does not have
+    try:
+        A[13].set_pool_route(13)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("consumer 13 routed to itself without a replica")
     cache.detach_from_model()
     model.__dict__.pop("_get_cache_layers", None)
+
+    # replica route (an explicit placement's split at 12): layer 12 owns a replica of source 8;
+    # 13 reads it
+    import exllamav3.cache.dsv41_replica as rep_mod
+    A[12].set_pool_route(12, replica_of = 8)
+    A[13].set_pool_route(12)
+    try:
+        cache2 = Cache(model, max_num_tokens = T, max_batch_size = 1)
+        extra = set(cache2.layers) - keys
+        assert extra == {(12, 0)}, f"extra pools {sorted(extra)}"
+        r = cache2.layers[(12, 0)]
+        assert type(r) is rep_mod.CacheLayer_dsv41_replica, type(r)
+        assert r.storage_size() == 536_870_912, r.storage_size()
+        assert A[13].pool_owner_layer == 12 and not A[13].caps["kv_cache"]
+        assert A[12].caps["kv_cache"] and A[12].replica_of == 8
+        cache2.detach_from_model()
+    finally:
+        model.__dict__.pop("_get_cache_layers", None)
+        A[12].set_pool_route(8)
+        A[13].set_pool_route(8)
     print(f"  OK  cache: 4 source pools {total:,} B at 1M (3 x 671,088,640 + 1,342,177,280), "
-          f"40 DSV41LayerState, carry rings on 2/8/14")
+          f"40 DSV41LayerState, carry rings on 2/8/14; replica (12,0) {r.storage_size():,} B")
 
 
 def check_numerics_vs_packed_pools(cfg, model):
@@ -604,12 +633,14 @@ def test_state_and_guard(cfg, model):
         msg = str(e)
         assert "the compressed-KV pool it reads (layers.2) is on meta, but this layer is on cpu" in msg, msg
         assert "every change of device at layer 1, 2, 8, 14 or 20" in msg and "Loading across GPUs" in msg, msg
+        assert "An explicit placement (EXL3_PLACEMENT / --placement) can instead change device" in msg, msg
     else:
         raise AssertionError("a pool on another device went unreported")
     finally:
         a.device = None
     print(f"  OK  layer state: stash/clear/unstash round trip incl. the carry ring "
-          f"(checkpoint {n_ck:,} B); a pool on another device is refused, naming the free cuts")
+          f"(checkpoint {n_ck:,} B); a pool on another device is refused, naming the free cuts "
+          f"and the explicit placement's split")
 
 
 def test_checkpoint_bytes(cfg, model):
@@ -697,6 +728,7 @@ def test_pool_limit(cfg, model):
     """dsa_attn and the pool scatters address a pool row as row * width in int32: a pool whose
     entries times its widest row (448 fp16 values) reach 2^31 is refused at construction."""
     from exllamav3.cache.dsv41 import CacheLayer_dsv41
+    from exllamav3.cache.dsv41_replica import CacheLayer_dsv41_replica
     A = attn_layers(cfg, model)
     rows = (2 ** 31 - 1) // 448
     lim1 = (rows // 256) * 256                  # rate 1: 256 entries per token page
@@ -704,7 +736,8 @@ def test_pool_limit(cfg, model):
     assert lim1 == 4_793_344 and lim2 == 9_586_944, (lim1, lim2)
     made = 0
     for make, lim in ((lambda n: CacheLayer_dsv41(cfg, A[20], 0, n), lim1),
-                      (lambda n: CacheLayer_dsv41(cfg, A[2], 0, n), lim2)):
+                      (lambda n: CacheLayer_dsv41(cfg, A[2], 0, n), lim2),
+                      (lambda n: CacheLayer_dsv41_replica(cfg, A[12], 0, n), lim2)):
         make(lim)
         try:
             make(lim + 256)
@@ -714,7 +747,7 @@ def test_pool_limit(cfg, model):
         else:
             raise AssertionError("a pool past the int32 row addressing was accepted")
     print(f"  OK  pool limit: max_num_tokens {lim1:,} (rate 1) / {lim2:,} (rate 2) build, one page "
-          f"more is refused naming the limit ({made} source pools)")
+          f"more is refused naming the limit ({made} layer kinds: source pools and a replica)")
 
 
 def test_quantized_pool_limit():

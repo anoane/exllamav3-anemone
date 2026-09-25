@@ -26,8 +26,9 @@ The SWA ring (768 rows, raw roped K=V) is identical to V4's and exists on every 
 sliding and compressed alike: each V4.1 layer keeps its own window.
 
 Also here: check_pool_addressing, which refuses a pool the int32 kernels cannot address, and
-DeviceMemo, which moves the small per-forward selections of the stateless path to a reading
-layer on another device, once per forward.
+DeviceMemo, which moves the small per-forward selections to a reading layer on another device,
+once per forward: in the stateless path, and in the cached path across the split of an explicit
+placement (whose pool replica is cache/dsv41_replica.py).
 """
 
 from __future__ import annotations
@@ -326,11 +327,12 @@ class DSV41State(DSV4State):
 
 class DeviceMemo:
     """
-    Small per-forward tensors that a layer on another device than their producer needs in the
-    stateless path (no Cache, where a layer split may fall anywhere) -- the top-k selection of
-    its index source (2 KiB per row, 4 MiB per 2048-row chunk) and the candidate blocks
-    (8 KiB per row) -- moved once per (key, device) and shared by every reader on that
-    device. The memo lives in params["dsv41_dev_memo"] and is only valid for one forward:
+    Small per-forward tensors that a layer on another device than their producer needs -- the
+    top-k selection of its index source (2 KiB per row, 4 MiB per 2048-row chunk) and the
+    candidate blocks (8 KiB per row) -- moved once per (key, device) and shared by every reader
+    on that device. The stateless path (no Cache, where a change of device may fall anywhere)
+    needs them at any change of device, the cached path only across the split of an explicit
+    placement (architecture/dsv41/placement.py). The memo lives in params["dsv41_dev_memo"] and is only valid for one forward:
     prepare_inputs must reset it together with dsv41_topk and the other per-forward keys.
 
     An entry remembers the tensor it was made from and is remade when a different tensor is

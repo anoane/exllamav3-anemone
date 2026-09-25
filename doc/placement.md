@@ -259,8 +259,8 @@ DeepSeek-V4.1 adds refusals of its own, when the model object is built and at lo
 - The tuning of RAM-held experts (`EXL3_MOE_CPU_THREADS` / `-mct`, `EXL3_MOE_CPU_WSLOT_MB`,
   `EXL3_MOE_CPU_WSLOTS`, `EXL3_MOE_STREAM_*`, `EXL3_MOE_PINNED_ARENA`, `EXL3_MOE_CPU_SWAP`, ...)
   applies unchanged.
-- DeepSeek-V4.1 checks the placement when the model object is built and at load, and restricts
-  where it may change device; see [DeepSeek-V4.1](#deepseek-v41).
+- DeepSeek-V4.1 reads the placement when the model object is built and restricts where it may
+  change device; see [DeepSeek-V4.1](#deepseek-v41).
 
 ## Memory, performance and determinism
 
@@ -280,14 +280,14 @@ computes nothing differently from the older settings that express the same layou
 revision of this code gave per-token log-probabilities of a 64K-token scoring run loaded through
 `0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1` bitwise identical to the same layout set
 up with model-specific expert settings that this code no longer has (its V4.1 expert claims now
-take the generic path); that comparison has not been repeated on this code, which refuses that
-layout for DeepSeek-V4.1 (its change of device at 12 is not a free cut; see
-[DeepSeek-V4.1](#deepseek-v41)). Which GPU runs a layer can change that layer's results, as with
-any split.
+take the generic path); that comparison has not been repeated on this code. Which GPU runs a
+layer can change that layer's results, as with any split.
 
 ## When to use it
 
 - The split must not depend on free memory, e.g. to compare runs.
+- DeepSeek-V4.1 across GPUs with a change of device inside a kv group (its pool replica needs
+  the explicit split, see below).
 - The layers whose experts go to system RAM should not be the first N: next to the GPU with the
   faster host link, away from a GPU that should stay resident, or wherever there is room.
 - Different layers need different expert modes, e.g. GPU-streamed experts on one GPU and
@@ -300,8 +300,8 @@ autosplit does the same with less to write.
 ## DeepSeek-V4.1
 
 DeepSeek-V4.1 applies a placement like every other model (each layer on its device, the routed
-experts of each MoE layer as its rule says), with two differences, because its compressed layers
-share state across layers.
+experts of each MoE layer as its rule says), with three differences, because its compressed
+layers share state across layers.
 
 Background. A V4.1 compressed layer does not keep its own compressed KV: the first layer of each
 kv group (its kv source) owns one paged pool, and every other layer of the group reads it (on
@@ -316,62 +316,126 @@ and covers loading without a placement).
 
 ### When it is read
 
-When the model object is built (`Model.from_config`), and again when `model.load()` starts: a
-placement that breaks the rule below is refused before a Cache can be built for the model, and
-the placement set at load, which may have changed since, is checked again. Set
-`EXL3_PLACEMENT`, `--placement` or `config.infer_params.placement` before `Model.from_config`.
+When the model object is built (`Model.from_config`), not only at load: a split inside a kv group
+needs a pool replica (below), which the Cache allocates when it is created, and a Cache can be
+created before the model loads. Set `EXL3_PLACEMENT`, `--placement` or
+`config.infer_params.placement` before `Model.from_config`; a placement set only afterwards does
+not add a replica (and is refused at load if it needs one, below).
 
 ### Where it may change device
 
-Every change of device between decoder layers must be a free cut. A change anywhere else would
-separate layers from a pool, a top-k selection or candidate blocks that they read on their own
-device, and is refused with a `ValueError`, e.g.
+Every change of device between decoder layers must be a free cut, except at most one, the
+*split*, which may fall anywhere else. At the split:
 
-`DeepSeek-V4.1: the explicit placement '0-11=cuda:0; 12-39=cuda:1' changes device at layer 12, but layers 8-13 share the compressed-KV pool of layers.8. On this model a change of device can only fall where no pool, top-k selection or candidate list is shared across it: at layer 1, 2, 8, 14 or 20 (doc/placement.md, "DeepSeek-V4.1")`
+- the first layer past it owns a replica of its kv group's pool, on its own device, allocated by
+  the Cache like any other pool, and every forward copies the entries the kv source added into
+  the replica;
+- the other layers of the group past the split read that replica;
+- the top-k selections and candidate blocks produced below the split and read past it are copied
+  to the other device once per forward.
+
+No layer that reads across the split reads across another change of device: nothing is shared
+across a free cut. So one split among any number of free cuts, on any number of GPUs, is exact.
 
 Examples on DeepSeek-V4.1-Flash:
 
 | Placement | Changes of device | Result |
 |---|---|---|
-| `0-13=cuda:0; 14-39=cuda:1` | 14 (free) | loads |
-| `0-13=cuda:1; 14-39=cuda:0` | 14 (free), GPUs reversed | loads |
-| `0-7=cuda:0; 8-19=cuda:1; 20-39=cuda:2` | 8 and 20 (free) | loads |
-| `0-7=cuda:0; 8-13=cuda:1; 14-39=cuda:0` | 8 and 14 (free), back to the first GPU | loads |
-| `0-11=cuda:0; 12-39=cuda:1` | 12, inside kv group 8-13 | refused |
-| `*=cuda:0` | none | loads |
+| `0-13=cuda:0; 14-39=cuda:1` | 14 (free) | no replica |
+| `0-7=cuda:0; 8-19=cuda:1; 20-39=cuda:2` | 8 and 20 (free) | no replica |
+| `0-11=cuda:0; 12-39=cuda:1` | 12 (the split) | layer 12 owns a replica of layer 8's pool; layers 12-13 read it |
+| `0-11=cuda:1; 12-39=cuda:0` | 12 (the split), GPUs reversed | the same, on the other GPUs |
+| `0-11=cuda:0; 12-19=cuda:1; 20-39=cuda:2` | 12 (the split) and 20 (free) | replica of 8 on layer 12 |
+| `0-5=cuda:0; 6-11=cuda:1; 12-39=cuda:0` | 6 and 12, both inside a kv group | refused |
+| `*=cuda:0` | none | no replica |
 
-As at any change of device, the hidden state crosses into the first block past it: for V4.1 the
-residual streams, 4 x 5120 FP32 values per token (80 KiB per token, 160 MiB for a 2048-token
-chunk). Nothing else crosses a free cut.
+A placement with more than one change of device outside the free cuts is refused with a
+`ValueError` when the model object is built, e.g.
+
+`DeepSeek-V4.1: the explicit placement '0-5=cuda:0; 6-11=cuda:1; 12-39=cuda:0' changes device in 2 places where a pool, a top-k selection or candidate blocks are shared across the change: at layer 6 (layers 2-7 share the compressed-KV pool of layers.2) and at layer 12 (layers 8-13 share the compressed-KV pool of layers.8). At most one change of device may fall there (the layers past it then read a replica of the pool); every other one must fall at layer 1, 2, 8, 14 or 20 on this model (doc/placement.md, "DeepSeek-V4.1")`
+
+What each split costs on DeepSeek-V4.1-Flash. Replica sizes are for `max_num_tokens` = 1M in
+FP16 and scale linearly with the Cache size; a quantized Cache (`-cq`) shrinks the replica's NoPE
+part as it does the source's.
+
+| Change of device at layer | Replica | Replica size at 1M | Also crosses every forward |
+|---|---|---|---|
+| 1, 2, 8, 14, 20 (a free cut) | none | 0 | nothing |
+| 3 .. 7 | layer k, of source 2 (rate 2, no index keys) | 512 MiB | layer 2's top-k selection |
+| 9 .. 13 | layer k, of source 8 (rate 2, no index keys) | 512 MiB | layer 8's top-k selection |
+| 15 .. 19 | layer k, of source 14 (rate 2, no index keys) | 512 MiB | layer 14's top-k selection |
+| 21 .. 36 | layer k, of source 20 (rate 1, with its index keys, which index sources 24/28/32/36 past the split borrow) | 1.25 GiB | the top-k selection of the last index source below k (nothing when k is itself an index source); layer 20's candidate blocks for the index sources at or past k |
+| 37 .. 39 | layer k, of source 20 (rate 1, no index keys) | 1 GiB | layer 36's top-k selection |
+
+Per forward, the entries a forward adds to the source pool are copied to the replica, 1 KiB per
+entry without index keys and 1.25 KiB with them (1 MiB for a 2048-token prefill chunk at rate 2;
+1 KiB for every second decoded token at rate 2, 1.25 KiB for every decoded token at rate 1, 1 KiB
+for splits 37-39, whose replica has no index keys). A top-k selection crosses once per forward
+per device, 2 KiB per query row, and the candidate blocks 8 KiB per row. As at any change of
+device, the hidden state crosses into the first block past it too: for V4.1 the residual streams,
+4 x 5120 FP32 values per token (80 KiB per token, 160 MiB for a 2048-token chunk), the largest
+item here (`EXL3_DSV41_XDEV_BF16` halves it).
+
+Replica copies go directly between GPUs whose driver reports peer access and that pass
+`EXLLAMA_NO_P2P_COPY`'s check; otherwise (no peer access, `EXLLAMA_NO_P2P_COPY=1`, or a failed
+probe) they go through one page-locked host buffer per device pair, grown as needed up to 8 MiB
+(longer ranges move in pieces) and ordered with CUDA events, so the host never waits for them.
+`EXLLAMA_NO_P2P_COPY=0` does not force a direct replica copy between GPUs without peer access.
+The top-k selections and candidate blocks move with the engine's ordinary device copy
+(`util/device_copy.py`, `to_device`): a driver copy, or, when `EXLLAMA_NO_P2P_COPY` or the probe
+says the pair must go through the host, a blocking copy through pageable host memory.
 
 ### At load
 
-The placement set at load is checked again with the same rule, before anything loads.
+The placement set at load is parsed and checked again, and the pool routes it needs are compared
+with those the model was built with:
+
+- the same routes: the load goes on. Devices, expert storage and free cuts may differ from the
+  placement the model was built with, and a placement that had only free cuts may even be
+  cleared (the routes are then the default ones either way);
+- other routes: a `ValueError` before anything loads, e.g.
+  `DeepSeek-V4.1: the model was built for no pool replica, but config.infer_params.placement is now '0-11=cuda:0; 12-39=cuda:1', which needs a pool replica for a change of device at layer 12. The cross-device pool routes are fixed when the model object is built (the Cache is sized from them): set the placement before Model.from_config, or build a new model to change it`.
+
 Tensor-parallel loading (`-tp`) is refused for V4.1 with or without a placement. The general
 checks of this page (settings the placement replaces, layer coverage, visible and budgeted GPUs)
-apply as for every model, and after the load every compressed layer is checked against the
-device of the pool it reads, as for a load without a placement.
+apply as for every model.
+
+After a load with a placement, one line reports where the modules landed and what crosses
+between the devices, e.g.
+`-- DSV41 placement [0-11=cuda:0; 12-39=cuda:1]: cpu embed | cuda:0 hc_expand,layers.0-11 | cuda:1 layers.12-39,hc_head,norm,head | replicas 12<-8 | top-k cross 8->12-13 | candidates cross none`
+(after a real load each `cuda:N` is followed by the card's name in parentheses). A split at 22
+reports `replicas 22<-20+idxK | top-k cross 20->22-23 | candidates cross 20->24,28,32,36`
+(`+idxK`: the replica carries index keys).
 
 ### Examples
 
 Two cards, the tail 192 of each layer's 384 routed experts in system RAM on the CPU worker (as
-`-mcs 192`, about 95 GiB of RAM), the change of device at the free cut 14:
+`-mcs 192`, about 95 GiB of RAM), the change of device inside kv group 8-13:
 
 ```sh
-python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -gs 40,90 \
-    --placement "0-13=cuda:0 experts=split cpu=192; 14-39=cuda:1 experts=split cpu=192" ...
+python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -gs 62,90 \
+    --placement "0-11=cuda:0 experts=split cpu=192; 12-39=cuda:1 experts=split cpu=192" ...
 ```
 
 ```python
 config = Config.from_directory(model_dir)
-config.infer_params.placement = "0-13=cuda:0 experts=split cpu=192; 14-39=cuda:1 experts=split cpu=192"
-model = Model.from_config(config)                   # the placement is checked here
-cache = Cache(model, max_num_tokens = 262144)
-model.load(use_per_device = [40, 90])
+config.infer_params.placement = "0-11=cuda:0 experts=split cpu=192; 12-39=cuda:1 experts=split cpu=192"
+model = Model.from_config(config)                   # the placement is read here
+cache = Cache(model, max_num_tokens = 262144)       # allocates layer 12's replica of 8 on cuda:1
+model.load(use_per_device = [62, 90])
 ```
 
-Determinism: the placement changes no arithmetic of V4.1's own code. As with any split, which GPU
-runs a layer can change the results of the kernels on that layer.
+The layout of the long-context measurements in this series: the experts of layers 12-22 held in
+system RAM and streamed to the second GPU (computed there), the first GPU keeping all of its
+experts:
 
-See also `EXL3_DSV41_PIPELINE` (pipelined prefill across a change of device) in
-[env_vars.md](env_vars.md).
+```
+0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1
+```
+
+Determinism: the replica is a bitwise copy of the source's entries, and the placement changes no
+arithmetic of V4.1's own code. As with any split, which GPU runs a layer can change the results of
+the kernels on that layer.
+
+See also `EXL3_DSV41_PIPELINE` (pipelined prefill across a change of device) and
+`EXL3_DSV41_XDEV_BF16` (the residual streams' crossing) in [env_vars.md](env_vars.md).

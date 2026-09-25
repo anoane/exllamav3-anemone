@@ -220,7 +220,7 @@ def check_placement_topology(cfg, directory):
     """
     placement.py's Topology reads config.json without the package; it must answer
     every topology query exactly as the config class does, and give the same free
-    cuts and crossings.
+    cuts and crossings, and the same pool routes for every split.
     """
     spec = importlib.util.spec_from_file_location(
         "_placement", os.path.join(_HERE, "exllamav3", "architecture", "dsv41", "placement.py"))
@@ -241,8 +241,11 @@ def check_placement_topology(cfg, directory):
     assert free == P.free_cuts(topo), (free, P.free_cuts(topo))
     for c in range(1, n):
         assert P.crossings(cfg, c) == P.crossings(topo, c), c
+        assert P.compute_routes(cfg, c) == P.compute_routes(topo, c), c
+    assert P.default_routes(cfg) == P.default_routes(topo)
     print(f"  OK  placement topology: config class and header-only Topology agree on all "
-          f"{n} layers; a change of device is free only at {P.format_cuts(free)}")
+          f"{n} layers; a change of device is free only at {P.format_cuts(free)}; every split "
+          f"routes the same through either")
 
 
 if __name__ == "__main__":
