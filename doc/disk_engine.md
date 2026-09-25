@@ -428,9 +428,29 @@ on bare metal or NVMe passthrough. Registered buffers are registered on the poll
 per-read descriptor lookup; registered buffers (the `O_DIRECT` bounce arena, and caller buffers
 registered with `disk_register_buffer`, e.g. RAM-tier arena chunks of up to 1 GiB) make reads into
 them `READ_FIXED`, which skips pinning the pages per read. Registration failures fall back to
-plain reads with a message (a locked-memory limit, `RLIMIT_MEMLOCK`, is the usual cause). A
+plain reads with a message (a locked-memory limit, `RLIMIT_MEMLOCK`, is the usual cause). The
+table holds up to 1,023 caller buffers (index 0 is the bounce arena), kept sorted by address, so
+finding the buffer of a read's destination is a binary search however many are registered (an
+expert RAM tier of 126 GiB registers 126 chunks); a registration beyond the table returns -1 (not
+an error: that memory is read with plain reads). A
 registered buffer stays referenced until `disk_unregister_buffer`, which refuses while reads
 still target it, or until its engine is gone. The `register` sweep measures each setting.
+
+Not every read into a registered buffer is `READ_FIXED`. The kernel describes a fixed read as the
+buffer's page vectors from the destination's page to the buffer's end, and a direct I/O bio keeps
+that count in 16 bits: with 65,537 pages left (or 131,073, 196,609, ...) it reads as a one-page
+bio, which skips the block layer's segment split, and an `O_DIRECT` read of many pages then
+reaches the disk driver with more segments than the driver allocated for. On the test host
+(kernel 6.8.0-139, a virtio-scsi disk) that is a kernel BUG in `scsi_alloc_sgtables`, and the
+machine locks up: it happened once, in an expert-tier run reading into its 1 GiB RAM-tier chunks.
+Kernels of that generation also count a destination inside the buffer's first page, past its
+start, as that page's length in vectors. So the engine uses `READ_FIXED` only when fewer than
+65,536 pages remain from the destination's page to the buffer's end and the destination is not
+inside the first page (unless it is the buffer's start); any other read into a registered buffer
+is a plain `READ` into the same memory, which the kernel maps page by page
+(`exl3_disk::fixed_read_ok`; `disk_stats()["fixed_plain"]` counts them). In a 1 GiB buffer that
+is roughly its first three quarters; since `REGISTER=none` measured within noise, the cost is
+none that the sweeps can see.
 
 ### `EXL3_DISK_URING_ASYNC` (default: `0`)
 
@@ -742,7 +762,7 @@ everything else is one run of 2-60 calls, so treat single-run differences under 
 
 C++ (`disk/disk_engine.h`): `Engine::submit_rows`, `submit_extents`, `gather_rows`,
 `read_extents`, `wait`, `done`, `release`, `cancel`, `promote`, `arm_hold`, `stats`,
-`extent_geometry`, `register_buffer`, `forget`, `forget_path`; `auto_backend()`,
+`extent_geometry`, `register_buffer`, `find_registered`, `forget`, `forget_path`; `auto_backend()`,
 `auto_ngram_engine()`, `auto_keepalive_ms()`, `ngram_engine_from_env()`. Python (`exllamav3_ext`): `disk_gather_rows`,
 `disk_read_extents`, `disk_extent_geometry`, `DiskTicket`, `disk_arm_hold`, `disk_stats`,
 `disk_engine_info`, `disk_engine_configure`, `disk_engine_forget`, `disk_set_thread_class`,

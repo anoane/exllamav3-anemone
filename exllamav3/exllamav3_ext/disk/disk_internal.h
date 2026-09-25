@@ -49,7 +49,8 @@ constexpr uint32_t kSpanOpMax = 65536;  // pool: ops up to this size are taken i
 constexpr int kSpanMax = 256;           // pool: ops per span
 constexpr int64_t kMaxOpBytes = 1ll << 30;
 constexpr int kMaxTables = 64;
-constexpr int kMaxUserBuffers = 64;     // io_uring buffer table (index 0 = bounce arena)
+constexpr int kMaxUserBuffers = 1024;   // io_uring buffer table (index 0 = bounce arena); a
+                                        // RAM tier registers one entry per 1 GiB chunk
 // Largest file offset a read may end at: every rounding the engine does (O_DIRECT alignment,
 // slot geometry) adds less than 64 KiB, so nothing past this can overflow int64_t
 constexpr int64_t kMaxFileEnd = INT64_MAX - (1ll << 20);
@@ -260,6 +261,7 @@ struct Core
     std::condition_variable cv_drained;
     Counters cc[kClasses];
     uint64_t inline_reaped = 0, reaper_reaped = 0, resubmits = 0, stray_cqes = 0;
+    uint64_t fixed_plain = 0;          // Core::mx: see Stats::fixed_plain
     std::atomic<uint64_t> enters { 0 };        // io_uring_enter calls that submitted (no lock)
     std::vector<TraceRec> trace;
     size_t trace_pos = 0;

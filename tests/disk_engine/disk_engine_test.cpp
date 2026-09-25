@@ -1087,11 +1087,16 @@ void test_registered(const Overrides& base, File& big, const char* what)
         return;
     }
     std::mt19937_64 rng(g_seed + 3);
-    for (int i = 0; i < 8; ++i)
+    // 8 reads into random slots, then 4 into the second and third: those (destinations past the
+    // buffer's first page, far fewer than 65,536 pages before its end) are all READ_FIXED, only a
+    // resumed short read could make one plain. (A buffered read into the first slot starts at its
+    // payload offset, inside the buffer's first page: a plain read by the READ_FIXED rule.)
+    for (int i = 0; i < 12; ++i)
     {
         int64_t len = 1 + (int64_t) (rng() % (6 << 20));
         int64_t off = (int64_t) (rng() % (uint64_t) (big.size - len));
-        size_t slot_off = (size_t) (rng() % 3) * (8 << 20);
+        size_t slot_off = (i < 8 ? (size_t) (rng() % 3) : (size_t) (1 + i % 2)) * (size_t) (8 << 20);
+        if (i == 8) (void) e.stats(true);
         ExtentReq x { big.fd, off, len, region.p + slot_off, 8 << 20 };
         int64_t pay = 0;
         Options o;
@@ -1106,6 +1111,11 @@ void test_registered(const Overrides& base, File& big, const char* what)
         ref_read(big.fd, off, len, ref.data());
         CHECK(std::memcmp(ref.data(), region.p + slot_off + pay, (size_t) len) == 0,
               "%s: READ_FIXED data", what);
+    }
+    {
+        Stats st = e.stats(false);
+        CHECK(st.fixed_plain <= st.resubmits, "%s: %llu plain reads past the first page of a small registered "
+              "buffer", what, (unsigned long long) st.fixed_plain);
     }
     // rows whose whole output lies in the registered region
     {
@@ -1128,6 +1138,149 @@ void test_registered(const Overrides& base, File& big, const char* what)
     CHECK(region.guards_ok(), "%s: registered region guards", what);
     e.unregister_buffer(idx);
     CHECK(expect_error([&] { e.unregister_buffer(idx); }) == EINVAL, "%s: double unregister", what);
+}
+
+// Many registered buffers (a RAM tier registers one per 1 GiB chunk): the table takes 1023
+// caller buffers, the lookup by address finds exactly the buffer that holds a destination range,
+// reads into every buffer are byte-exact, and unregistering some leaves the others intact
+void test_registered_many(const Overrides& base, File& big, const char* what)
+{
+    Engine e(cfg_of(base));
+    const int nbig = g_quick ? 96 : 300;
+    const size_t bytes = 1 << 20;
+    std::vector<std::unique_ptr<Guarded>> bufs;
+    std::vector<int> idx;
+    for (int i = 0; i < nbig; ++i)
+    {
+        bufs.emplace_back(new Guarded(bytes));
+        idx.push_back(e.register_buffer(bufs.back()->p, bytes));
+        if (idx.back() < 0)
+        {
+            CHECK(i == 0, "%s: registration %d refused after %d succeeded", what, i, i);
+            std::printf("   (%s: no registered buffers in this backend)\n", what);
+            return;
+        }
+    }
+    {
+        std::vector<int> sorted = idx;
+        std::sort(sorted.begin(), sorted.end());
+        CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end(), "%s: an index given twice", what);
+        CHECK(sorted.front() >= 1 && sorted.back() <= 1023, "%s: index out of 1..1023", what);
+    }
+    // the lookup: whole buffer, first and last byte, a range crossing the end, one past the end,
+    // the guard pages between buffers, and memory never registered
+    for (int i = 0; i < nbig; ++i)
+    {
+        const uint8_t* p = bufs[(size_t) i]->p;
+        CHECK(e.find_registered(p, bytes) == idx[(size_t) i], "%s: buffer %d whole", what, i);
+        CHECK(e.find_registered(p, 1) == idx[(size_t) i], "%s: buffer %d first byte", what, i);
+        CHECK(e.find_registered(p + bytes - 1, 1) == idx[(size_t) i], "%s: buffer %d last byte", what, i);
+        CHECK(e.find_registered(p + bytes - 16, 32) == -1, "%s: buffer %d range crossing its end", what, i);
+        CHECK(e.find_registered(p + bytes, 1) == -1, "%s: buffer %d one past the end", what, i);
+        CHECK(e.find_registered(p - 1, 1) == -1, "%s: buffer %d byte before it", what, i);
+        CHECK(e.find_registered(p - 1, 2) == -1, "%s: buffer %d range crossing its start", what, i);
+    }
+    {
+        Guarded stray(bytes);
+        CHECK(e.find_registered(stray.p, 64) == -1, "%s: unregistered memory found", what);
+    }
+    std::mt19937_64 rng(g_seed + 11);
+    auto read_into = [&](int i, const char* when)
+    {
+        int64_t len = (int64_t) (bytes / 2) + (int64_t) (rng() % (bytes / 4));
+        int64_t off = (int64_t) (rng() % (uint64_t) (big.size - len));
+        ExtentReq x { big.fd, off, len, bufs[(size_t) i]->p, (int64_t) bytes };
+        int64_t pay = 0;
+        Options o;
+        o.cls = kExpert;
+        CHECK(e.read_extents(&x, 1, o, &pay) == 0, "%s: read into buffer %d (%s)", what, i, when);
+        std::vector<uint8_t> ref((size_t) len);
+        ref_read(big.fd, off, len, ref.data());
+        CHECK(std::memcmp(ref.data(), bufs[(size_t) i]->p + pay, (size_t) len) == 0,
+              "%s: buffer %d data (%s)", what, i, when);
+    };
+    for (int i = 0; i < nbig; ++i) read_into(i, "all registered");
+    // unregister every third: their lookups fail, reads into them fall back to plain reads
+    for (int i = 0; i < nbig; i += 3)
+    {
+        e.unregister_buffer(idx[(size_t) i]);
+        CHECK(e.find_registered(bufs[(size_t) i]->p, bytes) == -1, "%s: unregistered buffer %d found", what, i);
+    }
+    for (int i = 0; i < nbig; ++i)
+    {
+        int want = i % 3 == 0 ? -1 : idx[(size_t) i];
+        CHECK(e.find_registered(bufs[(size_t) i]->p + 4096, 4096) == want, "%s: buffer %d after unregistering", what, i);
+        read_into(i, "every third unregistered");
+    }
+    // fill the table: 1023 caller buffers in all, then -1
+    std::vector<std::unique_ptr<Guarded>> small;
+    std::vector<int> sidx;
+    int live = nbig - (nbig + 2) / 3;
+    for (;;)
+    {
+        small.emplace_back(new Guarded(4096));
+        int k = e.register_buffer(small.back()->p, 4096);
+        if (k < 0) break;
+        sidx.push_back(k);
+    }
+    CHECK(live + (int) sidx.size() == 1023, "%s: table held %d caller buffers, not 1023", what,
+          live + (int) sidx.size());
+    for (size_t j = 0; j < sidx.size(); ++j)
+        CHECK(e.find_registered(small[j]->p, 4096) == sidx[j], "%s: small buffer %zu", what, j);
+    for (int k : sidx) e.unregister_buffer(k);
+    // the same memory twice (overlapping entries): the lowest index that holds a range wins
+    int a = e.register_buffer(bufs[1]->p, bytes);
+    int b = e.register_buffer(bufs[1]->p + 4096, 8192);
+    CHECK(a >= 0 && b >= 0, "%s: overlapping registrations", what);
+    int lo = std::min({ a, b, idx[1] });
+    CHECK(e.find_registered(bufs[1]->p + 4096, 4096) == lo, "%s: overlap lookup", what);
+    CHECK(e.find_registered(bufs[1]->p, 4096) == std::min(a, idx[1]), "%s: overlap lookup outside the small one", what);
+    read_into(1, "overlapping registrations");
+    e.unregister_buffer(a);
+    e.unregister_buffer(b);
+    CHECK(e.find_registered(bufs[1]->p + 4096, 4096) == idx[1], "%s: lookup after the overlap is gone", what);
+    for (int i = 0; i < nbig; ++i)
+        if (i % 3) e.unregister_buffer(idx[(size_t) i]);
+    for (auto& g : bufs) CHECK(g->guards_ok(), "%s: guards", what);
+}
+
+// The READ_FIXED rule (fixed_read_ok): which destinations of a registered buffer the kernel
+// describes correctly. Arithmetic only: a read the rule wrongly allowed could take the host down
+void test_fixed_rule()
+{
+    const size_t pg = 4096;
+    const uintptr_t B = (uintptr_t) 1 << 40;
+    auto ok = [&](uintptr_t base, size_t n, uintptr_t dst) { return fixed_read_ok(base, n, dst, pg); };
+    const size_t gib = (size_t) 1 << 30, pages = gib / pg;          // 262,144 pages
+    CHECK(!ok(B, gib, B), "fixed rule: 1 GiB buffer, its start (262,144 pages left)");
+    CHECK(ok(B, gib, B + (pages - 65535) * pg), "fixed rule: 65,535 pages left");
+    CHECK(ok(B, gib, B + (pages - 65535) * pg + 100), "fixed rule: 65,535 pages left, mid-page");
+    CHECK(!ok(B, gib, B + (pages - 65536) * pg), "fixed rule: 65,536 pages left");
+    CHECK(!ok(B, gib, B + (pages - 65537) * pg), "fixed rule: 65,537 pages left (a one-page bio)");
+    CHECK(!ok(B, gib, B + (pages - 131073) * pg), "fixed rule: 131,073 pages left");
+    CHECK(ok(B, gib, B + gib - 1), "fixed rule: the last byte");
+    CHECK(ok(B, gib, B + gib), "fixed rule: the end");
+    CHECK(!ok(B, gib, B + gib + 1), "fixed rule: past the end");
+    CHECK(!ok(B, gib, B - 1), "fixed rule: before the start");
+    // the RAM tier's chunk of 80 slots of 13,320,192 bytes (260,160 pages): the three pages from
+    // which the kernel would see a one-page bio
+    const size_t chunk = (size_t) 80 * 13320192, cp = chunk / pg;
+    for (size_t left : { (size_t) 65537, (size_t) 131073, (size_t) 196609 })
+        CHECK(!ok(B, chunk, B + (cp - left) * pg), "fixed rule: tier chunk, %zu pages left", left);
+    CHECK(ok(B, chunk, B + (cp - 3252) * pg), "fixed rule: tier chunk, its last slot");
+    // below 65,536 pages: every page-aligned destination, and the start
+    const size_t n1 = (size_t) 65535 * pg;
+    CHECK(ok(B, n1, B), "fixed rule: 65,535-page buffer, start");
+    CHECK(ok(B, n1, B + pg), "fixed rule: 65,535-page buffer, second page");
+    CHECK(!ok(B, n1, B + 512), "fixed rule: inside the first page, past the start");
+    CHECK(!ok(B, (size_t) 65536 * pg, B), "fixed rule: 65,536-page buffer, start");
+    CHECK(ok(B, (size_t) 65536 * pg, B + pg), "fixed rule: 65,536-page buffer, second page");
+    // a buffer that does not start on a page: its first page ends at the next page boundary
+    const uintptr_t u = B + 3000;
+    CHECK(ok(u, 8 << 20, u), "fixed rule: unaligned start");
+    CHECK(!ok(u, 8 << 20, u + 500), "fixed rule: unaligned, inside the first page");
+    CHECK(ok(u, 8 << 20, B + pg), "fixed rule: unaligned, the next page");
+    CHECK(!fixed_read_ok(B, gib, B + pg, 0), "fixed rule: page size 0");
 }
 
 // An engine is refused in a forked child
@@ -1930,6 +2083,7 @@ int main(int argc, char** argv)
     };
 
     run("config", [] { test_config(); });
+    run("fixed-rule", [] { test_fixed_rule(); });
     for (auto& b : backends)
     {
         std::string n = b.name;
@@ -1947,6 +2101,7 @@ int main(int argc, char** argv)
         run(n + "/faults", [&] { test_faults(b.ov, files, big, (n + "/faults").c_str()); });
         run(n + "/shutdown", [&] { test_shutdown(b.ov, big, (n + "/shutdown").c_str()); });
         run(n + "/registered", [&] { test_registered(b.ov, big, (n + "/registered").c_str()); });
+        run(n + "/registered-many", [&] { test_registered_many(b.ov, big, (n + "/registered-many").c_str()); });
         run(n + "/fork", [&] { test_fork(b.ov, big, (n + "/fork").c_str()); });
         run(n + "/fork-busy", [&] { test_fork_busy(b.ov, big, (n + "/fork-busy").c_str()); });
         run(n + "/release-race", [&] { test_release_race(b.ov, big, (n + "/release-race").c_str()); });

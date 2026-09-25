@@ -316,6 +316,10 @@ def test_registered_buffer(ext, data):
     t.release()
     assert np.array_equal(arena[(8 << 20) + 123 : (8 << 20) + 123 + (9 << 20)].numpy(),
                           buf[123 : 123 + (9 << 20)])
+    # a 32 MiB buffer is below the READ_FIXED rule's 65,536 pages: no read of it was made plain
+    # (only a resumed short read could land inside its first page)
+    st = ext.disk_stats()
+    assert st["fixed_plain"] <= st["resubmits"], st
     ext.disk_unregister_buffer(idx)
     with pytest.raises(RuntimeError):
         ext.disk_unregister_buffer(idx)
@@ -488,6 +492,39 @@ def test_sync_calls_use_the_synchronous_path(ext, data):
                             "the submission returned"
     finally:
         os.sched_setaffinity(0, own_cpus)
+        ext.disk_engine_shutdown()
+
+
+def test_registered_buffer_table(ext, data):
+    """The io_uring buffer table takes 1023 caller buffers (index 0 is the engine's bounce arena):
+    a RAM tier registers one per 1 GiB chunk. Reads into the first, a middle and the last one
+    are exact; the 1024th registration returns -1."""
+    path, fd, buf = data
+    ext.disk_engine_configure({"backend": "io_uring"})
+    try:
+        arenas, idx = [], []
+        for i in range(1023):
+            arenas.append(aligned_u8(256 << 10))
+            k = ext.disk_register_buffer(arenas[-1])
+            if k < 0 and i == 0:
+                pytest.skip("registered buffers unavailable")
+            assert k >= 0, f"registration {i} refused"
+            idx.append(k)
+        assert sorted(idx) == list(range(1, 1024))
+        extra = aligned_u8(256 << 10)
+        assert ext.disk_register_buffer(extra) == -1
+        for i in (0, 511, 1022):
+            off = 4096 * i + 7
+            po = torch.zeros(1, dtype = torch.long)
+            ext.disk_read_extents(torch.tensor([fd]), torch.tensor([off]), torch.tensor([200 << 10]),
+                                  arenas[i], torch.tensor([0]), 256 << 10, payload_offsets = po, wait = True)
+            pay = int(po[0])
+            assert np.array_equal(arenas[i][pay : pay + (200 << 10)].numpy(), buf[off : off + (200 << 10)])
+        for k in idx:
+            ext.disk_unregister_buffer(k)
+        assert ext.disk_register_buffer(extra) == 1
+        ext.disk_unregister_buffer(1)
+    finally:
         ext.disk_engine_shutdown()
 
 

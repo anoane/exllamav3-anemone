@@ -514,6 +514,7 @@ public:
         ubuf_[idx].refs = 0;
         ubuf_[idx].state = 2;
         ++nreg_;
+        index_add(idx);
         return idx;
 #else
         (void) p;
@@ -536,6 +537,7 @@ public:
                                    " is still the target of unfinished reads");
             ubuf_[idx].state = 1;       // find_buffer no longer returns it
             --nreg_;
+            index_remove(idx);
         }
         (void) update_buffer(main_, idx, nullptr, 0, nullptr);
         if (poll_.buf_table) (void) update_buffer(poll_, idx, nullptr, 0, nullptr);
@@ -548,16 +550,26 @@ public:
 
     int user_buffers() const override { return nreg_; }
 
+    // The registered buffer that holds [p, p + n) whole, or -1. Registered buffers are kept
+    // sorted by address, so this is a binary search (a RAM tier registers one buffer per 1 GiB
+    // chunk, over a hundred of them, and every destination range of every ticket is looked up).
+    // Buffers that overlap each other (the same memory registered twice) fall back to the scan
+    // in index order, which returns the lowest index that holds the range
     int find_buffer(const uint8_t* p, size_t n) override
     {
+        if (nreg_ == 0) return -1;
         uintptr_t a = reinterpret_cast<uintptr_t>(p);
-        for (int i = 1; i < kMaxUserBuffers; ++i)
+        if (overlap_)
         {
-            const UBuf& b = ubuf_[i];
-            uintptr_t base = reinterpret_cast<uintptr_t>(b.p);
-            if (b.state == 2 && a >= base && a - base <= b.n && n <= b.n - (a - base)) return i;
+            for (int i = 1; i < kMaxUserBuffers; ++i)
+                if (ubuf_[i].state == 2 && holds(ubuf_[i], a, n)) return i;
+            return -1;
         }
-        return -1;
+        auto it = std::upper_bound(sorted_.begin(), sorted_.end(), a,
+                                   [](uintptr_t x, const std::pair<uintptr_t, int>& e) { return x < e.first; });
+        if (it == sorted_.begin()) return -1;
+        --it;
+        return holds(ubuf_[it->second], a, n) ? it->second : -1;
     }
 
     void buffer_ref(int idx, int d) override
@@ -593,6 +605,41 @@ private:
         int64_t refs = 0;
         int state = 0;          // 0 free, 1 changing, 2 registered
     };
+
+    static bool holds(const UBuf& b, uintptr_t a, size_t n)
+    {
+        uintptr_t base = reinterpret_cast<uintptr_t>(b.p);
+        return a >= base && a - base <= b.n && n <= b.n - (a - base);
+    }
+
+    // Core::mx held: keep sorted_ (registered buffers by address) and overlap_ current
+    void index_add(int idx)
+    {
+        std::pair<uintptr_t, int> e(reinterpret_cast<uintptr_t>(ubuf_[idx].p), idx);
+        sorted_.insert(std::lower_bound(sorted_.begin(), sorted_.end(), e), e);
+        index_check();
+    }
+
+    void index_remove(int idx)
+    {
+        for (auto it = sorted_.begin(); it != sorted_.end(); ++it)
+            if (it->second == idx)
+            {
+                sorted_.erase(it);
+                break;
+            }
+        index_check();
+    }
+
+    void index_check()
+    {
+        overlap_ = false;
+        for (size_t i = 1; i < sorted_.size(); ++i)
+        {
+            const UBuf& prev = ubuf_[sorted_[i - 1].second];
+            if (reinterpret_cast<uintptr_t>(prev.p) + prev.n > sorted_[i].first) overlap_ = true;
+        }
+    }
 
     void note(const std::string& s)
     {
@@ -733,8 +780,16 @@ private:
         }
         else if (!op.bounce && op.buf_index >= 0 && r.buf_table)
         {
-            sqe->opcode = IORING_OP_READ_FIXED;
-            sqe->buf_index = (uint16_t) op.buf_index;
+            // never a READ_FIXED the kernel would mis-describe (fixed_read_ok, disk_engine.h);
+            // then a plain READ into the same memory
+            const UBuf& b = ubuf_[op.buf_index];
+            if (fixed_read_ok(reinterpret_cast<uintptr_t>(b.p), b.n,
+                              reinterpret_cast<uintptr_t>(op.dst + op.got), page_))
+            {
+                sqe->opcode = IORING_OP_READ_FIXED;
+                sqe->buf_index = (uint16_t) op.buf_index;
+            }
+            else ++c_.fixed_plain;
         }
         if (&r == &main_ && op.fixed >= 0)
         {
@@ -1193,11 +1248,14 @@ private:
     std::vector<uint32_t> resub_;               // Core::mx: slots whose op must be (re)submitted
     uint8_t* bounce_ = nullptr;
     size_t bounce_total_ = 0;
+    const size_t page_ = (size_t) sysconf(_SC_PAGESIZE);
     bool buf_warned_ = false;                   // Core::mx
     bool files_reg_ = false;
     std::vector<int> fixed_free_;               // fixed_mx_
     UBuf ubuf_[kMaxUserBuffers];                // Core::mx
     int nreg_ = 0;                              // Core::mx: registered caller buffers
+    std::vector<std::pair<uintptr_t, int>> sorted_;   // Core::mx: (address, index), registered only
+    bool overlap_ = false;                      // Core::mx: two registered buffers overlap
     cpu_set_t aff_set_;                         // EXL3_DISK_AFFINITY (init only)
     uint64_t aff_token_ = 0;                    // 0: no affinity
     std::atomic<bool> aff_warned_ { false };

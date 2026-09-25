@@ -1609,7 +1609,12 @@ reason, for any other device (virtio and SCSI disks included).
 ### `EXL3_DISK_REGISTER` (default: `auto`)
 
 `io_uring` only: `none`, `files`, `buffers` or `all` (`auto` = `all`): fixed files and registered
-buffers (`READ_FIXED`).
+buffers (`READ_FIXED`). The buffer table takes up to 1,023 caller buffers of at most 1 GiB each
+(the RAM tier of an expert cache registers one per chunk); a registration beyond that returns -1
+and reads into that memory stay plain reads. So do reads that the kernel would describe wrongly
+as fixed reads: a destination with 65,536 or more pages to its buffer's end (an `O_DIRECT` read
+there can hit a kernel BUG on 6.8), or inside the buffer's first page past its start (see
+[disk_engine.md](disk_engine.md), `EXL3_DISK_REGISTER`).
 
 ### `EXL3_DISK_URING_ASYNC` (default: `0`)
 

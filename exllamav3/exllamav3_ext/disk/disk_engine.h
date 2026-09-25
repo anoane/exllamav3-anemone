@@ -173,6 +173,8 @@ struct Stats
     uint64_t reaper_reaped = 0;         // ... by the reaper / poller threads
     uint64_t enters = 0;                // io_uring_enter calls that submitted
     uint64_t resubmits = 0;             // short reads, EAGAIN, EINTR resumed
+    uint64_t fixed_plain = 0;           // reads into a registered buffer issued as plain READ
+                                        // (fixed_read_ok)
     uint64_t stray_cqes = 0;            // completions with an unknown tag (must stay 0)
     uint64_t keepalive_reads = 0;       // EXL3_DISK_KEEPALIVE_MS reads
     int64_t inflight_now = 0;
@@ -200,6 +202,28 @@ struct TicketTimes
 };
 
 using TicketId = uint64_t;
+
+// Whether an io_uring READ_FIXED whose destination starts at dst, inside the registered buffer
+// [base, base + n), is one the kernel describes correctly; page is the host's page size. The
+// kernel hands the read to the block layer as the buffer's page vectors from dst's page to the
+// buffer's end, and a direct I/O bio keeps that count in 16 bits (bio::bi_vcnt): 65,537 pages
+// left (or 131,073, 196,609, ...) reads as a one-page bio, which skips the segment split, so an
+// O_DIRECT read of many pages reaches the disk driver with more segments than it allocated for
+// (a kernel BUG in scsi_alloc_sgtables on the test host: 6.8.0-139, virtio-scsi, a 1 GiB RAM-tier
+// chunk). Kernels of that generation also count a destination inside the buffer's first page,
+// past its start, as that page's length in vectors. So READ_FIXED needs fewer than 65,536 pages
+// from dst's page to the end and a destination outside the first page (or at the buffer's
+// start); every other read into a registered buffer is a plain READ, which the kernel maps page
+// by page (Stats::fixed_plain counts them)
+inline bool fixed_read_ok(uintptr_t base, size_t n, uintptr_t dst, size_t page)
+{
+    if (page == 0 || dst < base || dst - base > n) return false;
+    uintptr_t first_end = base - base % page + page;
+    if (dst > base && dst < first_end) return false;
+    uintptr_t from = dst - dst % page;
+    uintptr_t end = base + n;
+    return (end - from + page - 1) / page < 65536;
+}
 
 namespace detail { struct Core; }
 
@@ -249,9 +273,13 @@ public:
                      int64_t* t_submitted = nullptr);
 
     // io_uring registered buffers for extent slots (READ_FIXED). Returns an index, or -1 when
-    // the backend has no registration (not an error)
+    // the backend has no registration or its table is full (1023 caller buffers; not an error)
     int register_buffer(void* p, size_t n);
     void unregister_buffer(int idx);
+    // The registered buffer a destination range [p, p + n) would be read into with READ_FIXED
+    // (when fixed_read_ok allows it, below), or -1 (none holds it whole, or the backend
+    // registers none)
+    int find_registered(const void* p, size_t n);
 
     // Close the engine's own descriptors of a file (the caller's descriptor, or a path), so an
     // unloaded or deleted model file no longer stays open. Returns 1 when they were closed, 0

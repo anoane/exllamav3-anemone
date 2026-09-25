@@ -1935,6 +1935,15 @@ void Engine::unregister_buffer(int idx)
     c.ex->unregister_buffer(idx);
 }
 
+int Engine::find_registered(const void* p, size_t n)
+{
+    Core& c = *core_;
+    check_usable(c);
+    std::lock_guard<std::mutex> lk(c.mx);
+    if (c.ex->user_buffers() == 0) return -1;
+    return c.ex->find_buffer(static_cast<const uint8_t*>(p), n);
+}
+
 int Engine::forget(int fd)
 {
     Core& c = *core_;
@@ -1988,6 +1997,7 @@ Stats Engine::stats(bool reset)
     s.reaper_reaped = c.reaper_reaped;
     s.enters = c.enters.load();
     s.resubmits = c.resubmits;
+    s.fixed_plain = c.fixed_plain;
     s.stray_cqes = c.stray_cqes;
     s.inflight_now = c.inflight_total;
     s.queued_ops_now = c.queued_ops;
@@ -1995,7 +2005,7 @@ Stats Engine::stats(bool reset)
     s.keepalive_reads = c.keepalive_reads.load();
     if (reset)
     {
-        c.inline_reaped = c.reaper_reaped = c.resubmits = 0;
+        c.inline_reaped = c.reaper_reaped = c.resubmits = c.fixed_plain = 0;
         c.enters.store(0);
         c.keepalive_reads.store(0);
     }
@@ -2182,6 +2192,7 @@ int Engine::read_extents(const ExtentReq*, int64_t, const Options&, int64_t*, in
 { unsupported(); }
 int Engine::register_buffer(void*, size_t) { unsupported(); }
 void Engine::unregister_buffer(int) { unsupported(); }
+int Engine::find_registered(const void*, size_t) { unsupported(); }
 int Engine::forget(int) { return 0; }
 int Engine::forget_path(const std::string&) { return 0; }
 Stats Engine::stats(bool) { unsupported(); }

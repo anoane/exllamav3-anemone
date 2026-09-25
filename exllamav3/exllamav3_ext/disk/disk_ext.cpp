@@ -472,6 +472,7 @@ py::dict disk_stats(bool reset)
     d["reaper_reaped"] = s.reaper_reaped;
     d["enters"] = s.enters;
     d["resubmits"] = s.resubmits;
+    d["fixed_plain"] = s.fixed_plain;
     d["stray_cqes"] = s.stray_cqes;
     d["keepalive_reads"] = s.keepalive_reads;
     d["inflight_now"] = s.inflight_now;
