@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <map>
 #include <cmath>
+#include "../silu_ref.h"
 
 #include "../util.h"
 #include "../util.cuh"
@@ -17,19 +18,38 @@
 #define EXL3_MOE_COOP_DEFINE_ROT
 #include "exl3_moe_coop_kernel.cuh"
 
-static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide)
+// silu_ref: the A kernels of DeepSeek's reference swiglu (MOE_COOP_ACT_SILU_REF), instances of
+// their own (exl3_moe_coop_instances.cuh)
+static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide, bool silu_ref)
 {
     const BitsK bk = bits_from_K(K_);
     const int K = bk.bits;
     if (bk.half)
     {
         TORCH_CHECK(cb == 2, "exl3_moe_coop: half-integer bitrates require the mul1 codebook");
+        if (silu_ref) switch (K)
+        {
+            case 1: return exl3_moe_coop_kernel_a_sr_h1(Hi, wide);
+            case 2: return exl3_moe_coop_kernel_a_sr_h2(Hi, wide);
+            default: return exl3_moe_coop_kernel_a_sr_h3(Hi, wide);
+        }
         switch (K)
         {
             case 1: return exl3_moe_coop_kernel_a_h1(Hi, wide);
             case 2: return exl3_moe_coop_kernel_a_h2(Hi, wide);
             default: return exl3_moe_coop_kernel_a_h3(Hi, wide);
         }
+    }
+    if (silu_ref) switch (K)
+    {
+        case 1: return exl3_moe_coop_kernel_a_sr_k1(cb, Hi, wide);
+        case 2: return exl3_moe_coop_kernel_a_sr_k2(cb, Hi, wide);
+        case 3: return exl3_moe_coop_kernel_a_sr_k3(cb, Hi, wide);
+        case 4: return exl3_moe_coop_kernel_a_sr_k4(cb, Hi, wide);
+        case 5: return exl3_moe_coop_kernel_a_sr_k5(cb, Hi, wide);
+        case 6: return exl3_moe_coop_kernel_a_sr_k6(cb, Hi, wide);
+        case 7: return exl3_moe_coop_kernel_a_sr_k7(cb, Hi, wide);
+        default: return exl3_moe_coop_kernel_a_sr_k8(cb, Hi, wide);
     }
     switch (K)
     {
@@ -126,7 +146,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a, p.act == MOE_COOP_ACT_SILU_REF);
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
@@ -184,7 +204,9 @@ MoeCoopParams exl3_moe_coop_prepare
     TORCH_CHECK(!(mcg && mul1), "exl3_moe_coop: specified both mcg and mul1");
     TORCH_CHECK(Kg >= 1 && Kg <= 8 && Ku >= 1 && Ku <= 8 && Kd >= 1 && Kd <= 8, "exl3_moe_coop: K out of range");
     TORCH_CHECK(!gated || Kg == Ku, "exl3_moe_coop: gate and up must share a bit width");
-    TORCH_CHECK(act >= 0 && act <= 3, "exl3_moe_coop: unknown activation");
+    TORCH_CHECK((act >= 0 && act <= 3) || act == MOE_COOP_ACT_SILU_REF, "exl3_moe_coop: unknown activation");
+    TORCH_CHECK(act != MOE_COOP_ACT_SILU_REF || (gated && silu_ref_valid_limit(act_limit)),
+                "exl3_moe_coop: silu_ref requires gated experts and a finite, nonnegative limit");
 
     MoeCoopParams p = {};
     p.Hi = Hi;

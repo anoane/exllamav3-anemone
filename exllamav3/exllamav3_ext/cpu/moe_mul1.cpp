@@ -1,5 +1,6 @@
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "moe_mul1.h"
+#include "../silu_ref.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
 
@@ -2153,6 +2154,23 @@ void forward_phase(void* vctx, int worker, int num_workers)
                         }
                         break;
                     }
+                    case 5: {
+                        // DeepSeek's reference swiglu (silu_ref.cuh): raw gate clamped
+                        // from above and up symmetrically, silu(gate) * up in FP32, the
+                        // product rounded to FP16 as on the GPU paths
+                        for (size_t i = 0; i < count; ++i) {
+                            float gv = g[i], uv = u[i];
+                            if (L.act_limit > 0.0f) {
+                                if (gv > L.act_limit) gv = L.act_limit;
+                                if (uv > L.act_limit) uv = L.act_limit;
+                                if (uv < -L.act_limit) uv = -L.act_limit;
+                            }
+                            const float sigmoid = 1.0f / (1.0f + std::exp(-gv));
+                            const float activated = gv * sigmoid;
+                            g[i] = half_to_float(at::Half(activated * uv));
+                        }
+                        break;
+                    }
                     default:
                         for (size_t i = 0; i < count; ++i) {
                             const float uv = u[i] > 0.0f ? u[i] : 0.0f;
@@ -2371,12 +2389,15 @@ int64_t exl3_moe_cpu_make_layer
     int64_t swizzled
 )
 {
+    TORCH_CHECK(activation != 5 || silu_ref_valid_cpu_limit(act_limit),
+                "CPU MoE: silu_ref act_limit must be finite, nonnegative and representable in FP32");
     auto* layer = new MoeCpuLayer;
     const bool swz = swizzled != 0;
     const size_t E = up_trellis.size();
     const bool gated = !gate_trellis.empty();
     TORCH_CHECK(down_trellis.size() == E && (!gated || gate_trellis.size() == E), "expert count mismatch");
-    TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
+    TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3 || activation == 5) : activation == 2,
+                "gated experts take silu/gelu/swiglu_oai/silu_ref, gateless take relu2");
     TORCH_CHECK(gate_bias.empty() || gate_bias.size() == E, "gate bias count mismatch");
     TORCH_CHECK(up_bias.empty() || up_bias.size() == E, "up bias count mismatch");
     TORCH_CHECK(down_bias.empty() || down_bias.size() == E, "down bias count mismatch");

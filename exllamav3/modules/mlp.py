@@ -601,6 +601,7 @@ class GatedMLP(Module):
 
         match activation_fn:
             case "silu": self.activation_fn_call = ext.silu_mul
+            case "silu_ref": self.activation_fn_call = ext.silu_ref_mul
             case "relu2": self.activation_fn_call = ext.relu2_mul
             case "gelu": self.activation_fn_call = ext.gelu_mul
 
@@ -693,6 +694,7 @@ class GatedMLP(Module):
                     u0.inner.bc if mgu is None else None,
                     self.downs[0].inner.bc,
                     self.act_limit,
+                    act_silu_ref = self.activation_fn == "silu_ref",
                 )
 
 

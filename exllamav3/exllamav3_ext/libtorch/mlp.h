@@ -2,6 +2,7 @@
 
 #include <ATen/Tensor.h>
 #include <vector>
+#include "../silu_ref.h"
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 
@@ -32,6 +33,7 @@ struct BC_GatedMLP
     bool act_silu;
     bool act_gelu;
     bool act_relu2;
+    bool act_silu_ref;
     std::shared_ptr<BC_LinearEXL3> gate;
     std::shared_ptr<BC_LinearEXL3> up;
     std::shared_ptr<BC_LinearEXL3> down;
@@ -68,7 +70,8 @@ struct BC_GatedMLP
         std::shared_ptr<BC_LinearEXL3> _gate,
         std::shared_ptr<BC_LinearEXL3> _up,
         std::shared_ptr<BC_LinearEXL3> _down,
-        float _act_limit
+        float _act_limit,
+        bool _act_silu_ref = false
     ) :
         guh                 (std::move(_guh)),
         gu                  (std::move(_gu)),
@@ -83,11 +86,14 @@ struct BC_GatedMLP
         act_silu            (_act_silu),
         act_gelu            (_act_gelu),
         act_relu2           (_act_relu2),
+        act_silu_ref        (_act_silu_ref),
         gate                (_gate),
         up                  (_up),
         down                (_down),
         act_limit           (_act_limit)
     {
+        TORCH_CHECK(!act_silu_ref || (!act_silu && !act_gelu && !act_relu2 && silu_ref_valid_limit(act_limit)),
+                    "BC_GatedMLP: silu_ref requires no other activation and a finite, nonnegative limit");
         TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
         guh_cache.resize(MAX_BSZN);
         gu_cache.resize(MAX_BSZN);

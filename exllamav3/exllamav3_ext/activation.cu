@@ -3,11 +3,15 @@
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/MemoryOverlap.h>
 #include "util.h"
 #include "util.cuh"
 #include "compat.cuh"
 #include <cmath>
+#include <cstdint>
 #include "reduction.cuh"
+#include "silu_ref.cuh"
+#include "silu_ref.h"
 
 #define NUM_THREADS 256
 #define NUM_THREADS_P 1024
@@ -16,6 +20,7 @@
 #define ACT_RELU2 2
 #define ACT_SILU_OAI 3
 #define ACT_RELU 4
+#define ACT_SILU_REF 5
 
 #include "activation_kernels.cuh"
 
@@ -174,6 +179,108 @@ void silu_oai_mul
 )
 {
     silu_oai_mul_gr(x, y, z, act_limit, nullptr);
+}
+
+// DeepSeek's reference swiglu: x = min(x, limit), y = clamp(y, -limit, limit) (no clamp when
+// limit is 0), silu(x) * y in fp32, rounded once -> z, in-place if z == x or z == y (see
+// silu_ref.cuh)
+
+void silu_ref_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(silu_ref_valid_limit(act_limit), "silu_ref_mul: act_limit must be finite and nonnegative");
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    // The kernels read and write element pairs (half2 / float2), so the tensors must be packed,
+    // equally long, of even length and start at a pair boundary, as every caller passes them;
+    // anything else is refused rather than dropping the last element or reading past a view.
+    // In place is supported for an exact FP16 alias of x or y
+    TORCH_CHECK(x.is_cuda() && y.device() == x.device() && z.device() == x.device(),
+                "silu_ref_mul: tensors must share one CUDA device");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && z.is_contiguous(),
+                "silu_ref_mul: contiguous tensors required");
+    TORCH_CHECK(y.numel() == x.numel() && z.numel() == x.numel(),
+                "silu_ref_mul: x, y and z must have the same number of elements");
+    TORCH_CHECK(x.numel() % 2 == 0, "silu_ref_mul: an even number of elements required");
+    const uintptr_t pair_bytes = float_input ? 8 : 4;
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % pair_bytes == 0 &&
+                reinterpret_cast<uintptr_t>(y.data_ptr()) % pair_bytes == 0 &&
+                reinterpret_cast<uintptr_t>(z.data_ptr()) % 4 == 0,
+                "silu_ref_mul: tensors must start at an element-pair boundary");
+    at::assert_no_partial_overlap(z, x);
+    at::assert_no_partial_overlap(z, y);
+
+    size_t numel = x.numel();
+    if (numel == 0) return;  // an empty grid is not a valid launch
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_SILU_REF><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_REF>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_REF>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_REF>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_REF>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_SILU_REF><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_REF>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_REF>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_REF>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_REF>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void silu_ref_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+)
+{
+    silu_ref_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // silu(x) * y -> z, in-place if z == x or z == y

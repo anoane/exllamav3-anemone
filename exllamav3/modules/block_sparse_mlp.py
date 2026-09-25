@@ -394,6 +394,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 case "silu":
                     self.activation_fn_call = ext.silu_mul
                     self.activation_fn_idx = 0
+                case "silu_ref":
+                    # DeepSeek's reference swiglu (exllamav3_ext/silu_ref.cuh): raw gate and up
+                    # clamped, SiLU and the product in fp32
+                    self.activation_fn_call = ext.silu_ref_mul
+                    self.activation_fn_idx = 5
                 case "gelu":
                     self.activation_fn_call = ext.gelu_mul
                     self.activation_fn_idx = 1
@@ -504,12 +509,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
-        # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
+        # activations other than silu/silu_ref/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         self.support_quant_paths = (
             self.is_quantized and
-            (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
+            (self.activation_fn in ("silu", "silu_ref", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
         )
@@ -523,7 +528,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return all(has) or not any(has)
         self.support_bc_bszn = (
             self.is_quantized and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
+            (self.activation_fn in ("silu", "silu_ref", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
         )
@@ -728,6 +733,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 down_bias_ptrs,
                 act_relu2 = self.activation_fn == "relu2",
                 sh_coop = self.shared_coop_ok(),
+                act_silu_ref = self.activation_fn == "silu_ref",
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
@@ -1464,7 +1470,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return False
         if len(se.gates) != 1 or len(se.ups) != 1 or len(se.downs) != 1:
             return False
-        if se.activation_fn not in ("silu", "gelu", "relu2"):
+        if se.activation_fn not in ("silu", "silu_ref", "gelu", "relu2"):
             return False
         g, u, d = se.gates[0], se.ups[0], se.downs[0]
         def quantized(l):

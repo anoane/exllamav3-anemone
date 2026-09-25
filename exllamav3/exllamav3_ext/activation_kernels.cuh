@@ -166,6 +166,12 @@ void act_mul_kernel_h
         return;
     }
 
+    if constexpr (activation_type == ACT_SILU_REF)
+    {
+        ((half2*) z)[idx] = silu_ref_h2(x2, y2, act_limit);
+        return;
+    }
+
     if constexpr (activation_type == ACT_SILU)
         x2 = _silu(x2);
     else if constexpr (activation_type == ACT_GELU)
@@ -210,6 +216,13 @@ void act_mul_kernel_f
         half2 r = __float22half2_rn(x2);
         r = clamp_half2_to_finite(r);
         ((half2*) z)[idx] = r;
+        return;
+    }
+
+    if constexpr (activation_type == ACT_SILU_REF)
+    {
+        ((half2*) z)[idx] = __floats2half2_rn(silu_ref_f32(x2.x, y2.x, act_limit),
+                                              silu_ref_f32(x2.y, y2.y, act_limit));
         return;
     }
 

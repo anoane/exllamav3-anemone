@@ -78,7 +78,9 @@ void BC_GatedMLP::run_bszN_gr
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
-    if (act_silu)
+    if (act_silu_ref)
+        silu_ref_mul_gr(g, u, a_n, act_limit, graph);
+    else if (act_silu)
         silu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_gelu)
         gelu_mul_gr(g, u, a_n, act_limit, graph);

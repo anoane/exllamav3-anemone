@@ -61,6 +61,7 @@ struct BC_BlockSparseMLP
     bool act_gelu;
     bool act_silu_oai;
     bool act_relu2;     // non-gated relu2 (NemotronH): no gate projections, act on up alone
+    bool act_silu_ref;  // DeepSeek's reference swiglu (silu_ref.cuh)
     bool gated;         // derived: false when the gates vector is empty
     std::shared_ptr<BC_GatedMLP> shared_experts;
     std::shared_ptr<BC_LinearFP16> shared_gate;
@@ -159,7 +160,8 @@ struct BC_BlockSparseMLP
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
         bool _act_relu2 = false,
-        bool _sh_coop = false
+        bool _sh_coop = false,
+        bool _act_silu_ref = false
     );
 
     void run_bszN

@@ -128,6 +128,17 @@ __device__ __forceinline__ float act_gate(int act, bool gated, float g, float u,
     return x * u;
 }
 
+// Kernel A's activation: act_gate, or in the SILU_REF instances DeepSeek's reference swiglu
+// (silu_ref.cuh, MOE_COOP_ACT_SILU_REF), a template parameter so the other instances compile
+// without it. The reference form rounds its product to FP16 as the other paths of that activation
+// do, although this kernel carries the product on in FP32
+template <bool SILU_REF>
+__device__ __forceinline__ float act_gate_t(int act, bool gated, float g, float u, float limit)
+{
+    if constexpr (SILU_REF) return silu_ref_half_boundary(g, u, limit);
+    else return act_gate(act, gated, g, u, limit);
+}
+
 // 128-element Hadamard across the warp on 4 values per lane, same butterfly as had_*_r_128_inner
 __device__ __forceinline__ void had128(float& v0, float& v1, float& v2, float& v3, int lane)
 {
@@ -673,7 +684,7 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
-template <int bits, int cb, bool WIDE, bool HALF = false>
+template <int bits, int cb, bool WIDE, bool HALF = false, bool SILU_REF = false>
 __global__ __launch_bounds__(THREADS)
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
@@ -791,10 +802,10 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
                 if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
             }
 
-            float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit);
-            float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit);
-            float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit);
-            float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit);
+            float a0 = act_gate_t<SILU_REF>(p.act, p.gated, g0, u0, p.act_limit);
+            float a1 = act_gate_t<SILU_REF>(p.act, p.gated, g1, u1, p.act_limit);
+            float a2 = act_gate_t<SILU_REF>(p.act, p.gated, g2, u2, p.act_limit);
+            float a3 = act_gate_t<SILU_REF>(p.act, p.gated, g3, u3, p.act_limit);
 
             scale_h4(((const half*) p.d_suh[local]) + col, a0, a1, a2, a3);
             had128(a0, a1, a2, a3, lane);

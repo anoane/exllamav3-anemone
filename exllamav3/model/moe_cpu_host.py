@@ -1340,6 +1340,12 @@ class MoeCpuHost:
             gf = g.float().clamp(max = lim)
             uf = u.float().clamp(-lim, lim)
             return ((uf + 1.0) * gf * torch.sigmoid(1.702 * gf)).half()
+        if act == 5:
+            # silu_ref: the native kernel, so a streamed expert computes what the resident and
+            # fused paths compute (raw gate and up clamped, SiLU and product in fp32)
+            a = torch.empty_like(u, dtype = torch.half)
+            ext.silu_ref_mul(g, u, a, float(spec["act_limit"]))
+            return a
         uf = torch.nn.functional.relu(u.float())
         return (uf * uf).half()
 
@@ -1401,11 +1407,11 @@ class MoeCpuHost:
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-tier row limit for a streamed layer, 0 when the layer isn't eligible (same rule
-        as support_fused on the GPU side: silu/gelu gated or relu2 gateless, no per-expert
-        biases, no padded dims). With fused-only prefill every row count is fused (the kernel
-        stripes rows through its temp buffers) and an ineligible layer is an error"""
+        as support_fused on the GPU side: silu/silu_ref/gelu gated or relu2 gateless, no
+        per-expert biases, no padded dims). With fused-only prefill every row count is fused
+        (the kernel stripes rows through its temp buffers) and an ineligible layer is an error"""
         eligible = (
-            spec["activation"] in (0, 1, 2) and spec["hi"] == h and spec["ho"] == h
+            spec["activation"] in (0, 1, 2, 5) and spec["hi"] == h and spec["ho"] == h
             and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))
         )
         if TUNING.fused_prefill:
@@ -1566,8 +1572,9 @@ class MoeCpuHost:
 
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;
         # experts too hot for the temp buffers take the reconstruct tiers. Same eligibility as
-        # support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2 gateless, no
-        # per-expert biases, no padded dims. Fused-only prefill fuses every expert (row stripes)
+        # support_fused on the GPU side: mul1 (given), silu/silu_ref/gelu gated or relu2
+        # gateless, no per-expert biases, no padded dims. Fused-only prefill fuses every expert
+        # (row stripes)
         fused_t = self._stream_fused_t(spec, aux, h)
         recon = self._stream_recon_layer(st, layer_idx, spec, aux, y.device)
         recon_ctx = None

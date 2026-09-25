@@ -52,6 +52,7 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         bool,
+        bool,
         bool
     >(),
     py::arg("yh2"),
@@ -105,8 +106,10 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("up_bias_ptrs") = py::none(),
     py::arg("down_bias_ptrs") = py::none(),
     py::arg("act_relu2") = false,
-    py::arg("sh_coop") = false
+    py::arg("sh_coop") = false,
+    py::arg("act_silu_ref") = false
 )
+.def_readonly("act_silu_ref", &BC_BlockSparseMLP::act_silu_ref)
 .def_readonly("sh_coop", &BC_BlockSparseMLP::sh_coop)
 .def("run_bszN", &BC_BlockSparseMLP::run_bszN)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)

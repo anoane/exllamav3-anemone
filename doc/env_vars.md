@@ -2280,13 +2280,13 @@ captures):
 
 Both intervals include zero, the NLL moves in opposite directions under the two numerics
 settings, and both add confident flips: about +12 and +15 per 100K as a main effect over every
-combination with FP32 logits and an FP32 activation that clamps and evaluates SiLU as
-DeepSeek's reference code does. With it, the 64K run failed the agreement gates against the
-first reference capture, which the run without it passed. Together with that activation it gave
-the highest NLL of all combinations under both settings: +0.000359 without and +0.000365 with
-FP32 logits under `precise`, +0.000821 without and +0.000817 with FP32 logits under
-`deepseek:index`, where both intervals ([+0.000068, +0.001550] without FP32 logits) exclude zero
-and no other interval does. The reading:
+combination with FP32 logits and the reference activation (`EXL3_DSV41_ACTIVATION=reference`,
+below). With it, the 64K run failed the agreement gates against the first reference capture,
+which the run without it passed. Together with that activation it gave the highest NLL of all
+combinations under both settings: +0.000359 without and +0.000365 with FP32 logits under
+`precise`, +0.000821 without and +0.000817 with FP32 logits under `deepseek:index`, where both
+intervals ([+0.000068, +0.001550] without FP32 logits) exclude zero and no other interval does.
+The reading:
 the FP32 biases move a few hundred selections the way any change of the last bits does in this
 model, without a measurable gain; the lost precision of the FP16 biases is not a measurable
 source of error here. It was not measured at longer lengths.
@@ -2414,6 +2414,106 @@ for fused in (False, True):
     cache.detach_from_model()
 ```
 
+### `EXL3_DSV41_ACTIVATION` (default: `silu`)
+
+Selects how DeepSeek-V4.1's routed and shared experts evaluate their SwiGLU activation: the
+engine's gated SiLU (default) or the form of DeepSeek's reference code, which clamps the raw
+inputs and computes in FP32. An experiment switch: in the comparisons below it gave no consistent
+gain.
+
+What it changes: every expert computes `act(gate) * up` from its gate and up projections, with
+the checkpoint's `swiglu_limit` (10 on DeepSeek-V4.1-Flash) bounding the inputs. The two forms:
+
+| Setting | Clamp (limit L) | SiLU and product | Rounding |
+|---|---|---|---|
+| `silu` | the ACTIVATED gate from above, `min(silu(gate), L)`, and `up` to `[-L, L]` | in FP16 on the per-expert kernels, the fused prefill kernel and the batched reconstruct tier (V4.1's experts have FP16 intermediates there); in FP32 on the fused decode kernel, the CPU worker and the streamed per-expert path | FP16 arithmetic on the FP16 paths; the fused decode kernel and the CPU worker keep the product in FP32, the streamed per-expert path rounds it to FP16 once |
+| `reference` | the RAW gate from above, `silu(min(gate, L))`, and `up` to `[-L, L]` | in FP32 on every path (the fused decode kernel passes it its FP32 gate and up values) | once, the product to FP16 |
+
+The clamps differ only for gates above the limit, by at most `L * sigmoid(-L) * |up|` (0.0045 at
+L = 10). On the FP16 paths the practical difference is therefore the precision of SiLU and the
+product. On the FP32 paths `reference` changes the clamp; on the fused decode kernel and the CPU
+worker, where `silu` keeps the product in FP32 (on the CPU worker up to its int8-quantized down
+input), it also adds one FP16 rounding of the product, so there, in decode and on the CPU worker
+(e.g. the serving layout with `experts=cpu`), it is less precise than `silu`. The streamed
+per-expert path rounds `silu`'s FP32 product to FP16 once as well, so there `reference` changes the
+clamp and uses the GPU's fast exponential instead of torch's. The measurements below are
+teacher-forced prefills, which run the FP16 paths; decode and the CPU worker were not measured with
+this switch. `reference` uses a new activation, `silu_ref` (`exllamav3_ext/silu_ref.cuh`), which
+every path that can run an expert implements: the per-expert kernel (`ext.silu_ref_mul`), the fused
+routed-expert kernel, the graph-captured decode of routed and shared experts and their fused
+single-launch decode, the batched reconstruct tier, experts held in system RAM and streamed to the
+GPU, and the CPU worker (which computes in FP32 as well, with the host's exponential, so its last
+bits differ from the GPU's, as for every activation). A limit of 0 clamps nothing in either form.
+
+Values: `silu` (default) or `reference`, case-insensitive, surrounding whitespace ignored; unset or
+empty means `silu`. Anything else is refused with a `ValueError` when the model object is built,
+never silently replaced by the default (the builds used for the measurements below spelled the
+default `legacy`, which is refused too: use `silu` or leave the variable unset), and so is
+`reference` with a `swiglu_limit` that is negative, not finite or beyond FP32's range.
+
+When it is read: once, when the model object is built (`Model.from_config`); the experts keep that
+activation for the model's lifetime, since the fused and graph kernels are chosen when they load.
+Python: set `os.environ["EXL3_DSV41_ACTIVATION"]` before `Model.from_config(config)`; to compare
+both forms in one process, build one model object per form. The native side refuses a negative
+or nonfinite limit again when a kernel is called or a graph is built. Other architectures ignore
+the variable; the `silu_ref` activation itself is available to any model definition through
+`activation_fn = "silu_ref"` of `BlockSparseMLP` / `GatedMLP`, but no other architecture selects it.
+
+Interactions: independent of the attention numerics (`EXL3_DSV41_NUMERICS`), of where the experts
+live (`-mcl`, `-mcs`, `--placement ... experts=...`), of the pipelined prefill and of
+`EXL3_STABLE_ARITHMETIC` (the activation is elementwise, so results stay independent of the row
+count). DeepSeek-V4.1 refuses tensor-parallel loads, so the tensor-parallel export of the flag is
+not exercised.
+
+Performance and memory: an elementwise kernel either way, now in FP32 instead of FP16; no memory. In
+the runs below 64K prefill measured 800 tok/s against 798 under `precise` and 795 against 796 under
+`deepseek:index`. Generated code: in the fused routed-expert kernel `silu_ref` is a template
+parameter, not a runtime case: instances of its own (a row-striped and a whole-K twin of each of the
+54 default instances, 108 more, which the launcher selects for the activation's id) replace the
+activation switch, so the default instances compile without it. The reference instances cost about
+as much as the ones they mirror: 76 fused routed-expert units, about 10 s of compiler CPU time each
+for sm_80, sm_86 and sm_120 and 266 MiB of objects (185 MiB in an sm_80 + sm_120a build; half of
+them whole-K, which `EXLLAMA_NO_WHOLE_K_MOE` leaves out), and 11 fused-decode units, about 16 s each
+and 41 MiB (29 MiB). ptxas reports the same registers as the row-striped and whole-K instances they
+mirror and about 1% fewer spill bytes in total; the fused decode kernel's reference gate/up kernels
+differ from the default ones by -12 to +29 registers (112 of 162 kernel and GPU pairs unchanged) and
+spill less in total (808 against 928 bytes; at most 40/28 bytes stored / loaded). The `act_mul`
+instances of the other activations compile unchanged.
+
+Determinism: deterministic; results differ from `silu`, and from DeepSeek's own implementation,
+which also keeps the projections in higher precision.
+
+What it measured. DeepSeek-V4.1-Flash (EXL3, 3.0 bpw), teacher-forced over one real text,
+arithmetic independent of the row count, one process per setting; intervals are 95%
+moving-block bootstraps of the change in negative log-likelihood (NLL); confident and certain
+flips per 100K reference-confident positions against captures of vLLM's V4.1 path on the same
+checkpoint, as for `EXL3_DSV41_ROUTER_BIAS` above:
+
+| Run | NLL `silu` / `reference` | Change [95% interval] | Top-1 changed | Confident flips | Certain misses per 100K |
+|---|---|---|---|---|---|
+| 64K, `precise` | 0.250939 / 0.250528 | -0.000411 [-0.000921, +0.000026] | 228 of 65,535 | 161 / 169 | 8.4 / 5.3 |
+| 64K, `deepseek:index` | 0.249963 / 0.250426 | +0.000464 [-0.000159, +0.000898] | 289 of 65,535 | 150 / 147 | 7.6 / 6.9 |
+| first 364,544 of the 1M text, `precise` | 0.294598 / 0.294927 | +0.000329 | | 228 / 220 | 4.8 / 2.5 |
+
+At one position of the long text where `precise` misses a token the two reference captures give 93%
+and 96%, the log-probability of that token rose from -7.46 to -1.68, still not the top-1. Together
+with `EXL3_DSV41_ROUTER_BIAS` it gave the highest NLL of all combinations under both numerics
+settings (+0.000359 without and +0.000365 with FP32 logits under `precise`, +0.000821 and +0.000817
+under `deepseek:index`). The reading: lower NLL under one setting and higher under the other and at
+the longer prefix, intervals spanning zero at 64K, no consistent gain; the FP16 evaluation of the
+activation is not a measurable source of error here. The measurement build reproduced the earlier
+`precise` results bitwise with the default activation; its scalar `silu_ref` kernel has the same
+per-element arithmetic as this code's kernels (checked in the compiled code for sm_80 and sm_120),
+and this code reproduces the measurement build's `precise` 64K scores with `reference` bitwise at
+all 65,535 positions (NLL 0.250528; stable profile, the fused kernel's whole-K reference instances).
+
+When to use it: to compare with DeepSeek's reference activation arithmetic, or to study the
+activation's precision. Not for serving: keep the default.
+
+```sh
+EXL3_DSV41_ACTIVATION=reference python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+```
+
 ### `EXL3_DSV41_ABLATE` (default: unset; tests and validation only)
 
 A comma-separated list of deliberate errors in DeepSeek-V4.1's function. Each token makes the
@@ -2491,7 +2591,8 @@ unset, ExLlamaV3 derives the list from the GPUs present in the system.
 ### `EXLLAMA_NO_WHOLE_K_MOE` (default: unset)
 
 Build option that leaves the whole-K instances of the fused MoE kernel out of the extension. They
-are the whole-column twins of the 54 `exl3_moe_kernel` instances, in the 38 compilation units
+are the whole-column twins of the 54 `exl3_moe_kernel` instances and of their 54 twins for the
+reference activation of `EXL3_DSV41_ACTIVATION`, 108 instances in the 76 compilation units
 `exllamav3_ext/quant/comp_units/exl3_moe_inst_*_wk.cu`, and only `EXL3_STABLE_ARITHMETIC` uses them.
 Unlike the other entries of this section it applies to every build: `setup.py` (`pip install .`,
 `python setup.py build_ext`) and the JIT build in `exllamav3/ext.py`, which compiles the extension
@@ -2504,9 +2605,12 @@ skips those units and passes `-DEXLLAMA_NO_WHOLE_K_MOE` to nvcc, so the launcher
 (`quant/exl3_moe.cu`) compiles without them. A JIT build keys its cache on the sources and flags,
 so setting or unsetting the variable triggers a rebuild.
 
-Cost of the default: the 54 instances take about as much to compile as the 54 default fused MoE
-instances: about 10 s of compiler CPU time per compilation unit for sm_80, sm_86 and sm_120 (38
-units, about 6 minutes) and 133 MiB of objects, 93 MiB in an sm_80 + sm_120a build.
+Cost of the default: the 108 instances take about as much to compile as twice the 54 default fused
+MoE instances: about 10 s of compiler CPU time per compilation unit for sm_80, sm_86 and sm_120 (76
+units, about 12 minutes) and 265 MiB of objects. In an sm_80 + sm_120a build of the whole extension
+they are 185 MiB of 1,982 MiB of objects and 1,095 s of the 8,325 s of summed per-object compile
+time (13%; measured with 6 jobs on a shared 8-core allotment, so absolute times are long), and the
+extension is 977 MiB with them and 792 MiB without.
 
 Effect of leaving them out: the default arithmetic and `EXL3_MOE_FUSED_PREFILL` are unchanged.
 `EXL3_STABLE_ARITHMETIC=1` refuses every MoE layer whose experts the fused kernel computes

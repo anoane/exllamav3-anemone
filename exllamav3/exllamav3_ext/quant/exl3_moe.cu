@@ -13,6 +13,7 @@ namespace cg = cooperative_groups;
 #include "../stable_arithmetic.h"
 #include <set>
 #include <limits>
+#include "../silu_ref.h"
 
 int exl3_moe_max_concurrency(int device)
 {
@@ -93,6 +94,35 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_m64_st[] =
     exl3_moe_kernel_k6_n128_cb2_m64_st(), exl3_moe_kernel_k7_n128_cb2_m64_st(), exl3_moe_kernel_k8_n128_cb2_m64_st()
 };
 
+// Reference-swiglu twins of the row-striped tables, same layout (act_function MOE_ACT_SILU_REF, DeepSeek's
+// reference swiglu, see had_hf_r_128_guad_inner)
+fp_exl3_moe_kernel exl3_moe_kernel_instances_sr[] =
+{
+    exl3_moe_kernel_k0_n128_cb1_sr(), exl3_moe_kernel_k0_n256_cb1_sr(), exl3_moe_kernel_k0_n128_cb2_sr(), exl3_moe_kernel_k0_n256_cb2_sr(),
+    exl3_moe_kernel_k1_n128_cb1_sr(), exl3_moe_kernel_k1_n256_cb1_sr(), exl3_moe_kernel_k1_n128_cb2_sr(), exl3_moe_kernel_k1_n256_cb2_sr(),
+    exl3_moe_kernel_k2_n128_cb1_sr(), exl3_moe_kernel_k2_n256_cb1_sr(), exl3_moe_kernel_k2_n128_cb2_sr(), exl3_moe_kernel_k2_n256_cb2_sr(),
+    exl3_moe_kernel_k3_n128_cb1_sr(), exl3_moe_kernel_k3_n256_cb1_sr(), exl3_moe_kernel_k3_n128_cb2_sr(), exl3_moe_kernel_k3_n256_cb2_sr(),
+    exl3_moe_kernel_k4_n128_cb1_sr(), exl3_moe_kernel_k4_n256_cb1_sr(), exl3_moe_kernel_k4_n128_cb2_sr(), exl3_moe_kernel_k4_n256_cb2_sr(),
+    exl3_moe_kernel_k5_n128_cb1_sr(), exl3_moe_kernel_k5_n256_cb1_sr(), exl3_moe_kernel_k5_n128_cb2_sr(), exl3_moe_kernel_k5_n256_cb2_sr(),
+    exl3_moe_kernel_k6_n128_cb1_sr(), exl3_moe_kernel_k6_n256_cb1_sr(), exl3_moe_kernel_k6_n128_cb2_sr(), exl3_moe_kernel_k6_n256_cb2_sr(),
+    exl3_moe_kernel_k7_n128_cb1_sr(), exl3_moe_kernel_k7_n256_cb1_sr(), exl3_moe_kernel_k7_n128_cb2_sr(), exl3_moe_kernel_k7_n256_cb2_sr(),
+    exl3_moe_kernel_k8_n128_cb1_sr(), exl3_moe_kernel_k8_n256_cb1_sr(), exl3_moe_kernel_k8_n128_cb2_sr(), exl3_moe_kernel_k8_n256_cb2_sr()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m32_sr[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m32_sr(), exl3_moe_kernel_k1_n128_cb2_m32_sr(), exl3_moe_kernel_k2_n128_cb2_m32_sr(),
+    exl3_moe_kernel_k3_n128_cb2_m32_sr(), exl3_moe_kernel_k4_n128_cb2_m32_sr(), exl3_moe_kernel_k5_n128_cb2_m32_sr(),
+    exl3_moe_kernel_k6_n128_cb2_m32_sr(), exl3_moe_kernel_k7_n128_cb2_m32_sr(), exl3_moe_kernel_k8_n128_cb2_m32_sr()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m64_sr[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m64_sr(), exl3_moe_kernel_k1_n128_cb2_m64_sr(), exl3_moe_kernel_k2_n128_cb2_m64_sr(),
+    exl3_moe_kernel_k3_n128_cb2_m64_sr(), exl3_moe_kernel_k4_n128_cb2_m64_sr(), exl3_moe_kernel_k5_n128_cb2_m64_sr(),
+    exl3_moe_kernel_k6_n128_cb2_m64_sr(), exl3_moe_kernel_k7_n128_cb2_m64_sr(), exl3_moe_kernel_k8_n128_cb2_m64_sr()
+};
+
 // Whole-K twins, same layout (EXL3_STABLE_ARITHMETIC): every block of an expert group computes whole output
 // columns, see exl3_gemm_kernel_inner. They run in row stripes (see exl3_moe_kernel). A build with
 // EXLLAMA_NO_WHOLE_K_MOE set leaves them out (the *_wk.cu units are not compiled, see setup.py / ext.py)
@@ -123,6 +153,34 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_m64_wk[] =
     exl3_moe_kernel_k3_n128_cb2_m64_wk(), exl3_moe_kernel_k4_n128_cb2_m64_wk(), exl3_moe_kernel_k5_n128_cb2_m64_wk(),
     exl3_moe_kernel_k6_n128_cb2_m64_wk(), exl3_moe_kernel_k7_n128_cb2_m64_wk(), exl3_moe_kernel_k8_n128_cb2_m64_wk()
 };
+
+// Whole-K twins of the reference-swiglu tables
+fp_exl3_moe_kernel exl3_moe_kernel_instances_sr_wk[] =
+{
+    exl3_moe_kernel_k0_n128_cb1_sr_wk(), exl3_moe_kernel_k0_n256_cb1_sr_wk(), exl3_moe_kernel_k0_n128_cb2_sr_wk(), exl3_moe_kernel_k0_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k1_n128_cb1_sr_wk(), exl3_moe_kernel_k1_n256_cb1_sr_wk(), exl3_moe_kernel_k1_n128_cb2_sr_wk(), exl3_moe_kernel_k1_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k2_n128_cb1_sr_wk(), exl3_moe_kernel_k2_n256_cb1_sr_wk(), exl3_moe_kernel_k2_n128_cb2_sr_wk(), exl3_moe_kernel_k2_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k3_n128_cb1_sr_wk(), exl3_moe_kernel_k3_n256_cb1_sr_wk(), exl3_moe_kernel_k3_n128_cb2_sr_wk(), exl3_moe_kernel_k3_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k4_n128_cb1_sr_wk(), exl3_moe_kernel_k4_n256_cb1_sr_wk(), exl3_moe_kernel_k4_n128_cb2_sr_wk(), exl3_moe_kernel_k4_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k5_n128_cb1_sr_wk(), exl3_moe_kernel_k5_n256_cb1_sr_wk(), exl3_moe_kernel_k5_n128_cb2_sr_wk(), exl3_moe_kernel_k5_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k6_n128_cb1_sr_wk(), exl3_moe_kernel_k6_n256_cb1_sr_wk(), exl3_moe_kernel_k6_n128_cb2_sr_wk(), exl3_moe_kernel_k6_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k7_n128_cb1_sr_wk(), exl3_moe_kernel_k7_n256_cb1_sr_wk(), exl3_moe_kernel_k7_n128_cb2_sr_wk(), exl3_moe_kernel_k7_n256_cb2_sr_wk(),
+    exl3_moe_kernel_k8_n128_cb1_sr_wk(), exl3_moe_kernel_k8_n256_cb1_sr_wk(), exl3_moe_kernel_k8_n128_cb2_sr_wk(), exl3_moe_kernel_k8_n256_cb2_sr_wk()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m32_sr_wk[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m32_sr_wk(), exl3_moe_kernel_k1_n128_cb2_m32_sr_wk(), exl3_moe_kernel_k2_n128_cb2_m32_sr_wk(),
+    exl3_moe_kernel_k3_n128_cb2_m32_sr_wk(), exl3_moe_kernel_k4_n128_cb2_m32_sr_wk(), exl3_moe_kernel_k5_n128_cb2_m32_sr_wk(),
+    exl3_moe_kernel_k6_n128_cb2_m32_sr_wk(), exl3_moe_kernel_k7_n128_cb2_m32_sr_wk(), exl3_moe_kernel_k8_n128_cb2_m32_sr_wk()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m64_sr_wk[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m64_sr_wk(), exl3_moe_kernel_k1_n128_cb2_m64_sr_wk(), exl3_moe_kernel_k2_n128_cb2_m64_sr_wk(),
+    exl3_moe_kernel_k3_n128_cb2_m64_sr_wk(), exl3_moe_kernel_k4_n128_cb2_m64_sr_wk(), exl3_moe_kernel_k5_n128_cb2_m64_sr_wk(),
+    exl3_moe_kernel_k6_n128_cb2_m64_sr_wk(), exl3_moe_kernel_k7_n128_cb2_m64_sr_wk(), exl3_moe_kernel_k8_n128_cb2_m64_sr_wk()
+};
 #endif
 
 // One family of instances: the 16-row table [4 * K + 2 * cb_idx + N_off] and the 32- and 64-row tables [K];
@@ -136,10 +194,13 @@ struct MoeInstanceFamily
 
 static const MoeInstanceFamily moe_family_default = { exl3_moe_kernel_instances, exl3_moe_kernel_instances_m32, exl3_moe_kernel_instances_m64 };
 static const MoeInstanceFamily moe_family_striped = { exl3_moe_kernel_instances_st, exl3_moe_kernel_instances_m32_st, exl3_moe_kernel_instances_m64_st };
+static const MoeInstanceFamily moe_family_silu_ref = { exl3_moe_kernel_instances_sr, exl3_moe_kernel_instances_m32_sr, exl3_moe_kernel_instances_m64_sr };
 #ifndef EXLLAMA_NO_WHOLE_K_MOE
 static const MoeInstanceFamily moe_family_whole_k = { exl3_moe_kernel_instances_wk, exl3_moe_kernel_instances_m32_wk, exl3_moe_kernel_instances_m64_wk };
+static const MoeInstanceFamily moe_family_silu_ref_whole_k = { exl3_moe_kernel_instances_sr_wk, exl3_moe_kernel_instances_m32_sr_wk, exl3_moe_kernel_instances_m64_sr_wk };
 #else
 static const MoeInstanceFamily moe_family_whole_k = { nullptr, nullptr, nullptr };
+static const MoeInstanceFamily moe_family_silu_ref_whole_k = { nullptr, nullptr, nullptr };
 #endif
 
 // Whether this build has the whole-K instances that EXL3_STABLE_ARITHMETIC needs (false when built with
@@ -226,7 +287,8 @@ inputs:
         row within its expert. Selects the row-striped instances (_st). Fused-only prefill
         (EXL3_MOE_FUSED_PREFILL) sets it
 
-    Under EXL3_STABLE_ARITHMETIC the whole-K instances (_wk) run every launch. They always run in row stripes;
+    Under EXL3_STABLE_ARITHMETIC the whole-K instances (_wk) run every launch, and act_function MOE_ACT_SILU_REF
+    runs the reference-swiglu instances (_sr, or _sr_wk under the profile). They always run in row stripes;
     without tile_rows the launch's row limit (count_hi) is capped at max_tokens_per_expert, which skips the
     experts an unstriped launch skips
 */
@@ -279,6 +341,9 @@ void exl3_moe
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    if (act_function == MOE_ACT_SILU_REF)
+        TORCH_CHECK(silu_ref_valid_limit(act_limit), "MoE kernel: silu_ref act_limit must be finite and nonnegative");
 
     // Nothing for the fused kernel to do
     if (num_active == 0) return;
@@ -401,14 +466,18 @@ void exl3_moe
     // Row stripes run in instances of their own (tile_rows is a template parameter of exl3_moe_kernel), so the
     // default instances compile without the stripe code. EXL3_STABLE_ARITHMETIC: the whole-K twins, whose
     // per-column arithmetic does not depend on the group width (and so on num_active or the concurrency); the
-    // default instances split K between blocks. The whole-K instances are striped: an unstriped launch caps its
-    // row limit at the temp buffers' capacity, so it skips exactly the experts an unstriped instance skips
+    // default instances split K between blocks. DeepSeek's reference swiglu (MOE_ACT_SILU_REF) has instances of
+    // its own as well. The whole-K and reference-swiglu instances are striped: an unstriped launch caps its row
+    // limit at the temp buffers' capacity, so it skips exactly the experts an unstriped instance skips
     const bool whole_k = stable_arithmetic();
-    const MoeInstanceFamily& family = whole_k ? moe_family_whole_k : tile_rows ? moe_family_striped : moe_family_default;
+    const bool silu_ref = act_function == MOE_ACT_SILU_REF;
+    const MoeInstanceFamily& family =
+        silu_ref ? (whole_k ? moe_family_silu_ref_whole_k : moe_family_silu_ref) :
+        whole_k ? moe_family_whole_k : tile_rows ? moe_family_striped : moe_family_default;
     TORCH_CHECK(family.rows16, "exl3_moe: EXL3_STABLE_ARITHMETIC=1 needs the whole-K fused MoE kernels, which this "
                 "build of exllamav3_ext leaves out (built with EXLLAMA_NO_WHOLE_K_MOE set); rebuild without it");
     int launch_count_hi = count_hi;
-    if (whole_k && !tile_rows && count_hi > 0 && (size_t) count_hi > max_tokens_per_expert)
+    if ((whole_k || silu_ref) && !tile_rows && count_hi > 0 && (size_t) count_hi > max_tokens_per_expert)
         launch_count_hi = (int) max_tokens_per_expert;
     fp_exl3_moe_kernel kernel;
     if (m_tile <= 16)

@@ -42,7 +42,7 @@ from ..model.config import Config
 from ..model.model import Model
 from ..model.placement import parse as parse_placement
 from ..model.math_policy import STABLE_ARITHMETIC
-from .dsv41 import numerics, pipeline, router_bias
+from .dsv41 import activation, numerics, pipeline, router_bias
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
 V41_VALID_RATIOS = (0, 1, 2)
@@ -481,6 +481,11 @@ class DeepseekV41Model(Model):
 
         c = config
 
+        # The routed and shared experts' activation, the same for both (EXL3_DSV41_ACTIVATION,
+        # architecture/dsv41/activation.py), fixed for the model's lifetime: the fused and graph
+        # kernels are selected when the layers load
+        activation_fn = activation.activation_fn(os.environ.get(activation.ENV_ACTIVATION), c.swiglu_limit)
+
         # The explicit placement (EXL3_PLACEMENT / --placement / config.infer_params.placement),
         # read now, or None: its changes of device must be free cuts, except at most one, the
         # split, past which the first layer owns a replica of its kv group's pool. The Cache sizes
@@ -578,7 +583,7 @@ class DeepseekV41Model(Model):
                 qmap = "block.mlp",
                 interm_dtype = torch.half,
                 out_dtype = torch.float,
-                activation_fn = "silu",
+                activation_fn = activation_fn,
                 act_limit = c.swiglu_limit,
                 router_type = "sqrtsp_hash" if is_hash else "sqrtsp",
                 routed_scaling_factor = c.routed_scaling_factor,
@@ -590,7 +595,7 @@ class DeepseekV41Model(Model):
                     key_up = "w3", key_gate = "w1", key_down = "w2",
                     qmap = "block.mlp",
                     out_dtype = torch.float,
-                    activation_fn = "silu",
+                    activation_fn = activation_fn,
                     act_limit = c.swiglu_limit,
                     select_hq_bits = 2,
                 ) if c.n_shared_experts else None,

@@ -156,7 +156,7 @@ class MoeStripeKernelTests(unittest.TestCase):
                               for xs in (t, su, sv)))
         return tabs, keep
 
-    def run_kernel(self, device, x, tabs, routing, rows, tile_rows):
+    def run_kernel(self, device, x, tabs, routing, rows, tile_rows, act = (0, 0.0)):
         ext = self.ext
         expert_count, token_sorted, weight_sorted, fused_base, launches = routing
         C = ext.exl3_moe_max_concurrency(torch.device(device).index)
@@ -167,10 +167,10 @@ class MoeStripeKernelTests(unittest.TestCase):
         for num_active, lo, hi, m_tile in launches:
             ext.exl3_moe(
                 x, out, expert_count, token_sorted, weight_sorted, *temps,
-                0, float(self.K), float(self.K), float(self.K),
+                act[0], float(self.K), float(self.K), float(self.K),
                 gt, gs, gv, ut, us, uv, dt, ds, dv,
                 False, True, False, True, False, True,
-                0.0, num_active, scratch, fused_base, lo, hi, m_tile,
+                act[1], num_active, scratch, fused_base, lo, hi, m_tile,
                 tile_rows = tile_rows,
             )
         torch.cuda.synchronize(device)
@@ -206,15 +206,27 @@ class MoeStripeKernelTests(unittest.TestCase):
                 with self.subTest(device = device, rows = rows):
                     striped = self.run_kernel(device, x, tabs, routing, rows, True)
                     self.assertTrue(torch.equal(striped, reference))
-            # Without stripes, experts above the buffers' rows are skipped (left to the caller)
-            skipped = self.run_kernel(device, x, tabs, routing, 256, False)
+            # the same for DeepSeek's reference swiglu (activation 5, limit 10), which runs the fused
+            # kernel's silu_ref instances
+            ref_act = (5, 10.0)
+            reference5 = self.run_kernel(device, x, tabs, routing, 704, False, ref_act)
+            self.assertTrue(bool(torch.isfinite(reference5).all()))
+            self.assertFalse(torch.equal(reference5, reference))
+            with self.subTest(device = device, act = "silu_ref"):
+                self.assertTrue(torch.equal(self.run_kernel(device, x, tabs, routing, 128, True, ref_act), reference5))
+            # Without stripes, experts above the buffers' rows are skipped (left to the caller): by
+            # the default instances, and by the reference-swiglu instances, which run in stripes and
+            # get the launch's row limit capped at the buffers' rows instead
             starts = fused_base.tolist()
-            for e, c in enumerate(counts):
-                block = skipped[starts[e] : starts[e] + c]
-                if c > 256:
-                    self.assertTrue(bool(torch.isnan(block).all()), e)
-                else:
-                    self.assertTrue(torch.equal(block, reference[starts[e] : starts[e] + c]), e)
+            for act, full in (((0, 0.0), reference), (ref_act, reference5)):
+                skipped = self.run_kernel(device, x, tabs, routing, 256, False, act)
+                for e, c in enumerate(counts):
+                    block = skipped[starts[e] : starts[e] + c]
+                    with self.subTest(device = device, act = act[0], expert = e):
+                        if c > 256:
+                            self.assertTrue(bool(torch.isnan(block).all()))
+                        else:
+                            self.assertTrue(torch.equal(block, full[starts[e] : starts[e] + c]))
             del keep
 
 

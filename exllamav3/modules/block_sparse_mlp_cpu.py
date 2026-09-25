@@ -128,7 +128,7 @@ class BlockSparseMLP_CPU:
         return (
             device is not None and torch.device(device).type == "cuda" and
             (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
+            (self.activation_fn in ("silu", "silu_ref", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
         )
 
     def _cpu_init_state(self):
@@ -500,7 +500,7 @@ class BlockSparseMLP_CPU:
             [l.key for l in self.gates] if self.gated else [],
             [l.key for l in self.ups],
             [l.key for l in self.downs],
-            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
+            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3, "silu_ref": 5}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
@@ -634,7 +634,7 @@ class BlockSparseMLP_CPU:
             [l.key for l in self.gates[first:]] if self.gated else [],
             [l.key for l in self.ups[first:]],
             [l.key for l in self.downs[first:]],
-            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
+            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3, "silu_ref": 5}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),

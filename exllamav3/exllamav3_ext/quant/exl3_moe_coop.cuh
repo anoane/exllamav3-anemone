@@ -13,6 +13,7 @@
 #define MOE_COOP_ACT_GELU 1
 #define MOE_COOP_ACT_RELU2 2
 #define MOE_COOP_ACT_SILU_OAI 3
+#define MOE_COOP_ACT_SILU_REF 5    // DeepSeek's reference swiglu (silu_ref.cuh)
 
 #define MOE_COOP_THREADS 512
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)

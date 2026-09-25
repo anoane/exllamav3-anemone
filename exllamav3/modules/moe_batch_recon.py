@@ -54,13 +54,14 @@ DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", os.environ.get("EXL3_MOE_FU
 # act(g, u) -> a kernels; gateless relu2 rides relu_mul(u, u, a) = relu2(u)
 _ACT_CALLS_GATED = {
     "silu": ext.silu_mul,
+    "silu_ref": ext.silu_ref_mul,
     "gelu": ext.gelu_mul,
     "swiglu_oai": ext.silu_oai_mul,
     "relu2": ext.relu2_mul,
 }
 _ACT_CALLS_GATELESS = {"relu2": ext.relu_mul}
 # MoeCpuHost spec["activation"] indices
-_ACT_IDX = {0: "silu", 1: "gelu", 2: "relu2", 3: "swiglu_oai"}
+_ACT_IDX = {0: "silu", 1: "gelu", 2: "relu2", 3: "swiglu_oai", 5: "silu_ref"}
 
 
 def plan_groups(experts, count_of, batch_max = None):

@@ -17,7 +17,8 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
         std::shared_ptr<BC_LinearEXL3>,
         std::shared_ptr<BC_LinearEXL3>,
         std::shared_ptr<BC_LinearEXL3>,
-        float
+        float,
+        bool
     >(),
     py::arg("guh"),
     py::arg("gu"),
@@ -35,8 +36,10 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("gate"),
     py::arg("up"),
     py::arg("down"),
-    py::arg("act_limit")
+    py::arg("act_limit"),
+    py::arg("act_silu_ref") = false
 )
+.def_readonly("act_silu_ref", &BC_GatedMLP::act_silu_ref)
 .def("run_bszN", &BC_GatedMLP::run_bszN);
 
 py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def

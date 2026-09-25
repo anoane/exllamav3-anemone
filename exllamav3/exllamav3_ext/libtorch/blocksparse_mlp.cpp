@@ -156,7 +156,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
     bool _act_relu2,
-    bool _sh_coop
+    bool _sh_coop,
+    bool _act_silu_ref
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -196,6 +197,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         act_gelu            (_act_gelu),
         act_silu_oai        (_act_silu_oai),
         act_relu2           (_act_relu2),
+        act_silu_ref        (_act_silu_ref),
         shared_experts      (_shared_experts),
         shared_gate         (_shared_gate),
         act_limit           (_act_limit),
@@ -213,6 +215,9 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     // Non-gated experts (NemotronH): python passes an empty gates vector (the gate pointer
     // tables are unused placeholders) and act_relu2; the gate GEMMs are skipped throughout
     gated = !gates.empty();
+    TORCH_CHECK(!act_silu_ref || (gated && !act_silu && !act_gelu && !act_silu_oai && !act_relu2 &&
+                silu_ref_valid_limit(act_limit)),
+                "BC_BlockSparseMLP: silu_ref requires gated experts, no other activation and a finite, nonnegative limit");
     TORCH_CHECK(gated || act_relu2, "BC_BlockSparseMLP: gateless experts require act_relu2");
     // The fused decode kernels decode all three projections with one codebook instantiation
     TORCH_CHECK(gate_mcg == up_mcg && up_mcg == down_mcg && gate_mul1 == up_mul1 && up_mul1 == down_mul1,
@@ -237,7 +242,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
 
     // Static part of the fused decode kernels' parameters, validated once
     {
-        int act = act_silu_oai ? MOE_COOP_ACT_SILU_OAI :
+        int act = act_silu_ref ? MOE_COOP_ACT_SILU_REF :
+                  act_silu_oai ? MOE_COOP_ACT_SILU_OAI :
                   act_gelu ? MOE_COOP_ACT_GELU :
                   act_relu2 ? MOE_COOP_ACT_RELU2 :
                   MOE_COOP_ACT_SILU;
@@ -307,7 +313,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             at::Tensor act_out_sh = at::empty({MAX_BSZN, I_sh}, hopt);
             at::Tensor d_out_sh = at::empty({MAX_BSZN, Ho_sh}, at::TensorOptions().dtype(at::kFloat).device(dev));
             at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len(MAX_BSZN, MAX_BSZN, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
-            int act_sh = se->act_gelu ? MOE_COOP_ACT_GELU : se->act_relu2 ? MOE_COOP_ACT_RELU2 : MOE_COOP_ACT_SILU;
+            int act_sh = se->act_silu_ref ? MOE_COOP_ACT_SILU_REF :
+                         se->act_gelu ? MOE_COOP_ACT_GELU : se->act_relu2 ? MOE_COOP_ACT_RELU2 : MOE_COOP_ACT_SILU;
             sh_coop_p = exl3_moe_coop_prepare
             (
                 Hi_sh, gt, gs, gv, ut, us, uv, dt, ds, dv, gb, ub, db,
@@ -388,6 +395,8 @@ void BC_BlockSparseMLP::run_single_expert_gr
 
         if (!gated)
             relu_mul_gr(ui, ui, ai, act_limit, graph);
+        else if (act_silu_ref)
+            silu_ref_mul_gr(gi, ui, ai, act_limit, graph);
         else if (act_silu)
             silu_mul_gr(gi, ui, ai, act_limit, graph);
         else if (act_gelu)
@@ -509,6 +518,8 @@ void BC_BlockSparseMLP::run_single_expert_dq
 
     if (!gated)
         relu_mul(interm2, interm2, interm_a, act_limit);
+    else if (act_silu_ref)
+        silu_ref_mul(interm1, interm2, interm_a, act_limit);
     else if (act_silu)
         silu_mul(interm1, interm2, interm_a, act_limit);
     else if (act_gelu)

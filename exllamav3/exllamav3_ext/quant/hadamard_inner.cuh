@@ -1,5 +1,6 @@
 #pragma once
 #include "../compat.cuh"
+#include "../silu_ref.cuh"
 
 #define ACT_SILU 0
 #define ACT_GELU 1
@@ -279,7 +280,11 @@ void had_fh_r_128_inner
 }
 
 // Fused op: o <- in_had(silu(out_had(g)) * out_had(u))
+// silu_ref: DeepSeek's reference swiglu (silu_ref.cuh) in place of the act_function switch, the limits and the
+// gate product below, for the fused MoE kernel's silu_ref instances. A template parameter, so the other instances
+// compile without it
 
+template <bool silu_ref = false>
 inline __device__
 void had_hf_r_128_guad_inner
 (
@@ -364,7 +369,12 @@ void had_hf_r_128_guad_inner
     }
 
     // Activation
-    switch (act_function)
+    if constexpr (silu_ref)
+    {
+        vg.x = silu_ref_h2(vg.x, vu.x, act_limit);
+        vg.y = silu_ref_h2(vg.y, vu.y, act_limit);
+    }
+    else switch (act_function)
     {
         case ACT_SILU:
             vg.x = _silu(vg.x);
@@ -386,7 +396,7 @@ void had_hf_r_128_guad_inner
     }
 
     // Optional activation limits
-    if (act_limit != 0.0f)
+    if (!silu_ref && act_limit != 0.0f)
     {
         vu.x = __hmax2(vu.x, __float2half2_rn(-act_limit));
         vu.y = __hmax2(vu.y, __float2half2_rn(-act_limit));
@@ -397,8 +407,11 @@ void had_hf_r_128_guad_inner
     }
 
     // Gate
-    vg.x = __hmul2(vg.x, vu.x);
-    vg.y = __hmul2(vg.y, vu.y);
+    if constexpr (!silu_ref)
+    {
+        vg.x = __hmul2(vg.x, vu.x);
+        vg.y = __hmul2(vg.y, vu.y);
+    }
 
     // Pre scale (d)
     half4 scales_d = ((half4*) pre_scale_d)[i];

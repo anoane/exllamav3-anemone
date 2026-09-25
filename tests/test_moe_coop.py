@@ -13,7 +13,7 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 
 DEV = torch.device(os.environ.get("EXL3_TEST_DEVICE", "cuda:0"))
-ACTS = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}
+ACTS = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3, "silu_ref": 5}
 
 
 def rand_trellis(k, n, K, gen):
@@ -61,6 +61,12 @@ def act_ref(act, gated, g, u, limit):
         x = torch.relu(u)
     elif act == "silu":
         x = torch.nn.functional.silu(g)
+    elif act == "silu_ref":
+        # DeepSeek's reference swiglu: the RAW gate clamped from above and up to [-L, L], SiLU and
+        # the product in FP32; the caller rounds the product to FP16 once, as the kernel does
+        if limit:
+            g = g.clamp(max = limit); u = u.clamp(-limit, limit)
+        return torch.nn.functional.silu(g) * u
     elif act == "gelu":
         x = torch.nn.functional.gelu(g, approximate = "tanh")
     elif act == "relu2":
@@ -172,7 +178,7 @@ def test_mixed_k():
     run_case(18, 2, 2, 7, 0)
 
 
-@pytest.mark.parametrize("act", ["silu", "gelu", "relu2", "swiglu_oai"])
+@pytest.mark.parametrize("act", ["silu", "gelu", "relu2", "swiglu_oai", "silu_ref"])
 def test_activations(act):
     run_case(3, 4, 4, 4, 1, act = act, limit = 0.0)
     run_case(4, 4, 4, 4, 1, act = act, limit = 1.0)

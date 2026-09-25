@@ -38,8 +38,8 @@ struct MoeCpuLayer
     int num_experts;
     int hidden_size;      // k of gate/up, n of down (unpadded handling is the caller's problem)
     int interm_size;      // n of gate/up, k of down
-    int activation;       // 0 = silu, 1 = gelu, 2 = relu2 (gateless), 3 = swiglu_oai
-    float act_limit;      // swiglu_oai clamp
+    int activation;       // 0 = silu, 1 = gelu, 2 = relu2 (gateless), 3 = swiglu_oai, 5 = silu_ref
+    float act_limit;      // swiglu_oai / silu_ref clamp
 };
 
 // Register a layer: per-expert tensor lists (CPU, contiguous). Returns a handle.

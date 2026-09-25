@@ -64,13 +64,16 @@ void moe_gemm_tile
 // tile_rows: row-striped instances (fused-only prefill, EXL3_MOE_FUSED_PREFILL). An expert with more rows
 // than the group's temp buffers hold (max_tokens_per_expert) is not skipped but runs in stripes of at most that
 // many rows. A compile-time option, like M_TILE, so the default instances compile without the stripe code.
-// whole_k: whole-column GEMM partition (EXL3_STABLE_ARITHMETIC, see moe_gemm_tile); these instances always run
-// in row stripes, and the launcher caps an unstriped launch's row limit at the buffers' capacity instead
-template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool tile_rows = false, bool whole_k = false>
+// whole_k: whole-column GEMM partition (EXL3_STABLE_ARITHMETIC, see moe_gemm_tile). silu_ref: DeepSeek's reference
+// swiglu (MOE_ACT_SILU_REF, see had_hf_r_128_guad_inner) in place of the act_function switch. The whole_k and
+// silu_ref instances always run in row stripes, and the launcher caps an unstriped launch's row limit at the
+// buffers' capacity instead
+template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool tile_rows = false, bool whole_k = false,
+         bool silu_ref = false>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
-    static_assert(tile_rows || !whole_k, "the whole-K instances run in row stripes");
+    static_assert(tile_rows || !(whole_k || silu_ref), "the whole-K and silu_ref instances run in row stripes");
 
     const int group_idx = blockIdx.z;
     const int block_idx = blockIdx.x;
@@ -223,7 +226,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
                 int token_off = warp_idx % warps_per_token;
-                had_hf_r_128_guad_inner
+                had_hf_r_128_guad_inner<silu_ref>
                 (
                     temp_intermediate_g + 128 * warp_idx,
                     temp_intermediate_u + 128 * warp_idx,
