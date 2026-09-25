@@ -135,14 +135,15 @@ def _check(pin, U, want):
     assert np.array_equal(pin.inv[:len(inv)].numpy(), inv)
 
 
-CONFIGS = [{"backend": "auto"}, {"backend": "pread"}, {"backend": "odirect"},
-           {"backend": "io_uring"}, {"backend": "io_uring", "direct": "all"}]
+CONFIGS = [{"backend": "original"}, {"backend": "auto"}, {"backend": "pread"},
+           {"backend": "odirect"}, {"backend": "io_uring"}, {"backend": "io_uring", "direct": "all"}]
 
 
 @pytest.mark.parametrize("cfg", CONFIGS, ids = lambda c: ",".join(f"{k}={v}" for k, v in c.items()))
 def test_stage_inline_and_prefetch(table, monkeypatch, cfg):
     info = ext.disk_engine_configure(cfg)
-    engine = cfg["backend"] != "auto"
+    # auto follows the recorded auto choice (disk/disk_auto.h), original never uses the engine
+    engine = {"original": False, "auto": info["auto_ngram_route"] == "engine"}.get(cfg["backend"], True)
     assert dm._disk_engine() == engine and info["ngram_route"] == ("engine" if engine else "original")
     eg = _module(table, monkeypatch)
     rng = np.random.default_rng(1)

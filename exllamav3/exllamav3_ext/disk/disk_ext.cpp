@@ -473,6 +473,7 @@ py::dict disk_stats(bool reset)
     d["enters"] = s.enters;
     d["resubmits"] = s.resubmits;
     d["stray_cqes"] = s.stray_cqes;
+    d["keepalive_reads"] = s.keepalive_reads;
     d["inflight_now"] = s.inflight_now;
     d["queued_ops_now"] = s.queued_ops_now;
     d["tickets_live"] = s.tickets_live;
@@ -486,6 +487,12 @@ static py::dict info_of(const std::shared_ptr<Engine>& eng)
     py::dict d;
     d["backend"] = std::string(exl3_disk::backend_name(c.backend));
     d["backend_named"] = c.backend_named;
+    d["ngram_engine"] = c.ngram_engine;
+    d["auto_backend"] = std::string(exl3_disk::backend_name(exl3_disk::auto_backend()));
+    d["auto_ngram_route"] = std::string(exl3_disk::auto_ngram_engine() ? "engine" : "original");
+    d["auto_keepalive_ms"] = exl3_disk::auto_keepalive_ms();
+    d["keepalive_ms"] = c.keepalive_ms;
+    d["keepalive_idle_s"] = c.keepalive_idle_s;
     d["direct_rows"] = c.direct_rows;
     d["direct_extents"] = c.direct_extents;
     d["threads"] = c.threads;

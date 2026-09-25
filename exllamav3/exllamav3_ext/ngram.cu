@@ -269,8 +269,9 @@ void ngram_gather_cpu
 
     py::gil_scoped_release release;
 
-    // EXL3_DISK_BACKEND named: the disk engine reads the rows (the same bytes); unset or auto:
-    // the original pool below
+    // The disk engine reads the rows (the same bytes) when EXL3_DISK_BACKEND names a backend,
+    // or is unset / auto and disk/disk_auto.h routes auto to the engine; otherwise (and with
+    // EXL3_DISK_BACKEND=original) the original pool below
     bool engine = false;
     int res = 0;
     try

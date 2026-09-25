@@ -95,13 +95,13 @@ def test_ngram_gather_engine_equals_original(ext, data, cfg):
             u = torch.from_numpy(uids)
             want = ref_rows(buf, base, row_bytes, uids)
 
-            ext.disk_engine_configure({"backend": "auto"})
+            ext.disk_engine_configure({"backend": "original"})
             assert ext.disk_ngram_route() == "original"
             a = torch.zeros((len(uids), row_bytes), dtype = torch.uint8)
             ext.ngram_gather_cpu(fd, base, row_bytes, u, 0, a)
 
             info = ext.disk_engine_configure(cfg)
-            assert info["ngram_route"] == "engine" and info["backend_named"]
+            assert info["ngram_route"] == "engine" and info["backend_named"] and info["ngram_engine"]
             b = torch.zeros((len(uids), row_bytes), dtype = torch.uint8)
             ext.ngram_gather_cpu(fd, base, row_bytes, u, 0, b)
 
@@ -333,9 +333,25 @@ def _run(code, env):
                           text = True, timeout = 600)
 
 
-def test_knob_routing(data):
+def test_auto_choice(ext):
+    """auto and original resolve through disk/disk_auto.h (written by the benchmark's decision
+    rule): auto's route is the recorded one, original always keeps the original pool."""
+    a = ext.disk_engine_configure({"backend": "auto"})
+    assert a["auto_backend"] in ("pread", "odirect", "io_uring")
+    assert a["auto_ngram_route"] in ("engine", "original")
+    assert not a["backend_named"] and a["ngram_route"] == a["auto_ngram_route"]
+    assert a["backend"] == a["auto_backend"] or a["fallbacks"]     # io_uring refused: a pool
+    o = ext.disk_engine_configure({"backend": "original"})
+    assert not o["backend_named"] and not o["ngram_engine"] and o["ngram_route"] == "original"
+    assert o["auto_backend"] == a["auto_backend"]
+    ext.disk_engine_shutdown()
+
+
+def test_knob_routing(ext, data):
     """ngram_gather_cpu follows EXL3_DISK_BACKEND, read once per process."""
     path, fd, buf = data
+    auto_route = ext.disk_engine_configure({"backend": "auto"})["auto_ngram_route"]
+    ext.disk_engine_shutdown()
     code = ("import os, torch\n"
             f"fd = os.open({path!r}, os.O_RDONLY)\n"
             "u = torch.tensor([1, 2, 9], dtype = torch.long)\n"
@@ -345,8 +361,10 @@ def test_knob_routing(data):
     ref = int(ref_rows(buf, 0, 256, [1, 2, 9]).astype(np.int64).sum())
     r = _run(code, {})
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["original", str(ref)]
+    assert r.stdout.split() == [auto_route, str(ref)]
     r = _run(code, {"EXL3_DISK_BACKEND": "auto"})
+    assert r.stdout.split() == [auto_route, str(ref)], r.stderr
+    r = _run(code, {"EXL3_DISK_BACKEND": "original"})
     assert r.stdout.split() == ["original", str(ref)], r.stderr
     r = _run(code, {"EXL3_DISK_BACKEND": "io_uring", "EXL3_DISK_QD": "16"})
     assert r.stdout.split() == ["engine", str(ref)], r.stderr

@@ -113,8 +113,10 @@ PIN_MAX_ROWS = 24 * 4096    # largest pinned staging set kept: 25.5 MiB requeste
 def _disk_engine() -> bool:
     """
     Whether the rows are read by the disk engine (doc/disk_engine.md): when EXL3_DISK_BACKEND
-    names a backend, or disk_engine_configure did, and only where the engine exists (not on
-    Windows, where ngram_gather_cpu keeps its overlapped path whatever the variable says).
+    names a backend (or disk_engine_configure did), or is unset / auto and the extension's auto
+    choice (disk/disk_auto.h) routes auto to the engine; never with EXL3_DISK_BACKEND=original,
+    and only where the engine exists (not on Windows, where ngram_gather_cpu keeps its
+    overlapped path whatever the variable says).
     The extension decides, as it does for ngram_gather_cpu; an invalid value raises here, at
     the first gather. With the engine, one native call per layer reads both tables, with a
     request class: the prefetch worker's look-ahead is class 2 until its forward waits for it

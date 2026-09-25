@@ -2,6 +2,7 @@
 // windows_backend_refusal() is used).
 
 #include "disk_engine.h"
+#include "disk_auto.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -14,12 +15,6 @@
 
 namespace exl3_disk
 {
-
-// The backend `auto` resolves to. It must name the fastest backend measured on the test host
-// (doc/env_vars.md, "Disk I/O engine"); until that benchmark has run it stays pread, which is
-// the original gather's technique, and ngram_gather_cpu keeps its original pool unless a
-// backend is named explicitly.
-static constexpr Backend kAutoBackend = Backend::Pread;
 
 const char* backend_name(Backend b)
 {
@@ -35,13 +30,16 @@ const char* backend_name(Backend b)
 namespace
 {
 
+const char* const kBackendValues = "auto, original, pread, odirect or io_uring";
+
 // Every knob, as its override key; the environment variable is EXL3_DISK_ + upper case
 const char* const kKnobs[] =
 {
     "backend", "direct", "threads", "qd", "reserve0", "engram_qd", "window_expert",
     "window_prefetch", "window_refill", "chunk", "align", "spin_us", "hold_arm_ms",
     "refill_age_ms", "sqpoll", "sqpoll_idle_ms", "sqpoll_cpu", "iopoll", "register",
-    "uring_async", "iowq_workers", "affinity", "fadvise", "extent_dontneed", "verbose", "trace",
+    "uring_async", "iowq_workers", "affinity", "fadvise", "extent_dontneed", "keepalive_ms",
+    "keepalive_idle_s", "verbose", "trace",
     "fault_eio", "fault_short", "fault_eintr", "fault_delay_us", "fault_no_uring",
     "fault_enter_fatal", "fault_force_iopoll",
 };
@@ -234,17 +232,15 @@ Config config_from_env(const Overrides& ov)
     Knobs k(ov);
     Config c;
 
-    // Backend
+    // Backend, and the route of ngram_gather_cpu (disk_auto.h holds what auto means)
     std::string b = lower(k.get("backend"));
-    if (b.empty() || b == "auto")
-    {
-        c.backend = kAutoBackend;
-        c.backend_named = false;
-    }
-    else if (b == "pread") { c.backend = Backend::Pread; c.backend_named = true; }
-    else if (b == "odirect") { c.backend = Backend::ODirect; c.backend_named = true; }
-    else if (b == "io_uring") { c.backend = Backend::IoUring; c.backend_named = true; }
-    else k.bad("backend", k.get("backend"), "auto, pread, odirect or io_uring");
+    c.backend_named = b == "pread" || b == "odirect" || b == "io_uring";
+    if (b.empty() || b == "auto") { c.backend = kAutoBackend; c.ngram_engine = kAutoNgramEngine; }
+    else if (b == "original") { c.backend = kAutoBackend; c.ngram_engine = false; }
+    else if (b == "pread") { c.backend = Backend::Pread; c.ngram_engine = true; }
+    else if (b == "odirect") { c.backend = Backend::ODirect; c.ngram_engine = true; }
+    else if (b == "io_uring") { c.backend = Backend::IoUring; c.ngram_engine = true; }
+    else k.bad("backend", k.get("backend"), kBackendValues);
     bool uring = c.backend == Backend::IoUring;
 
     // Page cache per traffic kind
@@ -323,6 +319,8 @@ Config config_from_env(const Overrides& ov)
     else if (f == "sequential") c.fadvise = Fadvise::Sequential;
     else k.bad("fadvise", k.get("fadvise"), "auto, none, random, normal or sequential");
     c.extent_dontneed = k.boolean("extent_dontneed", true);
+    c.keepalive_ms = (int) k.integer("keepalive_ms", 0, 1000, kAutoKeepaliveMs);
+    c.keepalive_idle_s = (int) k.integer("keepalive_idle_s", 1, 86400, 30);
 
     c.verbose = k.boolean("verbose", false);
     c.trace = (int) k.integer("trace", 0, 1 << 24, 0);
@@ -354,15 +352,20 @@ Config config_from_env(const Overrides& ov)
     return c;
 }
 
-bool backend_named_in_env()
+bool ngram_engine_from_env()
 {
     Overrides none;
     Knobs k(none);
     std::string b = lower(k.get("backend"));
-    if (b.empty() || b == "auto") return false;
+    if (b.empty() || b == "auto") return kAutoNgramEngine;
+    if (b == "original") return false;
     if (b == "pread" || b == "odirect" || b == "io_uring") return true;
-    k.bad("backend", k.get("backend"), "auto, pread, odirect or io_uring");
+    k.bad("backend", k.get("backend"), kBackendValues);
 }
+
+Backend auto_backend() { return kAutoBackend; }
+bool auto_ngram_engine() { return kAutoNgramEngine; }
+int auto_keepalive_ms() { return kAutoKeepaliveMs; }
 
 std::string Config::describe() const
 {
@@ -376,6 +379,7 @@ std::string Config::describe() const
     };
     std::ostringstream s;
     s << "backend " << backend_name(backend) << (backend_named ? "" : " (auto)")
+      << ", n-gram gather " << (ngram_engine ? "engine" : "original")
       << ", direct " << (direct_rows ? (direct_extents ? "all" : "rows")
                                      : (direct_extents ? "extents" : "none"))
       << ", qd " << qd << ", reserve0 " << reserve0 << ", engram_qd " << engram_qd;
@@ -395,6 +399,8 @@ std::string Config::describe() const
         if (iowq_workers) s << ", iowq_workers " << iowq_workers;
     }
     s << ", iopoll " << (iopoll ? "on" : "off");
+    if (keepalive_ms)
+        s << ", keepalive " << keepalive_ms << " ms (idle " << keepalive_idle_s << " s)";
     if (!affinity.empty()) s << ", affinity " << affinity.size() << " cpus";
     return s.str();
 }
@@ -404,7 +410,7 @@ std::string windows_backend_refusal()
     std::string v;
     const char* e = std::getenv("EXL3_DISK_BACKEND");
     if (e) v = lower(trim(std::string(e)));
-    if (v.empty() || v == "auto" || v == "odirect") return std::string();
+    if (v.empty() || v == "auto" || v == "original" || v == "odirect") return std::string();
     if (v == "pread")
         return "EXL3_DISK_BACKEND=pread is not available on Windows: the n-gram gather reads "
                "through an unbuffered overlapped handle, which is what odirect means there. "
@@ -412,7 +418,7 @@ std::string windows_backend_refusal()
     if (v == "io_uring")
         return "EXL3_DISK_BACKEND=io_uring is Linux-only. On Windows unset EXL3_DISK_BACKEND "
                "(the overlapped unbuffered ReadFile gather runs) or set it to odirect.";
-    return "EXL3_DISK_BACKEND=" + std::string(e) + ": expected auto, pread, odirect or io_uring";
+    return "EXL3_DISK_BACKEND=" + std::string(e) + ": expected " + kBackendValues;
 }
 
 int64_t hist_bucket_lower(int i)

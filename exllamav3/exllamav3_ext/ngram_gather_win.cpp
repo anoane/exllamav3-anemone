@@ -302,7 +302,8 @@ void ngram_gather_cpu
     TORCH_CHECK(out.size(0) >= U && out.size(1) * out.element_size() == row_bytes,
                 "ngram_gather_cpu: out shape");
     if (!U) return;
-    // This path is already unbuffered (EXL3_DISK_BACKEND=odirect); pread and io_uring are refused
+    // This path is already unbuffered (EXL3_DISK_BACKEND=odirect; auto and original also run it);
+    // pread and io_uring are refused
     static const std::string refusal = exl3_disk::windows_backend_refusal();
     TORCH_CHECK(refusal.empty(), "ngram_gather_cpu: ", refusal);
     const int64_t* up = (const int64_t*) uids.data_ptr();

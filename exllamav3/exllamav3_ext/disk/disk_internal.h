@@ -9,6 +9,7 @@
 //   uring sq_mx     the submission queue, from preparing SQEs to io_uring_enter; taken before
 //                   Core::mx (the only nesting), so a thread submits exactly what it prepared
 //   uring cq_mx     draining the completion queue; never held with any other lock
+//   Core::ka_mx     the keep-alive thread's sleep; never held with any other lock
 //
 // io_uring request ownership: a read is owned by the thread whose io_uring_enter submitted
 // it, and a buffered read whose owner exited before it completed fails (EFAULT). So a caller
@@ -29,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -102,6 +104,12 @@ public:
     // advice: posix_fadvise to apply once to the buffered descriptor (-1 none). Increments
     // refs; the caller must drop it with unref(). Throws Error.
     FileRef acquire(int fd, bool want_direct, int advice, const Config& cfg, Executor* ex);
+    // The keep-alive's file: the most recently used one that is not being forgotten and can be
+    // read with O_DIRECT (its O_DIRECT descriptor is opened here if needed). Increments refs
+    // like acquire (the caller drops it with unref()); false when there is no such file.
+    bool acquire_recent_direct(const Config& cfg, Executor* ex, FileRef* out);
+    // Close files forgotten while busy, if any (after an unref outside any ticket)
+    void sweep_doomed(Executor* ex);
     static void unref(FileEnt* e) { e->refs.fetch_sub(1, std::memory_order_acq_rel); }
     void close_all(Executor* ex);
     int64_t size();
@@ -260,6 +268,19 @@ struct Core
 
     FileTable files;
     std::unique_ptr<Executor> ex;
+
+    // Keep-alive (EXL3_DISK_KEEPALIVE_MS): while the engine is in use, a thread reads one small
+    // O_DIRECT block whenever the device has had nothing to do for a period, so a device that
+    // drops into a low-power state when idle is awake for the next real read. Submissions and
+    // ticket completions stamp the clocks below (no lock); the thread sleeps on ka_mx / ka_cv.
+    std::atomic<int64_t> last_submit_ns { 0 };
+    std::atomic<int64_t> last_io_ns { 0 };
+    std::atomic<uint64_t> keepalive_reads { 0 };
+    std::atomic<bool> ka_dormant { false };  // waiting for the next submission (idle engine)
+    std::mutex ka_mx;
+    std::condition_variable ka_cv;
+    bool ka_stop = false;                    // ka_mx
+    std::thread ka_thread;
 
     // Scheduler (Core::mx held)
     bool hold_active(int64_t now) const;

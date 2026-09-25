@@ -12,6 +12,7 @@
 // a file truncated under queued reads, and engine shutdown with reads in flight.
 
 #include "disk/disk_engine.h"
+#include "disk/disk_auto.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1284,6 +1285,75 @@ void test_overflow(Engine& e, File& big, const char* what)
     CHECK(s.queued_ops_now == 0 && s.tickets_live == 0, "%s: leftovers", what);
 }
 
+// EXL3_DISK_KEEPALIVE_MS: reads while the engine is in use, none while its own reads are
+// queued, none after the idle window until the next submission, and never keeps a forgotten
+// file open
+void test_keepalive(const Overrides& base, const char* what)
+{
+    Overrides ov = base;
+    ov["keepalive_ms"] = "2";
+    ov["keepalive_idle_s"] = "1";
+    ov["hold_arm_ms"] = "10000";
+    Engine e(cfg_of(ov));
+    File a = make_file("keepalive_a.bin", 1 << 20, 51);
+    uint8_t out[64];
+    int64_t ids[1] = { 7 };
+    Options o;
+    RowTable ta { a.fd, 0, 64, out, 64 };
+    auto reads = [&] { return e.stats(false).keepalive_reads; };
+    auto wait_until = [&](const std::function<bool()>& f)
+    {
+        int64_t t0 = now_ns();
+        while (!f() && now_ns() - t0 < 3000000000ll)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return f();
+    };
+    auto sleep_ms = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+    CHECK(e.config().keepalive_ms == 2 && e.describe().find("keepalive 2 ms") != std::string::npos,
+          "%s: config %s", what, e.describe().c_str());
+    sleep_ms(20);
+    CHECK(reads() == 0, "%s: keep-alive read before any submission", what);
+    CHECK(e.gather_rows(ids, 1, 0, &ta, 1, o) == 0, "%s: gather", what);
+    CHECK(wait_until([&] { return reads() >= 3; }), "%s: no keep-alive reads (%llu)", what,
+          (unsigned long long) reads());
+
+    // reads of its own queued (a class-3 ticket held back by an armed hold): no keep-alive
+    e.arm_hold();
+    Guarded g(1 << 16);
+    ExtentReq x { a.fd, 8192, 4096, g.p, (int64_t) g.n };
+    Options o3;
+    o3.cls = kRefill;
+    TicketId id = e.submit_extents(&x, 1, o3, nullptr);
+    sleep_ms(5);
+    uint64_t k0 = reads();
+    sleep_ms(30);
+    CHECK(reads() == k0, "%s: keep-alive read while reads were queued", what);
+    e.release(id);
+
+    // dormant once nothing was submitted for keepalive_idle_s, until the next submission
+    sleep_ms(1300);
+    uint64_t k1 = reads();
+    sleep_ms(60);
+    CHECK(reads() == k1, "%s: keep-alive reads after the idle window", what);
+    CHECK(e.gather_rows(ids, 1, 0, &ta, 1, o) == 0, "%s: gather again", what);
+    CHECK(wait_until([&] { return reads() > k1; }), "%s: keep-alive not resumed", what);
+
+    // forgotten (at once, or once the keep-alive read holding it finished): closed, and no
+    // keep-alive reads without a file
+    int f = e.forget(a.fd);
+    CHECK(f == 1 || f == -1, "%s: forget %d", what, f);
+    CHECK(wait_until([&] { return count_fds_to("keepalive_a.bin") == 1; }),
+          "%s: forgotten file kept open (%d descriptors)", what, count_fds_to("keepalive_a.bin"));
+    sleep_ms(5);
+    uint64_t k2 = reads();
+    sleep_ms(30);
+    CHECK(reads() == k2, "%s: keep-alive read without a file", what);
+    CHECK(e.stats(true).keepalive_reads == k2 && e.stats(false).keepalive_reads == 0,
+          "%s: stats reset", what);
+    ::close(a.fd);
+    ::unlink(a.path.c_str());
+}
+
 // forget(): an engine descriptor goes away with the file; a busy file goes once idle; an
 // unlinked file is closed on its own
 void test_forget(const Overrides& base, const char* what)
@@ -1656,6 +1726,14 @@ void test_config()
     CHECK(err({ { "window_prefetch", "8M/0" } }).empty(), "%s: lo 0 refused", what);
     CHECK(err({ { "fault_enter_fatal", "3" }, { "fault_force_iopoll", "1" } }).empty(),
           "%s: test knobs", what);
+    CHECK(!err({ { "keepalive_ms", "1001" } }).empty(), "%s: keepalive_ms range", what);
+    CHECK(!err({ { "keepalive_ms", "5ms" } }).empty(), "%s: keepalive_ms unit", what);
+    CHECK(!err({ { "keepalive_idle_s", "0" } }).empty(), "%s: keepalive_idle_s 0", what);
+    CHECK(config_from_env({ { "keepalive_ms", "auto" } }).keepalive_ms == kAutoKeepaliveMs &&
+          config_from_env({}).keepalive_ms == auto_keepalive_ms() &&
+          config_from_env({ { "keepalive_ms", "0" } }).keepalive_ms == 0 &&
+          config_from_env({ { "keepalive_ms", "5" } }).keepalive_ms == 5 &&
+          config_from_env({}).keepalive_idle_s == 30, "%s: keepalive values", what);
     CHECK(!err({ { "chunk", "100K" } }).empty(), "%s: chunk not 64K multiple", what);
     CHECK(!err({ { "align", "1000" } }).empty(), "%s: align not pow2", what);
     CHECK(!err({ { "affinity", "3-1" } }).empty(), "%s: cpu range", what);
@@ -1673,9 +1751,20 @@ void test_config()
     CHECK(!c.direct_rows && c.direct_extents, "%s: io_uring direct auto", what);
     Config p = config_from_env({ { "backend", "odirect" } });
     CHECK(p.direct_rows && p.direct_extents, "%s: odirect direct auto", what);
-    Config a = config_from_env({ { "backend", "auto" } });
-    CHECK(a.backend == Backend::Pread && !a.backend_named && !a.direct_rows && !a.direct_extents,
-          "%s: auto", what);
+    // auto and original: disk_auto.h's backend, with its own direct defaults; the n-gram route
+    // is disk_auto.h's for auto, the original pool for original, the engine when named
+    for (const char* v : { "auto", "original", "" })
+    {
+        Config a = config_from_env({ { "backend", v } });
+        bool route = std::string(v) == "original" ? false : kAutoNgramEngine;
+        CHECK(a.backend == kAutoBackend && a.backend == auto_backend() && !a.backend_named &&
+              a.ngram_engine == route && a.direct_rows == (kAutoBackend == Backend::ODirect) &&
+              a.direct_extents == (kAutoBackend != Backend::Pread), "%s: backend '%s'", what, v);
+    }
+    CHECK(auto_ngram_engine() == kAutoNgramEngine, "%s: auto route", what);
+    CHECK(c.ngram_engine && p.ngram_engine, "%s: named backend routes the engine", what);
+    CHECK(err({ { "backend", "legacy" } }).find("original") != std::string::npos,
+          "%s: backend values message", what);
     Config n = config_from_env({ { "backend", "pread" }, { "sqpoll", "1" } });
     CHECK(!n.notes.empty(), "%s: inapplicable knob not noted", what);
     Config w = config_from_env({ { "window_refill", "inf" } });
@@ -1702,13 +1791,16 @@ void test_config()
 
     // the ngram route follows EXL3_DISK_BACKEND only
     ::unsetenv("EXL3_DISK_BACKEND");
-    CHECK(!backend_named_in_env(), "%s: unset route", what);
+    CHECK(ngram_engine_from_env() == kAutoNgramEngine, "%s: unset route", what);
     ::setenv("EXL3_DISK_BACKEND", "auto", 1);
-    CHECK(!backend_named_in_env(), "%s: auto route", what);
+    CHECK(ngram_engine_from_env() == kAutoNgramEngine, "%s: auto route", what);
+    ::setenv("EXL3_DISK_BACKEND", "Original", 1);
+    CHECK(!ngram_engine_from_env(), "%s: original route", what);
+    CHECK(windows_backend_refusal().empty(), "%s: windows original", what);
     ::setenv("EXL3_DISK_BACKEND", "io_uring", 1);
-    CHECK(backend_named_in_env(), "%s: named route", what);
+    CHECK(ngram_engine_from_env(), "%s: named route", what);
     ::setenv("EXL3_DISK_BACKEND", "bogus", 1);
-    CHECK(expect_error([] { (void) backend_named_in_env(); }) == EINVAL, "%s: bad route", what);
+    CHECK(expect_error([] { (void) ngram_engine_from_env(); }) == EINVAL, "%s: bad route", what);
     CHECK(windows_backend_refusal().find("bogus") != std::string::npos, "%s: windows msg", what);
     ::setenv("EXL3_DISK_BACKEND", "odirect", 1);
     CHECK(windows_backend_refusal().empty(), "%s: windows odirect", what);
@@ -1736,9 +1828,12 @@ void test_default(File& big)
                                           (int64_t) out.size()); }) == ERANGE, "%s: range", what);
     CHECK(set_thread_class(kPrefetch) == kEngram && thread_class() == kPrefetch, "%s: class", what);
     set_thread_class(kEngram);
-    std::shared_ptr<Engine> p = configure_default({ { "backend", "auto" } });
-    CHECK(!ngram_route_engine(), "%s: route after auto", what);
+    std::shared_ptr<Engine> p = configure_default({ { "backend", "original" } });
+    CHECK(!ngram_route_engine(), "%s: route after original", what);
     CHECK(default_engine() == p, "%s: default engine", what);
+    p = configure_default({ { "backend", "auto" } });
+    CHECK(ngram_route_engine() == kAutoNgramEngine, "%s: route after auto", what);
+    CHECK(default_engine() == p, "%s: default engine after auto", what);
     shutdown_default();
     e.reset();
 }
@@ -1849,6 +1944,9 @@ int main(int argc, char** argv)
         run(n + "/hold-class", [&] { test_hold_class(b.ov, big, (n + "/hold-class").c_str()); });
         run(n + "/overflow", [&] { Engine e(cfg_of(b.ov)); test_overflow(e, big, (n + "/overflow").c_str()); });
         run(n + "/forget", [&] { test_forget(b.ov, (n + "/forget").c_str()); });
+        if (n == "pread" || n == "odirect" || n == "io_uring" || n == "io_uring-direct" ||
+            n == "io_uring-sqpoll" || n == "io_uring-refused")
+            run(n + "/keepalive", [&] { test_keepalive(b.ov, (n + "/keepalive").c_str()); });
         bool uring = b.ov.at("backend") == "io_uring" && !b.ov.count("fault_no_uring");
         if (uring && !b.ov.count("sqpoll"))
         {

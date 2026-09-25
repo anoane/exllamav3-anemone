@@ -50,7 +50,10 @@ enum class Fadvise : int { Auto = 0, None = 1, Random = 2, Normal = 3, Sequentia
 struct Config
 {
     Backend backend = Backend::Pread;
-    bool backend_named = false;         // EXL3_DISK_BACKEND named a backend (not unset / auto)
+    bool backend_named = false;         // EXL3_DISK_BACKEND named a backend (not unset, auto
+                                        // or original)
+    bool ngram_engine = false;          // ngram_gather_cpu uses the engine (a backend named, or
+                                        // auto when disk_auto.h says so); false: original pool
     bool direct_rows = false;           // rows bypass the page cache
     bool direct_extents = false;        // extents bypass the page cache
     int threads = 0;                    // pool workers
@@ -75,6 +78,8 @@ struct Config
     std::vector<int> affinity;          // CPUs for engine threads, empty = inherit
     Fadvise fadvise = Fadvise::Auto;
     bool extent_dontneed = true;        // drop buffered extent pages after the read
+    int keepalive_ms = 0;               // idle device: one small O_DIRECT read this often, 0 off
+    int keepalive_idle_s = 30;          // ... only this long after the engine's last submission
     bool verbose = false;
     int trace = 0;                      // trace ring entries, 0 = off
     // Fault injection (tests): one read attempt in N (a reproducible pseudo-random draw) fails
@@ -95,8 +100,14 @@ struct Config
 // knob and the accepted values.
 Config config_from_env(const Overrides& ov = Overrides());
 
-// EXL3_DISK_BACKEND names a backend (not unset / auto); throws Error on an invalid value
-bool backend_named_in_env();
+// Whether ngram_gather_cpu uses the engine, from EXL3_DISK_BACKEND alone: a named backend
+// yes, original no, unset or auto as disk_auto.h says. Throws Error on an invalid value
+bool ngram_engine_from_env();
+
+// What auto resolves to (disk_auto.h, written by the benchmark's decision rule)
+Backend auto_backend();
+bool auto_ngram_engine();
+int auto_keepalive_ms();
 
 // Windows: message for an EXL3_DISK_BACKEND the overlapped ReadFile gather cannot honour, or ""
 std::string windows_backend_refusal();
@@ -163,6 +174,7 @@ struct Stats
     uint64_t enters = 0;                // io_uring_enter calls that submitted
     uint64_t resubmits = 0;             // short reads, EAGAIN, EINTR resumed
     uint64_t stray_cqes = 0;            // completions with an unknown tag (must stay 0)
+    uint64_t keepalive_reads = 0;       // EXL3_DISK_KEEPALIVE_MS reads
     int64_t inflight_now = 0;
     int64_t queued_ops_now = 0;
     int64_t tickets_live = 0;
@@ -267,8 +279,9 @@ std::shared_ptr<Engine> default_engine_if_created();   // nullptr before first u
 std::shared_ptr<Engine> configure_default(const Overrides& ov);
 void shutdown_default();
 
-// ngram_gather_cpu runs on the engine only when EXL3_DISK_BACKEND names a backend (or
-// configure_default did); otherwise its original pool runs verbatim
+// ngram_gather_cpu runs on the engine when EXL3_DISK_BACKEND names a backend, or is unset / auto
+// and disk_auto.h routes auto to the engine (configure_default's overrides replace the
+// environment); otherwise its original pool runs verbatim
 bool ngram_route_engine();
 
 // Class used by ngram_gather_cpu calls from this thread (default kEngram)

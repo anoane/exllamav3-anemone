@@ -363,6 +363,47 @@ FileRef FileTable::acquire(int fd, bool want_direct, int advice, const Config& c
     return r;
 }
 
+bool FileTable::acquire_recent_direct(const Config& cfg, Executor* ex, FileRef* out)
+{
+    std::lock_guard<std::mutex> lk(mx);
+    FileEnt* e = nullptr;
+    for (auto& kv : map)
+    {
+        FileEnt* f = kv.second.get();
+        if (f->doomed || f->fd_buf < 0 || f->fd_dir == -2) continue;
+        if (!e || f->last_use > e->last_use) e = f;
+    }
+    if (!e) return false;
+    if (e->fd_dir == -1) open_direct(*e, cfg, ex);
+    if (e->fd_dir < 0) return false;                   // refused: another file next time
+    int64_t size = e->blk_size;
+    if (!e->is_blk)
+    {
+        struct stat st;
+        if (::fstat(e->fd_buf, &st) != 0) return false;
+        size = (int64_t) st.st_size;
+    }
+    if (size < (int64_t) e->off_align) return false;
+    e->refs.fetch_add(1, std::memory_order_acq_rel);
+    FileRef r;
+    r.ent = e;
+    r.size = size;
+    r.fd_buf = e->fd_buf;
+    r.fd_dir = e->fd_dir;
+    r.mem_align = e->mem_align;
+    r.off_align = e->off_align;
+    r.geom_align = e->geom_align;
+    r.chunk = e->chunk;
+    *out = r;
+    return true;
+}
+
+void FileTable::sweep_doomed(Executor* ex)
+{
+    std::lock_guard<std::mutex> lk(mx);
+    if (n_doomed > 0) sweep_locked(ex);
+}
+
 void FileTable::close_ent(FileEnt* e, Executor* ex)
 {
     if (ex) ex->file_closing(e);
@@ -727,6 +768,7 @@ void Core::finish_span(const Span& sp, int64_t now)
 void Core::complete_ticket(Ticket* t, int64_t now)
 {
     t->t_done = now;
+    last_io_ns.store(now, std::memory_order_relaxed);
     if (t->hold && --hold_pending == 0) hold_armed_until = 0;
     for (FileEnt* f : t->files) FileTable::unref(f);
     t->files.clear();
@@ -1225,8 +1267,124 @@ void check_not_forked(pid_t owner)
 
 }  // namespace
 
+static void stop_keepalive(Core& c)
+{
+    {
+        std::lock_guard<std::mutex> lk(c.ka_mx);
+        c.ka_stop = true;
+    }
+    c.ka_cv.notify_all();
+    if (c.ka_thread.joinable()) c.ka_thread.join();
+}
+
+// One small O_DIRECT read of the most recently used file (its first aligned block; the device
+// is all that needs waking, which block does not matter), unless the engine has reads in
+// flight or queued. It bypasses the scheduler: one block per period cannot crowd anything.
+static void keepalive_ping(Core& c, uint8_t* buf)
+{
+    {
+        std::lock_guard<std::mutex> lk(c.mx);
+        if (c.stopping || c.inflight_total > 0 || c.queued_ops > 0) return;
+    }
+    FileRef r;
+    if (!c.files.acquire_recent_direct(c.cfg, c.ex.get(), &r)) return;
+    size_t len = std::max<size_t>(512, r.off_align);   // off_align <= 65536: fits the buffer
+    ssize_t n;
+    do n = ::pread(r.fd_dir, buf, len, 0);
+    while (n < 0 && errno == EINTR);
+    FileTable::unref(r.ent);
+    c.files.sweep_doomed(c.ex.get());       // forgotten while this read held it: close it now
+    c.last_io_ns.store(now_ns(), std::memory_order_relaxed);
+    if (n >= 0) c.keepalive_reads.fetch_add(1, std::memory_order_relaxed);
+    // a failed read is not reported here: the next real read of the file reports its error
+}
+
+static void keepalive_loop(Core& c)
+{
+    set_thread_name("exl3-disk-ka");
+    set_thread_affinity(c.cfg.affinity, "keep-alive");
+    const int64_t period = (int64_t) c.cfg.keepalive_ms * 1000000;
+    const int64_t idle = (int64_t) c.cfg.keepalive_idle_s * 1000000000;
+    void* mem = nullptr;
+    if (::posix_memalign(&mem, 65536, 65536) != 0)
+    {
+        warn("EXL3_DISK_KEEPALIVE_MS: no memory for the read buffer; keep-alive off");
+        return;
+    }
+    std::unique_ptr<void, decltype(&std::free)> hold(mem, &std::free);
+    std::unique_lock<std::mutex> lk(c.ka_mx);
+    while (!c.ka_stop)
+    {
+        int64_t now = now_ns();
+        int64_t last = c.last_submit_ns.load();
+        if (last == 0 || now - last > idle)
+        {
+            // Nothing submitted lately: let the device sleep until the next submission, which
+            // clears ka_dormant. The stores to ka_dormant and last_submit_ns and the loads of
+            // the other are sequentially consistent on both sides, so a submission racing with
+            // this is seen by one of them.
+            c.ka_dormant.store(true);
+            last = c.last_submit_ns.load();
+            if (last != 0 && now_ns() - last <= idle)
+            {
+                c.ka_dormant.store(false);
+                continue;
+            }
+            c.ka_cv.wait(lk, [&] { return c.ka_stop || !c.ka_dormant.load(); });
+            continue;
+        }
+        int64_t since = now - c.last_io_ns.load(std::memory_order_relaxed);
+        if (since >= period)
+        {
+            lk.unlock();
+            keepalive_ping(c, static_cast<uint8_t*>(mem));
+            lk.lock();
+            since = 0;
+        }
+        c.ka_cv.wait_for(lk, std::chrono::nanoseconds(std::max<int64_t>(period - since, 100000)),
+                         [&] { return c.ka_stop; });
+    }
+}
+
+// Nothing may escape a std::thread (std::terminate): a failure (an allocation, opening the
+// O_DIRECT descriptor) turns the keep-alive off and leaves the engine as it was. The loop drops
+// every file reference before anything that can throw, and ka_mx is released by unwinding.
+static void keepalive_main(Core* cp)
+{
+    try
+    {
+        keepalive_loop(*cp);
+    }
+    catch (const std::exception& e)
+    {
+        std::fprintf(stderr, " !! disk engine: EXL3_DISK_KEEPALIVE_MS: %s; keep-alive off\n", e.what());
+    }
+    catch (...)
+    {
+        std::fprintf(stderr, " !! disk engine: EXL3_DISK_KEEPALIVE_MS: unknown error; keep-alive off\n");
+    }
+}
+
+// Every submission: stamp the clocks, and wake a dormant keep-alive
+static void keepalive_touch(Core& c)
+{
+    if (!c.cfg.keepalive_ms) return;
+    int64_t now = now_ns();
+    c.last_submit_ns.store(now);
+    c.last_io_ns.store(now, std::memory_order_relaxed);
+    if (c.ka_dormant.load())
+    {
+        {
+            std::lock_guard<std::mutex> lk(c.ka_mx);
+            c.ka_dormant.store(false);
+        }
+        c.ka_cv.notify_one();
+    }
+}
+
 static void shutdown_core(Core& c)
 {
+    stop_keepalive(c);
     {
         std::unique_lock<std::mutex> lk(c.mx);
         c.stopping = true;
@@ -1277,6 +1435,20 @@ Engine::Engine(const Config& cfg)
     if (cfg.verbose)
         std::printf(" -- disk engine: %s | %s\n", c.cfg.describe().c_str(),
                     c.ex->describe().c_str());
+    // Last: nothing after it can throw, so an unwinding constructor never destroys a joinable
+    // std::thread
+    if (cfg.keepalive_ms > 0)
+    {
+        try
+        {
+            c.ka_thread = std::thread(keepalive_main, &c);
+        }
+        catch (const std::exception& e)
+        {
+            std::fprintf(stderr, " !! disk engine: EXL3_DISK_KEEPALIVE_MS: cannot start the "
+                                 "thread (%s); keep-alive off\n", e.what());
+        }
+    }
 }
 
 Engine::~Engine()
@@ -1394,6 +1566,7 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
                                  bool will_wait)
 {
     check_usable(c);
+    keepalive_touch(c);
     if (n < 0 || (n > 0 && !uids)) throw Error(EINVAL, "disk engine: bad row id list");
     if (ntables < 1 || ntables > kMaxTables || !tables)
         throw Error(EINVAL, "disk engine: between 1 and " + std::to_string(kMaxTables) +
@@ -1477,6 +1650,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
                                     int64_t* payload_offsets, bool will_wait)
 {
     check_usable(c);
+    keepalive_touch(c);
     if (n < 0 || (n > 0 && !ex)) throw Error(EINVAL, "disk engine: bad extent list");
     std::unique_ptr<Ticket> t = new_ticket(o);
     RefGuard guard { t };
@@ -1818,10 +1992,12 @@ Stats Engine::stats(bool reset)
     s.inflight_now = c.inflight_total;
     s.queued_ops_now = c.queued_ops;
     s.tickets_live = (int64_t) c.tickets.size();
+    s.keepalive_reads = c.keepalive_reads.load();
     if (reset)
     {
         c.inline_reaped = c.reaper_reaped = c.resubmits = 0;
         c.enters.store(0);
+        c.keepalive_reads.store(0);
     }
     return s;
 }
@@ -1917,7 +2093,7 @@ std::shared_ptr<Engine> configure_default(const Overrides& ov)
         old = std::move(*g_engine);
         *g_engine = e;
         g_engine_pid = me;
-        g_route.store(cfg.backend_named ? 1 : 0);
+        g_route.store(cfg.ngram_engine ? 1 : 0);
     }
     old.reset();    // outside the lock: waits for the old engine's reads in flight
     return e;
@@ -1942,7 +2118,7 @@ bool ngram_route_engine()
     {
         // Only EXL3_DISK_BACKEND decides the route; the other knobs are read when the engine
         // is created
-        r = backend_named_in_env() ? 1 : 0;
+        r = ngram_engine_from_env() ? 1 : 0;
         int expected = -1;
         g_route.compare_exchange_strong(expected, r);
         r = g_route.load();
