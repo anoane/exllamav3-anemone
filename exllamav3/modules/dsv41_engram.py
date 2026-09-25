@@ -100,10 +100,6 @@ from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
 
 PREFETCH_ENABLED = os.environ.get("EXL3_DSV41_ENGRAM_PREFETCH", "1") != "0"   # A/B switch
-# EXL3_DISK_BACKEND naming a backend (doc/disk_engine.md) moves the row reads onto the disk
-# engine: one native call per layer for both tables, staged with a class (prefetch worker: 2;
-# inline at decode: 0, holding bulk reads back). Unset or auto: two ngram_gather_cpu calls
-DISK_ENGINE = os.environ.get("EXL3_DISK_BACKEND", "").strip().lower() not in ("", "auto")
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines: decode
                             # gathers are ~48 parallel preads, cheaper than the thread hop
 MAX_PIN_SETS = 2            # one with the last forward's uploads in flight, one being staged
@@ -112,6 +108,20 @@ PIN_MAX_ROWS = 24 * 4096    # largest pinned staging set kept: 25.5 MiB requeste
                             # the blocks a growing set gives up stay cached, page-locked);
                             # bigger chunks stage through a transient pageable set --
                             # page-locked memory cannot be swapped out, so it is kept small
+
+
+def _disk_engine() -> bool:
+    """
+    Whether the rows are read by the disk engine (doc/disk_engine.md): when EXL3_DISK_BACKEND
+    names a backend, or disk_engine_configure did, and only where the engine exists (not on
+    Windows, where ngram_gather_cpu keeps its overlapped path whatever the variable says).
+    The extension decides, as it does for ngram_gather_cpu; an invalid value raises here, at
+    the first gather. With the engine, one native call per layer reads both tables, with a
+    request class: the prefetch worker's look-ahead is class 2 until its forward waits for it
+    (then class 0); inline gathers are class 0, and decode-sized ones hold bulk reads back.
+    Otherwise: two ngram_gather_cpu calls.
+    """
+    return ext.disk_ngram_route() == "engine"
 
 
 class _PinSet:
@@ -125,6 +135,7 @@ class _PinSet:
         self.pinned = pinned
         self.cap = 0
         self.inv = self.w = self.s = None
+        self.outs = None
         self.event = None
         self.held = False
 
@@ -134,6 +145,7 @@ class _PinSet:
             self.inv = torch.empty(n, dtype = torch.long, pin_memory = p)
             self.w = torch.empty((n, row_bytes), dtype = torch.uint8, pin_memory = p)
             self.s = torch.empty((n, scale_bytes), dtype = torch.uint8, pin_memory = p)
+            self.outs = [self.w, self.s]    # disk_gather_rows' outputs: built once per growth
             self.cap = n
 
 
@@ -235,6 +247,7 @@ class DSV41Engram(Module):
         self.engram_ctx = None
         self._pins = []
         self._pending = []          # queued prefetches, oldest first: {"hist", "pin", "future"}
+        self._disk_argv = None      # (fds, offsets, row_bytes) for disk_gather_rows, per fd pair
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
 
     @property
@@ -336,6 +349,15 @@ class DSV41Engram(Module):
             self.engram_ctx.release(self)       # the last engram module stops the worker
         self.engram_ctx = None
         self.qk = None
+        for h in (self.w_handle, self.s_handle):
+            if h is not None:
+                # the disk engine keeps its own descriptors of the shards: let them go (a no-op
+                # without an engine; a shard another layer still reads is simply reopened)
+                try:
+                    ext.disk_engine_forget(h.filename)
+                except Exception:
+                    pass
+        self._disk_argv = None
         self.w_handle = self.s_handle = None
         self.q_weight = None
         self.k_weight = None
@@ -447,15 +469,27 @@ class DSV41Engram(Module):
 
     # ---- staging: hash + dedup + gather, inline or on the prefetch worker ----
 
-    def _fds(self):
+    def _fds(self, engine: bool | None = None):
+        if engine is None:
+            engine = _disk_engine()
         fds = []
         for h in (self.w_handle, self.s_handle):
             fd = h._ensure_open()           # stc.close() at the end of load closes it; reopen
-            if hasattr(os, "posix_fadvise") and not DISK_ENGINE:   # the engine advises its own
+            if hasattr(os, "posix_fadvise") and not engine:     # the engine advises its own
                 # 256-byte rows scattered over 91 GiB: readahead only evicts useful pages
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
             fds.append(fd)
         return fds
+
+    def _disk_args(self, fw: int, fs: int):
+        """disk_gather_rows' per-table lists, built once per descriptor pair (a reopen after
+        stc.close() may change the numbers)."""
+        a = self._disk_argv
+        if a is None or a[0][0] != fw or a[0][1] != fs:
+            a = self._disk_argv = ([fw, fs],
+                                   [self.w_handle.abs_offset, self.s_handle.abs_offset],
+                                   [self.w_handle.row_bytes, self.s_handle.row_bytes])
+        return a
 
     def _acquire_pin(self, n: int) -> _PinSet:
         """A staging set not held by a queued prefetch, grown to n rows."""
@@ -486,10 +520,12 @@ class DSV41Engram(Module):
 
     @torch.inference_mode()
     def _stage(self, hist: torch.Tensor, pin: _PinSet, measure: bool, fds = None,
-               cls: int = 0, hold: bool = False) -> int:
-        """Hash, dedup and gather one chunk into pin; returns the unique row count. Runs on
-        the prefetch worker or inline (inference mode is thread-local). cls / hold: the disk
-        engine's request class and hold rule (EXL3_DISK_BACKEND only)."""
+               cls: int = 0, hold: bool = False, wait: bool = True):
+        """Hash, dedup and gather one chunk into pin; returns (unique row count, ticket). Runs
+        on the prefetch worker or inline (inference mode is thread-local). cls / hold / wait:
+        the disk engine's request class, hold rule, and whether to wait for the rows; with
+        wait=False and the engine, ticket is the DiskTicket still reading them (else None),
+        which the consumer promotes, waits for and releases (_finish)."""
         if pin.event is not None:
             # the previous forward's non-blocking uploads read this set
             pin.event.synchronize()
@@ -503,7 +539,7 @@ class DSV41Engram(Module):
             torch.arange(n, out = pin.inv[:n])
             pin.w[:n].zero_()
             pin.s[:n].fill_(127)
-            return n
+            return n, None
         idx = engram_hash_chunk(hist, self.table_index, self.hasher)         # [B, L, 24]
         # numpy's unique: single-threaded, and bitwise the same sorted ids and inverse as
         # torch.unique, whose parallel sort shares the intra-op pool with everything else on
@@ -513,19 +549,31 @@ class DSV41Engram(Module):
         U, n = uids.numel(), inv.numel()
         pin.inv[:n].copy_(inv)
         if U:
-            fw, fs = fds if fds is not None else self._fds()
-            if DISK_ENGINE:
-                # rows land at row i of the whole staging tensors: no slicing in Python
-                ext.disk_gather_rows(uids, 0, [fw, fs],
-                                     [self.w_handle.abs_offset, self.s_handle.abs_offset],
-                                     [self.w_handle.row_bytes, self.s_handle.row_bytes],
-                                     [pin.w, pin.s], cls = cls, hold = hold)
-            else:
-                ext.ngram_gather_cpu(fw, self.w_handle.abs_offset, self.w_handle.row_bytes,
-                                     uids, 0, pin.w[:U])
-                ext.ngram_gather_cpu(fs, self.s_handle.abs_offset, self.s_handle.row_bytes,
-                                     uids, 0, pin.s[:U])
-        return U
+            engine = _disk_engine()
+            fw, fs = fds if fds is not None else self._fds(engine)
+            if engine:
+                # rows land at row i of the whole staging tensors: no slicing in Python, and
+                # positional arguments (pybind's keyword path costs ~1.5 us more per call)
+                fl, offs, rbs = self._disk_args(fw, fs)
+                t = ext.disk_gather_rows(uids, 0, fl, offs, rbs, pin.outs, cls, hold, wait)
+                return U, t
+            ext.ngram_gather_cpu(fw, self.w_handle.abs_offset, self.w_handle.row_bytes,
+                                 uids, 0, pin.w[:U])
+            ext.ngram_gather_cpu(fs, self.s_handle.abs_offset, self.s_handle.row_bytes,
+                                 uids, 0, pin.s[:U])
+        return U, None
+
+    @staticmethod
+    def _finish(ticket):
+        """The forward needs a staged chunk's rows now: whatever the look-ahead has not read
+        yet becomes class 0 (full depth, ahead of bulk), then wait and release."""
+        if ticket is None:
+            return
+        try:
+            ticket.promote(0)
+            ticket.wait()
+        finally:
+            ticket.release()                # cancels what is queued, waits out what is in flight
 
     def _match(self, hist: torch.Tensor) -> dict | None:
         for e in self._pending:
@@ -539,13 +587,16 @@ class DSV41Engram(Module):
 
     def _retire(self, entry: dict):
         # Drop a queued prefetch no forward will take. Its worker may still be writing the
-        # staging set, so wait it out unless it hasn't started
+        # staging set, so wait it out unless it hasn't started, and release its disk ticket
+        # (cancels the queued reads, waits for those in flight) before the set is reused
         self._forget(entry)
         self.prefetch_stats["retired"] += 1
         f = entry["future"]
         if not f.cancel():
             try:
-                f.result()
+                _, ticket = f.result()
+                if ticket is not None:
+                    ticket.release()
             except Exception:
                 pass
         entry["pin"].held = False
@@ -575,10 +626,13 @@ class DSV41Engram(Module):
             return
         pin = self._acquire_pin(hist.shape[0] * (hist.shape[1] - self.ctx) * self.layout.n_hash_cols)
         fds = self._fds()                   # lazy open isn't thread-safe; do it here
+        # class 2 without waiting: the rows are read while block 0 runs, behind any demand
+        # reads, and forward() promotes what is left to class 0 when it needs them
         self._pending.append({
             "hist": hist,
             "pin": pin,
-            "future": self.engram_ctx.executor.submit(self._stage, hist, pin, False, fds, 2),
+            "future": self.engram_ctx.executor.submit(self._stage, hist, pin, False, fds, 2,
+                                                      False, False),
         })
 
     # ---- forward ----
@@ -618,7 +672,8 @@ class DSV41Engram(Module):
             self.prefetch_stats["hit"] += 1
             pin = entry["pin"]
             try:
-                U = entry["future"].result()
+                U, ticket = entry["future"].result()
+                self._finish(ticket)
             except BaseException:
                 pin.held = False            # don't strand the set on a failed gather
                 raise
@@ -627,7 +682,7 @@ class DSV41Engram(Module):
             pin = self._acquire_pin(n)
             try:
                 # decode-sized: rows the next block needs now, bulk reads held back meanwhile
-                U = self._stage(hist, pin, measure, cls = 0, hold = B * L < PREFETCH_MIN_TOKENS)
+                U, _ = self._stage(hist, pin, measure, None, 0, B * L < PREFETCH_MIN_TOKENS)
             except BaseException:
                 pin.held = False
                 raise

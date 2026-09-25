@@ -171,12 +171,14 @@ def main(checkpoint_dir, dev):
               f"set(s) reused; a 64-token chunk is not prefetched")
 
         # ---- 4. autosplit measuring pass: no disk reads ----
+        # (a real forward gathers with two ngram_gather_cpu calls, or with one
+        # disk_gather_rows call where the extension routes the rows to the disk engine)
         calls = []
         real_ext = dm.ext
         class CountExt:
             def __getattr__(self, name):
                 f = getattr(real_ext, name)
-                if name == "ngram_gather_cpu":
+                if name in ("ngram_gather_cpu", "disk_gather_rows"):
                     def g(*a, _f = f):
                         calls.append(1); return _f(*a)
                     return g
@@ -189,7 +191,7 @@ def main(checkpoint_dir, dev):
             n_real = len(calls) - n_measure
         finally:
             dm.ext = real_ext
-        assert n_measure == 0 and n_real == 2, (n_measure, n_real)
+        assert n_measure == 0 and n_real == (1 if dm._disk_engine() else 2), (n_measure, n_real)
         print(f"  layer {idx}: autosplit measuring forward made {n_measure} gather calls (a real one: {n_real})")
 
         eg.wkv.forward = orig_fwd

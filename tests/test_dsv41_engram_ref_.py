@@ -174,7 +174,7 @@ def main(checkpoint_dir):
         n = hid.size
         pin = eg._acquire_pin(n)
         try:
-            U = eg._stage(hist, pin, False)
+            U, _ = eg._stage(hist, pin, False)
             w, s, inv = pin.w[:U].clone(), pin.s[:U].clone(), pin.inv[:n].clone()
         finally:
             pin.held = False
@@ -190,7 +190,7 @@ def main(checkpoint_dir):
         # the measuring forward stages the worst case instead: every n-gram its own row
         pin = eg._acquire_pin(n)
         try:
-            assert eg._stage(hist, pin, True) == n and torch.equal(pin.inv[:n], torch.arange(n))
+            assert eg._stage(hist, pin, True) == (n, None) and torch.equal(pin.inv[:n], torch.arange(n))
         finally:
             pin.held = False
         print(f"  OK  layer {eg.backbone_idx}: DSV41Engram.forward == EngramForward reference, rel-L2 "
