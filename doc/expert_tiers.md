@@ -626,7 +626,13 @@ expert). Nothing else is read after the load unless a decode or prefill call mis
 **Checked in the tests** (`tests/test_expert_tier_policy_.py`): nine micro-scenarios with every
 record, counter and final state; invariants after every call of 200 random configurations x 5,000
 calls; agreement with the policy simulator the defaults were chosen on; the adaptive rule on
-scripted cache lives, exactly.
+scripted cache lives, exactly. The native core (`tests/test_expert_tier_native_.py`) makes the
+same decisions as the reference on the micro-scenarios and 200 random configurations: the same
+records, actions, counters and final state, heat, random draws and the adaptive probability
+included; its standalone driver (`tests/expert_tier/build.sh`, `tier_policy_test`) checks the
+micro-scenarios and 10^6 random calls with every invariant and a mirror directory that applies
+the records (the tier thread's view of the lookup kernel's directory), under AddressSanitizer,
+UndefinedBehaviorSanitizer and ThreadSanitizer.
 
 ### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
 

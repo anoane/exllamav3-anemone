@@ -932,23 +932,39 @@ def round_robin_order(layers: int, experts: int, pinned: set | None = None) -> l
 
 def replay(core: TierCore, script: list) -> list:
     """
-    Run a script of operations on a core; returns [(record or None, actions)] per operation:
+    Run a script of operations on a core; returns [(record or None, actions)] per operation that
+    produces actions (call, layer, complete), in order:
       ("tick", n)                          a decode pass of n tokens began
-      ("call", lc, ids, mode)              lookup + host (mode DECODE or ROUTED)
+      ("call", lc, ids[, mode])            lookup + host (mode DECODE or ROUTED)
       ("layer", lc, ids)                   a layer-mode prefill call
       ("complete",)                        demotions in flight landed (defer_returns)
+    and the seeding operations (no output): ("place", key, slot, stamp), ("ram_add", key, dup,
+    slot, now), ("heat", key, value), ("seq", n), ("cold_fill", order), ("check", deterministic).
+    The native core's tier_policy_replay takes the same script.
     """
     out = []
     for op in script:
-        if op[0] == "tick":
+        name = op[0]
+        if name == "tick":
             core.tick(op[1])
-            out.append((None, []))
-        elif op[0] == "call":
+        elif name == "call":
             out.append(core.call(op[1], op[2], op[3] if len(op) > 3 else DECODE))
-        elif op[0] == "layer":
+        elif name == "layer":
             out.append((None, core.layer_call(op[1], op[2])))
-        elif op[0] == "complete":
+        elif name == "complete":
             out.append((None, core.complete()))
+        elif name == "place":
+            core.vram.place(op[1], op[2], op[3])
+        elif name == "ram_add":
+            core.ram.add(op[1], bool(op[2]), op[4], op[3])
+        elif name == "heat":
+            core.heat.set(op[1], op[2])
+        elif name == "seq":
+            core.seq = op[1]
+        elif name == "cold_fill":
+            core.cold_fill(op[1])
+        elif name == "check":
+            core.check(bool(op[1]))
         else:
-            raise ValueError(f"replay: unknown operation {op[0]!r}")
+            raise ValueError(f"replay: unknown operation {name!r}")
     return out
