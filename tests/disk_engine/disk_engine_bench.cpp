@@ -6,15 +6,18 @@
 //                     [--backends pread,odirect,io_uring] [--direct auto|none|rows|extents|all]
 //                     [--pattern rows|extents|mixed|all] [--batch 48,96,8192] [--tables 2]
 //                     [--iters N] [--extent-bytes 13315596] [--inflight 1,2,4,8]
-//                     [--cold] [--max-gb G] [--set knob=value ...]
+//                     [--mixed-bulk extents,rows] [--cold] [--max-gb G] [--set knob=value ...]
 //
 // rows     one call per batch: U unique random rows of every table (--tables 2: a 256-byte and
 //          an 8-byte table 1 GiB apart, like one DeepSeek-V4.1 engram layer), latency from
 //          submit to completion
 // extents  N contiguous extents per call, all in flight at once, unaligned offsets
-// mixed    decode row batches (class 0, hold, armed 0.5 ms ahead) every 2 ms while a second
-//          thread streams extents 4 deep (class 1 demand or class 2 prefetch); row latency with
-//          and without it (with --cold the rows are dropped from the page cache first)
+// mixed    decode row batches (class 0, hold, armed 0.5 ms ahead; --tables 2: both engram
+//          tables) every 2 ms while a second thread runs bulk: `extents` streams extents 4 deep
+//          (class 1 demand or class 2 prefetch; buffered with --direct none), `rows` makes
+//          synchronous 8192-row class-2 gathers of both tables (a prefetch worker staging
+//          prefill rows, warm unless --cold); row latency with and without it (with --cold the
+//          rows are dropped from the page cache first)
 //
 // --cold drops the file's pages before every call (posix_fadvise DONTNEED): only for a file this
 // run created (--scratch), never for model shards. --max-gb bounds the bytes read per case.
@@ -95,6 +98,7 @@ struct Args
     int iters = 200;
     int64_t extent_bytes = 13315596;
     std::vector<int64_t> inflight = { 1, 2, 4, 8 };
+    std::vector<std::string> mixed_bulk = { "extents" };
     bool cold = false;
     double max_gb = 4.0;
     Overrides extra;
@@ -215,8 +219,9 @@ void bench_extents(Ctx& c, Engine& e, const char* backend)
     }
 }
 
-// Row batches every 2 ms (class 0, hold) with and without an extent stream in another thread
-void bench_mixed(Ctx& c, Engine& e, const char* backend, int bulk_cls)
+// Row batches every 2 ms (class 0, hold) with and without bulk in another thread: an extent
+// stream (bulk_rows false) or synchronous 8192-row class-2 gathers (bulk_rows true)
+void bench_mixed(Ctx& c, Engine& e, const char* backend, int bulk_cls, bool bulk_rows)
 {
     int64_t L = c.a.extent_bytes;
     int64_t slot = ((4095 + L) / 4096 + 1) * 4096;
@@ -224,14 +229,37 @@ void bench_mixed(Ctx& c, Engine& e, const char* backend, int bulk_cls)
     void* mem = nullptr;
     if (posix_memalign(&mem, 4096, (size_t) (slot * depth)) != 0) std::abort();
     std::memset(mem, 0, (size_t) (slot * depth));
-    int64_t rows = (c.size - 664) / 256;
+    int64_t t1_base = std::min<int64_t>(1ll << 30, c.size / 2);
+    int64_t rows = std::min((t1_base - 664) / 256, (c.size - t1_base) / 8);
+    const int tables = std::max(1, std::min(2, c.a.tables));
     for (int with_bulk = 0; with_bulk < 2; ++with_bulk)
     {
         std::atomic<bool> stop { false };
         std::atomic<int64_t> bulk_bytes { 0 };
         std::thread bulk;
         int64_t tb0 = now_ns();
-        if (with_bulk)
+        if (with_bulk && bulk_rows)
+            bulk = std::thread([&]
+            {
+                std::mt19937_64 rng(5);
+                std::uniform_int_distribution<int64_t> d(0, rows - 1);
+                std::vector<uint8_t> w((size_t) 8192 * 256), s8((size_t) 8192 * 8);
+                while (!stop.load())
+                {
+                    std::vector<int64_t> ids(8192);
+                    for (auto& x : ids) x = d(rng);
+                    std::sort(ids.begin(), ids.end());
+                    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                    RowTable tb[2] = { { c.fd, 664, 256, w.data(), (int64_t) w.size() },
+                                       { c.fd, t1_base, 8, s8.data(), (int64_t) s8.size() } };
+                    Options o;
+                    o.cls = kPrefetch;
+                    int r = e.gather_rows(ids.data(), (int64_t) ids.size(), 0, tb, 2, o);
+                    if (r != 0) std::fprintf(stderr, "bulk rows error %d\n", r);
+                    bulk_bytes.fetch_add((int64_t) ids.size() * 264);
+                }
+            });
+        else if (with_bulk)
             bulk = std::thread([&]
             {
                 std::mt19937_64 rng(3);
@@ -256,10 +284,11 @@ void bench_mixed(Ctx& c, Engine& e, const char* backend, int bulk_cls)
                 for (TicketId id : q) e.release(id);
             });
         std::this_thread::sleep_for(std::chrono::milliseconds(with_bulk ? 20 : 0));
-        std::mt19937_64 rng(4 + (uint64_t) with_bulk * 1000 + (uint64_t) bulk_cls * 77);  // fresh rows
+        std::mt19937_64 rng(4 + (uint64_t) with_bulk * 1000 + (uint64_t) bulk_cls * 77 +
+                            (bulk_rows ? 333u : 0u));                                      // fresh rows
         std::uniform_int_distribution<int64_t> d(0, rows - 1);
         std::vector<int64_t> lat;
-        std::vector<uint8_t> w(48 * 256);
+        std::vector<uint8_t> w(48 * 256), s8(48 * 8);
         int iters = std::min(c.a.iters, 400);
         for (int it = 0; it < iters; ++it)
         {
@@ -267,7 +296,8 @@ void bench_mixed(Ctx& c, Engine& e, const char* backend, int bulk_cls)
             for (auto& x : ids) x = d(rng);
             std::sort(ids.begin(), ids.end());
             ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-            RowTable tb { c.fd, 664, 256, w.data(), (int64_t) w.size() };
+            RowTable tb[2] = { { c.fd, 664, 256, w.data(), (int64_t) w.size() },
+                               { c.fd, t1_base, 8, s8.data(), (int64_t) s8.size() } };
             Options o;
             o.cls = kEngram;
             o.hold = true;
@@ -275,15 +305,18 @@ void bench_mixed(Ctx& c, Engine& e, const char* backend, int bulk_cls)
             e.arm_hold();
             std::this_thread::sleep_for(std::chrono::microseconds(500));   // sampling time
             int64_t t0 = now_ns();
-            (void) e.gather_rows(ids.data(), (int64_t) ids.size(), 0, &tb, 1, o);
+            (void) e.gather_rows(ids.data(), (int64_t) ids.size(), 0, tb, tables, o);
             lat.push_back(now_ns() - t0);
             std::this_thread::sleep_for(std::chrono::microseconds(1500));
         }
         stop.store(true);
         if (bulk.joinable()) bulk.join();
         double secs = (double) (now_ns() - tb0) / 1e9;
-        std::string shape = std::string(with_bulk ? "rows 48 + bulk" : "rows 48 alone") +
-                            (with_bulk ? (bulk_cls == kExpert ? " (cls 1)" : " (cls 2)") : "");
+        std::string shape = std::string(with_bulk ? "rows 48 + " : "rows 48 alone") +
+                            (with_bulk ? (bulk_rows ? "8192-row gathers (cls 2)"
+                                                    : bulk_cls == kExpert ? "extents (cls 1)"
+                                                                          : "extents (cls 2)")
+                                       : "");
         emit(backend, "mixed", shape, (int64_t) lat.size(), secs,
              with_bulk ? (double) bulk_bytes.load() / 1e9 : 0.0, with_bulk ? "GB/s" : "-",
              pct(lat));
@@ -313,6 +346,7 @@ int main(int argc, char** argv)
         else if (k == "--iters") a.iters = std::atoi(val().c_str());
         else if (k == "--extent-bytes") a.extent_bytes = std::atoll(val().c_str());
         else if (k == "--inflight") a.inflight = ints();
+        else if (k == "--mixed-bulk") a.mixed_bulk = split(val(), ',');
         else if (k == "--cold") a.cold = true;
         else if (k == "--max-gb") a.max_gb = std::atof(val().c_str());
         else if (k == "--set")
@@ -377,8 +411,15 @@ int main(int argc, char** argv)
         if (a.pattern == "extents" || a.pattern == "all") bench_extents(c, e, b.c_str());
         if (a.pattern == "mixed" || a.pattern == "all")
         {
-            bench_mixed(c, e, b.c_str(), kExpert);
-            bench_mixed(c, e, b.c_str(), kPrefetch);
+            for (const std::string& mb : a.mixed_bulk)
+            {
+                if (mb == "rows") bench_mixed(c, e, b.c_str(), kPrefetch, true);
+                else
+                {
+                    bench_mixed(c, e, b.c_str(), kExpert, false);
+                    bench_mixed(c, e, b.c_str(), kPrefetch, false);
+                }
+            }
         }
     }
     ::close(c.fd);

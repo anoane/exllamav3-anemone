@@ -84,6 +84,8 @@ struct Config
     int fault_eintr = 0;
     int fault_delay_us = 0;
     bool fault_no_uring = false;        // io_uring_setup "fails": the thread-pool fallback runs
+    int fault_enter_fatal = 0;          // the Nth submitting io_uring_enter fails with EBADFD
+    bool fault_force_iopoll = false;    // every device counts as able to poll (IOPOLL ring runs)
     std::vector<std::string> notes;     // knobs that do not apply to the chosen backend
 
     std::string describe() const;
@@ -126,7 +128,8 @@ struct ExtentGeom
 struct Options
 {
     int cls = kEngram;
-    bool hold = false;                  // classes 2-3 use their lo window until this completes
+    bool hold = false;                  // classes 2-3 use their lo window until this completes;
+                                        // only for classes 0 and 1 (EINVAL otherwise)
     int64_t deadline_ns = 0;            // class 2 order (CLOCK_MONOTONIC), 0 = after deadlines
     uint32_t* flag = nullptr;           // set to flag_value (release) when the ticket completes
     uint32_t flag_value = 0;
@@ -212,10 +215,13 @@ public:
 
     // Wait until the ticket completed: 0, the first error (-errno, -ECANCELED when cancelled),
     // or -ETIMEDOUT when timeout_ns (>= 0) passed first. The ticket stays valid either way.
+    // Any number of threads may wait for one ticket, also while another releases it.
     int wait(TicketId id, int64_t timeout_ns = -1);
     bool done(TicketId id);
     TicketTimes times(TicketId id);
-    // Cancel queued ops, wait for ops in flight, forget the ticket. No read lands after this.
+    // Cancel queued ops, wait for ops in flight and for every thread still inside wait() on
+    // this ticket, forget the ticket. No read lands after this. Concurrent releases of one
+    // ticket all return after it completed; releasing an unknown ticket does nothing.
     void release(TicketId id);
     void cancel(TicketId id);
     void promote(TicketId id, int cls);
@@ -235,6 +241,14 @@ public:
     int register_buffer(void* p, size_t n);
     void unregister_buffer(int idx);
 
+    // Close the engine's own descriptors of a file (the caller's descriptor, or a path), so an
+    // unloaded or deleted model file no longer stays open. Returns 1 when they were closed, 0
+    // when the engine had no such file open, -1 when tickets still read it: it is then closed
+    // as soon as it is idle. A later read of the file simply reopens it. Files whose last name
+    // was removed are also closed on their own once idle (checked every few submissions).
+    int forget(int fd);
+    int forget_path(const std::string& path);
+
     Stats stats(bool reset);
     std::vector<TraceRec> trace(bool clear);
     const Config& config() const;
@@ -249,6 +263,7 @@ private:
 // destroyed at exit (like the original gather pool). configure_default replaces it (tests,
 // benchmarks); a replaced engine lives on until its last ticket is released.
 std::shared_ptr<Engine> default_engine();
+std::shared_ptr<Engine> default_engine_if_created();   // nullptr before first use; never creates
 std::shared_ptr<Engine> configure_default(const Overrides& ov);
 void shutdown_default();
 

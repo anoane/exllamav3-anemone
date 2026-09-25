@@ -12,8 +12,12 @@
 //
 // io_uring request ownership: a read is owned by the thread whose io_uring_enter submitted
 // it, and a buffered read whose owner exited before it completed fails (EFAULT). So a caller
-// thread only ever submits reads of the ticket it is waiting for (without a timeout); every
-// other read is submitted by the reaper, which lives as long as the ring.
+// thread only ever submits reads of the class-0 ticket it is waiting for (without a timeout),
+// and only when the submission lock is free; every other read is submitted by the reaper,
+// which lives as long as the ring.
+//
+// Ticket lifetime: a Ticket is destroyed only by Engine::release, after it completed and after
+// every thread inside Engine::wait / Engine::release for it has left (Ticket::waiters).
 
 #if defined(__linux__)
 
@@ -44,6 +48,10 @@ constexpr int kSpanMax = 256;           // pool: ops per span
 constexpr int64_t kMaxOpBytes = 1ll << 30;
 constexpr int kMaxTables = 64;
 constexpr int kMaxUserBuffers = 64;     // io_uring buffer table (index 0 = bounce arena)
+// Largest file offset a read may end at: every rounding the engine does (O_DIRECT alignment,
+// slot geometry) adds less than 64 KiB, so nothing past this can overflow int64_t
+constexpr int64_t kMaxFileEnd = INT64_MAX - (1ll << 20);
+constexpr int64_t kMaxExtentBytes = 1ll << 40;
 
 // One file, as the engine holds it: its own descriptors, never the caller's
 struct FileEnt
@@ -69,6 +77,7 @@ struct FileEnt
     int advice = -1;                    // posix_fadvise applied to fd_buf, -1 none yet
     std::atomic<int64_t> refs { 0 };    // unfinished tickets referencing this file
     uint64_t last_use = 0;
+    bool doomed = false;                // forget() while busy: close once idle (FileTable::mx)
 };
 
 // What a submission needs from a file, copied under FileTable::mx
@@ -96,9 +105,12 @@ public:
     static void unref(FileEnt* e) { e->refs.fetch_sub(1, std::memory_order_acq_rel); }
     void close_all(Executor* ex);
     int64_t size();
+    // Close the file (dev, ino): 1 closed, 0 not open, -1 busy (closed once idle)
+    int forget(dev_t dev, ino_t ino, Executor* ex);
 
 private:
     void evict_locked(Executor* ex);
+    void sweep_locked(Executor* ex);    // close idle files that were forgotten or unlinked
     void close_ent(FileEnt* e, Executor* ex);
 
     struct Key
@@ -117,6 +129,8 @@ private:
     std::mutex mx;
     std::unordered_map<Key, std::unique_ptr<FileEnt>, KeyHash> map;
     uint64_t clock = 0;
+    size_t n_doomed = 0;
+    std::vector<dev_t> poll_refused;    // devices the IOPOLL refusal was reported for
 };
 
 struct Ticket;
@@ -152,6 +166,15 @@ struct Op
     int64_t t_issue = 0, t_done = 0;
 };
 
+// A destination range of a ticket's ops [op_begin, op_end) (a row table's output, an extent's
+// slot), looked up once in the registered buffers instead of per op
+struct DstRange
+{
+    size_t op_begin = 0, op_end = 0;
+    const uint8_t* p = nullptr;
+    size_t n = 0;
+};
+
 struct Ticket
 {
     uint64_t id = 0;
@@ -168,6 +191,9 @@ struct Ticket
     int err = 0;                        // first error, -errno
     std::vector<FileEnt*> files;        // unique files, one ref each
     std::vector<int> buffers;           // io_uring registered buffers, one ref each
+    std::vector<DstRange> dst;          // destination ranges (registered-buffer lookup)
+    int waiters = 0;                    // threads inside Engine::wait / release (Core::mx)
+    bool releasing = false;             // an Engine::release owns its destruction (Core::mx)
     int64_t t_submit = 0, t_first_issue = 0, t_done = 0, t_queued = 0;
     std::atomic<bool> complete { false };
     std::condition_variable cv;
@@ -272,7 +298,7 @@ public:
     // to the front of t->ops and returns how many there are
     virtual size_t prepass(Ticket*) { return 0; }
     // No locks held, after a ticket was queued (t) or a rule changed (t == nullptr).
-    // will_wait: this thread waits for t right away, without a timeout
+    // will_wait: this thread waits for t right away, without a timeout, and t is class 0
     virtual void submitted(Ticket* t, bool will_wait) = 0;
     // Core::mx held on entry and exit: wait for t (helping where the backend can). Returns
     // false when deadline_ns (>= 0) passed first
@@ -286,6 +312,7 @@ public:
     virtual int register_buffer(void*, size_t) { return -1; }
     virtual void unregister_buffer(int) {}
     virtual int find_buffer(const uint8_t*, size_t) { return -1; }   // Core::mx held
+    virtual int user_buffers() const { return 0; }                    // Core::mx held
     virtual void buffer_ref(int, int) {}                              // Core::mx held
     virtual bool direct_bounce_ok() const { return true; }
     virtual std::string describe() const = 0;

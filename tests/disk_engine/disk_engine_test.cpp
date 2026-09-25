@@ -29,10 +29,35 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__SANITIZE_THREAD__)
+#define EXL3_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define EXL3_TEST_TSAN 1
+#endif
+#endif
+#ifndef EXL3_TEST_TSAN
+#define EXL3_TEST_TSAN 0
+#endif
+
+// GCC's AddressSanitizer runtime (GCC 13's libasan) does not take its allocator's locks around
+// fork(). A child that allocates can then block forever on a lock that one of the parent's
+// other threads held at the fork: fork-default hung in about half of the GCC 13 ASan runs, and
+// every hung child sat in the sanitizer's own allocator lock (SizeClassAllocator64 ->
+// Mutex::Lock, from operator new), never in the engine. Clang's runtime takes those locks
+// around fork (clang 19: 20 of 20 runs clean), so the test runs under clang's ASan
+// (CXX=clang++ tests/disk_engine/build.sh).
+#if defined(__SANITIZE_ADDRESS__) && !defined(__clang__)
+#define EXL3_TEST_GCC_ASAN 1
+#else
+#define EXL3_TEST_GCC_ASAN 0
+#endif
 
 using namespace exl3_disk;
 
@@ -174,6 +199,126 @@ int count_fds()
     while (dirent* e = readdir(d)) if (e->d_name[0] != '.') ++n;
     closedir(d);
     return n;
+}
+
+// Descriptors of this process whose target contains `needle` (e.g. a path, "(deleted)")
+int count_fds_to(const std::string& needle)
+{
+    int n = 0;
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    while (dirent* e = readdir(d))
+    {
+        if (e->d_name[0] == '.') continue;
+        char link[600], target[600];
+        std::snprintf(link, sizeof link, "/proc/self/fd/%s", e->d_name);
+        ssize_t k = ::readlink(link, target, sizeof target - 1);
+        if (k <= 0) continue;
+        target[k] = '\0';
+        if (std::strstr(target, needle.c_str())) ++n;
+    }
+    closedir(d);
+    return n;
+}
+
+// Threads of this process named exactly `name` (comm), as tids
+std::vector<int> threads_named(const char* name)
+{
+    std::vector<int> v;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return v;
+    while (dirent* e = readdir(d))
+    {
+        if (e->d_name[0] == '.') continue;
+        std::string p = std::string("/proc/self/task/") + e->d_name + "/comm";
+        FILE* f = std::fopen(p.c_str(), "r");
+        if (!f) continue;
+        char buf[64] = {};
+        if (std::fgets(buf, sizeof buf, f))
+        {
+            size_t l = std::strlen(buf);
+            if (l && buf[l - 1] == '\n') buf[l - 1] = '\0';
+            if (std::strcmp(buf, name) == 0) v.push_back(std::atoi(e->d_name));
+        }
+        std::fclose(f);
+    }
+    closedir(d);
+    return v;
+}
+
+// A thread named `name` that is not in `before` (threads name themselves when they start)
+int new_thread_named(const char* name, const std::vector<int>& before)
+{
+    for (int i = 0; i < 1000; ++i)
+    {
+        for (int t : threads_named(name))
+            if (std::find(before.begin(), before.end(), t) == before.end()) return t;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return 0;
+}
+
+// utime + stime of a thread of this process, in clock ticks (-1 if it is gone)
+long thread_ticks(int tid)
+{
+    std::string p = "/proc/self/task/" + std::to_string(tid) + "/stat";
+    FILE* f = std::fopen(p.c_str(), "r");
+    if (!f) return -1;
+    char buf[1024] = {};
+    size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    const char* q = std::strrchr(buf, ')');      // comm may hold spaces
+    if (!q) return -1;
+    long ut = 0, st = 0;
+    // after ")": state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+    if (std::sscanf(q + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %ld %ld", &ut, &st) != 2)
+        return -1;
+    return ut + st;
+}
+
+std::string task_status_field(int tid, const char* field)
+{
+    std::string p = "/proc/self/task/" + std::to_string(tid) + "/status";
+    FILE* f = std::fopen(p.c_str(), "r");
+    if (!f) return "";
+    char line[512];
+    std::string r;
+    size_t fl = std::strlen(field);
+    while (std::fgets(line, sizeof line, f))
+        if (std::strncmp(line, field, fl) == 0 && line[fl] == ':')
+        {
+            const char* v = line + fl + 1;
+            while (*v == ' ' || *v == '\t') ++v;
+            r = v;
+            while (!r.empty() && (r.back() == '\n' || r.back() == ' ')) r.pop_back();
+            break;
+        }
+    std::fclose(f);
+    return r;
+}
+
+// The extent slot geometry the engine must use for a file: G = max(4096, O_DIRECT offset
+// alignment), the alignment from EXL3_DISK_ALIGN or, like the engine, statx
+int64_t geom_of(const Engine& e, int fd)
+{
+    int64_t a = e.config().align;
+    if (!a)
+    {
+        a = 4096;
+#ifdef STATX_DIOALIGN
+        struct statx sx;
+        std::memset(&sx, 0, sizeof sx);
+        if (::statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 &&
+            (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align &&
+            !(sx.stx_dio_offset_align & (sx.stx_dio_offset_align - 1)) &&
+            sx.stx_dio_offset_align <= 65536 && sx.stx_dio_mem_align <= 65536)
+            a = sx.stx_dio_offset_align;
+#else
+        (void) fd;
+#endif
+    }
+    return std::max<int64_t>(4096, a);
 }
 
 // ---- row gathers -----------------------------------------------------------------------------
@@ -353,8 +498,13 @@ void check_extents(Engine& e, File& f, std::mt19937_64& rng, int n, int cls, con
         if (i == 0 && eof) x.off = f.size - x.len;             // ends exactly at EOF
         if (i == 1 && !eof) x.off = 0;
         x.g = e.extent_geometry(f.fd, x.off, x.len);
-        CHECK(x.g.payload_offset == (x.off & 4095), "%s: payload offset %lld for %lld", what,
-              (long long) x.g.payload_offset, (long long) x.off);
+        const int64_t G = geom_of(e, f.fd);
+        CHECK(x.g.payload_offset == (x.off & (G - 1)), "%s: payload offset %lld for %lld (G %lld)",
+              what, (long long) x.g.payload_offset, (long long) x.off, (long long) G);
+        CHECK(x.g.span_bytes % G == 0 && x.g.span_bytes >= x.g.payload_offset + x.len &&
+              x.g.span_bytes - (x.g.payload_offset + x.len) < G,
+              "%s: span %lld for payload %lld + %lld (G %lld)", what, (long long) x.g.span_bytes,
+              (long long) x.g.payload_offset, (long long) x.len, (long long) G);
         x.slot.reset(new Guarded((size_t) x.g.span_bytes, 4096));
         xs.push_back(std::move(x));
     }
@@ -639,7 +789,7 @@ void test_hold(const Overrides& base, File& big, const char* what)
     ov["hold_arm_ms"] = "200";
     ov["chunk"] = "256K";
     Engine e(cfg_of(ov));
-    Guarded bulk(40 << 20);
+    Guarded bulk((40 << 20) + (1 << 16));     // + the largest slot geometry (G <= 64 KiB)
     ExtentReq xb { big.fd, 4096, 40 << 20, bulk.p, (int64_t) bulk.n };
     if (xb.offset + xb.length > big.size) xb.length = big.size - xb.offset - 4096;
     Options ob;
@@ -726,15 +876,17 @@ void test_windows(const Overrides& base, File& big, const char* what)
     e.release(b);
 }
 
-// Queued work: a ticket that can never be admitted (window 0) times out, is promoted, completes;
-// another is cancelled; refill ages into prefetch
+// Queued work: a ticket that is not admitted (class 3 under an armed hold: lo window 0) times
+// out, is promoted, completes; another is cancelled; refill ages into prefetch
 void test_queue_ops(const Overrides& base, File& big, const char* what)
 {
     {
         Overrides ov = base;
-        ov["window_refill"] = "0/0";
+        ov["window_refill"] = "8M/0";
         ov["refill_age_ms"] = "0";
+        ov["hold_arm_ms"] = "10000";
         Engine e(cfg_of(ov));
+        e.arm_hold();                       // classes 2-3 held for 10 s (no hold ticket follows)
         Guarded g(4 << 20);
         ExtentReq x { big.fd, 777, 3 << 20, g.p, (int64_t) g.n };
         Options o;
@@ -762,10 +914,12 @@ void test_queue_ops(const Overrides& base, File& big, const char* what)
     }
     {
         Overrides ov = base;
-        ov["window_refill"] = "0/0";
+        ov["window_refill"] = "8M/0";
         ov["window_prefetch"] = "inf/inf";
         ov["refill_age_ms"] = "40";
+        ov["hold_arm_ms"] = "10000";
         Engine e(cfg_of(ov));
+        e.arm_hold();                       // class 3 held; once aged, class 2 (lo inf) is not
         Guarded g(4 << 20);
         ExtentReq x { big.fd, 0, 2 << 20, g.p, (int64_t) g.n };
         Options o;
@@ -831,9 +985,11 @@ void test_truncate(const Overrides& base, const char* what)
 {
     File f = make_file("trunc.bin", 8 << 20, 99);
     Overrides ov = base;
-    ov["window_refill"] = "0/0";
+    ov["window_refill"] = "8M/0";
     ov["refill_age_ms"] = "0";
+    ov["hold_arm_ms"] = "10000";
     Engine e(cfg_of(ov));
+    e.arm_hold();                           // class 3 stays queued until promoted
     Guarded g(8 << 20);
     ExtentReq x { f.fd, 4096, 6 << 20, g.p, (int64_t) g.n };
     Options o;
@@ -950,6 +1106,24 @@ void test_registered(const Overrides& base, File& big, const char* what)
         CHECK(std::memcmp(ref.data(), region.p + slot_off + pay, (size_t) len) == 0,
               "%s: READ_FIXED data", what);
     }
+    // rows whose whole output lies in the registered region
+    {
+        std::vector<int64_t> ids;
+        for (int i = 0; i < 300; ++i) ids.push_back((int64_t) i * 131);
+        uint8_t* out = region.p + (24 << 20);
+        RowTable t { big.fd, 77, 256, out, (int64_t) ids.size() * 256 };
+        Options o;
+        CHECK(e.gather_rows(ids.data(), (int64_t) ids.size(), 0, &t, 1, o) == 0,
+              "%s: rows into a registered buffer", what);
+        std::vector<uint8_t> ref(256);
+        bool ok = true;
+        for (size_t i = 0; i < ids.size() && ok; ++i)
+        {
+            ref_read(big.fd, 77 + ids[i] * 256, 256, ref.data());
+            ok = std::memcmp(ref.data(), out + i * 256, 256) == 0;
+        }
+        CHECK(ok, "%s: rows into a registered buffer differ", what);
+    }
     CHECK(region.guards_ok(), "%s: registered region guards", what);
     e.unregister_buffer(idx);
     CHECK(expect_error([&] { e.unregister_buffer(idx); }) == EINVAL, "%s: double unregister", what);
@@ -985,6 +1159,472 @@ void test_fork(const Overrides& base, File& big, const char* what)
     CHECK(e.gather_rows(ids, 1, 0, &t, 1, o) == 0, "%s: parent after fork", what);
 }
 
+
+// ---- lifetimes and races -------------------------------------------------------------------------
+
+// wait() on one thread while another releases the ticket; two releases at once; several waiters.
+// Every wait returns the ticket's result, or ENOENT when the release finished first; nothing is
+// read after it was freed (ASan), nothing races (TSan)
+void test_release_race(const Overrides& base, File& big, const char* what)
+{
+    Overrides ov = base;
+    if (ov["backend"] != "io_uring" || ov.count("fault_no_uring")) ov["fault_delay_us"] = "3000";
+    Engine e(cfg_of(ov));
+    Guarded g(9 << 20);
+    std::mt19937_64 rng(g_seed + 21);
+    for (int round = 0; round < (g_quick ? 6 : 20); ++round)
+    {
+        (void) ::posix_fadvise(big.fd, 0, 0, POSIX_FADV_DONTNEED);
+        int64_t len = 8 << 20;
+        int64_t off = (int64_t) (rng() % (uint64_t) (big.size - len));
+        ExtentReq x { big.fd, off, len, g.p, (int64_t) g.n };
+        Options o;
+        o.cls = kExpert;
+        TicketId id = e.submit_extents(&x, 1, o, nullptr);
+        int kind = round % 3;               // 0: wait + release, 1: two releases + wait, 2: 4 waiters
+        std::atomic<int> go { 0 };
+        std::atomic<int> bad { 0 };
+        std::vector<std::thread> th;
+        int nwait = kind == 2 ? 4 : 1;
+        for (int k = 0; k < nwait; ++k)
+            th.emplace_back([&]
+            {
+                while (!go.load()) std::this_thread::yield();
+                try
+                {
+                    int r = e.wait(id, kWait);
+                    if (r != 0 && r != -ECANCELED) bad.fetch_add(1);
+                }
+                catch (const Error& err)
+                {
+                    if (err.code() != ENOENT) bad.fetch_add(1);
+                }
+            });
+        int nrel = kind == 1 ? 2 : 1;
+        for (int k = 0; k < nrel; ++k)
+            th.emplace_back([&]
+            {
+                while (!go.load()) std::this_thread::yield();
+                e.release(id);
+            });
+        go.store(1);
+        for (auto& t : th) t.join();
+        CHECK(bad.load() == 0, "%s: round %d: a waiter saw a wrong result", what, round);
+        CHECK(expect_error([&] { e.wait(id, 0); }) == ENOENT, "%s: ticket still known", what);
+        CHECK(g.guards_ok(), "%s: guards", what);
+    }
+    Stats s = e.stats(false);
+    CHECK(s.tickets_live == 0 && s.inflight_now == 0, "%s: %lld tickets live, %lld in flight",
+          what, (long long) s.tickets_live, (long long) s.inflight_now);
+}
+
+// A hold ticket of class 2 or 3 would be held by its own rule: refused
+void test_hold_class(const Overrides& base, File& big, const char* what)
+{
+    Engine e(cfg_of(base));
+    uint8_t out[64];
+    int64_t ids[1] = { 3 };
+    RowTable t { big.fd, 0, 64, out, 64 };
+    for (int cls = 0; cls < kClasses; ++cls)
+    {
+        Options o;
+        o.cls = cls;
+        o.hold = true;
+        if (cls >= kPrefetch)
+        {
+            CHECK(expect_error([&] { e.submit_rows(ids, 1, 0, &t, 1, o); }) == EINVAL,
+                  "%s: hold with class %d accepted", what, cls);
+            Guarded g(8192);
+            ExtentReq x { big.fd, 0, 100, g.p, 8192 };
+            CHECK(expect_error([&] { e.submit_extents(&x, 1, o, nullptr); }) == EINVAL,
+                  "%s: extent hold with class %d accepted", what, cls);
+        }
+        else CHECK(e.gather_rows(ids, 1, 0, &t, 1, o) == 0, "%s: hold class %d", what, cls);
+    }
+    // the class-3 queue still moves after the refused submissions
+    Options o3;
+    o3.cls = kRefill;
+    CHECK(e.gather_rows(ids, 1, 0, &t, 1, o3) == 0, "%s: class 3 after refusals", what);
+}
+
+// Offsets, lengths and ids at the edges of int64_t: clean errors, no signed overflow (UBSan)
+void test_overflow(Engine& e, File& big, const char* what)
+{
+    CHECK(expect_error([&] { e.extent_geometry(big.fd, 0, INT64_MAX); }) == EINVAL,
+          "%s: geometry of INT64_MAX bytes", what);
+    CHECK(expect_error([&] { e.extent_geometry(big.fd, INT64_MAX - 10, 5); }) == EINVAL,
+          "%s: geometry near INT64_MAX", what);
+    ExtentGeom g = e.extent_geometry(big.fd, 12345, (int64_t) 1 << 40);
+    CHECK(g.span_bytes >= ((int64_t) 1 << 40) + (12345 & 4095), "%s: geometry of 1 TiB", what);
+    uint8_t out[2 * 64];
+    RowTable t { big.fd, 0, 64, out, sizeof out };
+    Options o;
+    int64_t top[2] = { INT64_MAX - 1, INT64_MAX };
+    std::string msg;
+    int code = 0;
+    try
+    {
+        (void) e.submit_rows(top, 2, -1, &t, 1, o);
+    }
+    catch (const Error& err)
+    {
+        code = err.code();
+        msg = err.what();
+    }
+    CHECK(code == ERANGE && msg.find(std::to_string(INT64_MAX)) != std::string::npos,
+          "%s: rows at INT64_MAX: %d %s", what, code, msg.c_str());
+    int64_t low[1] = { INT64_MIN };
+    CHECK(expect_error([&] { e.submit_rows(low, 1, 1, &t, 1, o); }) == ERANGE,
+          "%s: id below uid_base overflow", what);
+    Guarded gg(8192);
+    ExtentReq x { big.fd, INT64_MAX - 100, 50, gg.p, 8192 };
+    CHECK(expect_error([&] { e.submit_extents(&x, 1, o, nullptr); }) == ERANGE,
+          "%s: extent near INT64_MAX", what);
+    Stats s = e.stats(false);
+    CHECK(s.queued_ops_now == 0 && s.tickets_live == 0, "%s: leftovers", what);
+}
+
+// forget(): an engine descriptor goes away with the file; a busy file goes once idle; an
+// unlinked file is closed on its own
+void test_forget(const Overrides& base, const char* what)
+{
+    Overrides ov = base;
+    ov["hold_arm_ms"] = "10000";
+    Engine e(cfg_of(ov));
+    File a = make_file("forget_a.bin", 1 << 20, 41);
+    File b = make_file("forget_b.bin", 1 << 20, 42);
+    uint8_t out[64];
+    int64_t ids[1] = { 5 };
+    Options o;
+    RowTable ta { a.fd, 0, 64, out, 64 };
+    CHECK(e.gather_rows(ids, 1, 0, &ta, 1, o) == 0, "%s: gather a", what);
+    int64_t open0 = e.stats(false).files_open;
+    CHECK(count_fds_to("forget_a.bin") >= 2, "%s: engine has not opened a", what);
+    CHECK(e.forget(a.fd) == 1, "%s: forget idle", what);
+    CHECK(e.stats(false).files_open == open0 - 1, "%s: still open after forget", what);
+    CHECK(count_fds_to("forget_a.bin") == 1, "%s: engine descriptor left", what);
+    CHECK(e.forget(a.fd) == 0, "%s: forget twice", what);
+    CHECK(e.gather_rows(ids, 1, 0, &ta, 1, o) == 0, "%s: gather after forget", what);
+    CHECK(e.forget_path(a.path) == 1, "%s: forget by path", what);
+    CHECK(e.forget_path(g_dir + "/no_such_file") == 0, "%s: forget missing path", what);
+
+    // busy: a queued class-3 ticket (armed hold) keeps it; closed once released and idle
+    e.arm_hold();
+    Guarded g(1 << 20);
+    ExtentReq x { a.fd, 0, 4096, g.p, (int64_t) g.n };
+    Options o3;
+    o3.cls = kRefill;
+    TicketId id = e.submit_extents(&x, 1, o3, nullptr);
+    CHECK(e.forget(a.fd) == -1, "%s: forget busy", what);
+    CHECK(count_fds_to("forget_a.bin") >= 2, "%s: busy file closed", what);
+    e.release(id);
+    RowTable tb { b.fd, 0, 64, out, 64 };
+    CHECK(e.gather_rows(ids, 1, 0, &tb, 1, o) == 0, "%s: gather b", what);
+    CHECK(count_fds_to("forget_a.bin") == 1, "%s: doomed file not closed once idle", what);
+
+    // unlinked: closed by the periodic sweep, and its blocks are released
+    CHECK(e.gather_rows(ids, 1, 0, &ta, 1, o) == 0, "%s: gather a again", what);
+    ::close(a.fd);
+    ::unlink(a.path.c_str());
+    CHECK(count_fds_to("forget_a.bin (deleted)") >= 1, "%s: engine let go too early", what);
+    for (int i = 0; i < 200; ++i) (void) e.gather_rows(ids, 1, 0, &tb, 1, o);
+    CHECK(count_fds_to("forget_a.bin") == 0, "%s: unlinked file still held by the engine", what);
+    ::close(b.fd);
+    ::unlink(b.path.c_str());
+}
+
+// Submissions racing a fatal ring error: the losers get an error, nothing leaks, nothing is
+// used after it was freed (the unwinding path of enqueue)
+void test_broken_submit(const Overrides& base, File& big, const char* what)
+{
+    Overrides ov = base;
+    ov["fault_enter_fatal"] = "2";
+    Engine e(cfg_of(ov));
+    const int nt = 12;
+    std::atomic<int> errors { 0 }, bad { 0 };
+    std::vector<std::thread> th;
+    for (int k = 0; k < nt; ++k)
+        th.emplace_back([&, k]
+        {
+            std::vector<int64_t> ids;
+            for (int i = 0; i < 400; ++i) ids.push_back((int64_t) i * 7 + k);   // not adjacent
+            std::vector<uint8_t> out(ids.size() * 256);
+            RowTable t { big.fd, 0, 256, out.data(), (int64_t) out.size() };
+            Options o;
+            o.cls = k % 2 ? kPrefetch : kEngram;
+            for (int it = 0; it < 200; ++it)
+            {
+                try
+                {
+                    TicketId id = e.submit_rows(ids.data(), (int64_t) ids.size(), 0, &t, 1, o);
+                    int r = wait_or_die(e, id, what);
+                    if (r != 0 && r != -EBADFD) bad.fetch_add(1);
+                    e.release(id);
+                }
+                catch (const Error& err)
+                {
+                    if (err.code() != EBADFD) bad.fetch_add(1);
+                    errors.fetch_add(1);
+                    break;
+                }
+            }
+        });
+    for (auto& t : th) t.join();
+    CHECK(bad.load() == 0, "%s: unexpected results", what);
+    CHECK(errors.load() == nt, "%s: %d of %d threads saw the broken engine", what, errors.load(), nt);
+    Stats s = e.stats(false);
+    CHECK(s.tickets_live == 0 && s.queued_ops_now == 0 && s.inflight_now == 0,
+          "%s: leftovers after the fatal error", what);
+}
+
+// After a fatal ring error: no thread of the engine spins (reaper timer, poller), and reads
+// prepared on the IOPOLL ring in the same pass are failed too
+void test_fatal_quiet(const Overrides& base, File& big, const char* what)
+{
+    long hz = ::sysconf(_SC_CLK_TCK);
+    // (a) armed hold + held class-2 ticket, then a synchronous gather hits the fatal error
+    {
+        Overrides ov = base;
+        ov["fault_enter_fatal"] = "1";
+        ov["hold_arm_ms"] = "200";
+        std::vector<int> before = threads_named("exl3-disk-reap");
+        Engine e(cfg_of(ov));
+        int reaper = new_thread_named("exl3-disk-reap", before);
+        e.arm_hold();
+        Guarded g(1 << 20);
+        ExtentReq x { big.fd, 0, 1 << 19, g.p, (int64_t) g.n };
+        Options o2;
+        o2.cls = kPrefetch;
+        TicketId held = e.submit_extents(&x, 1, o2, nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));   // the reaper saw it
+        uint8_t out[64];
+        int64_t ids[1] = { 9 };
+        RowTable t { big.fd, 0, 64, out, 64 };
+        Options o;
+        int r = e.gather_rows(ids, 1, 0, &t, 1, o);
+        CHECK(r == -EBADFD, "%s: sync gather on a failing ring gave %d", what, r);
+        CHECK(e.wait(held, kWait) == -EBADFD, "%s: held ticket not failed", what);
+        e.release(held);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));  // past the armed hold
+        long t0 = reaper ? thread_ticks(reaper) : -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        long t1 = reaper ? thread_ticks(reaper) : -1;
+        CHECK(reaper && t0 >= 0 && t1 - t0 <= hz / 10,
+              "%s: reaper used %ld ticks in 0.5 s after the fatal error (hz %ld)", what, t1 - t0, hz);
+    }
+    // (b) IOPOLL ring (forced) with direct rows, buffered extents on the main ring: both held
+    //     by the arm, admitted in one reaper pass whose first io_uring_enter fails
+    {
+        Overrides ov = base;
+        ov["fault_enter_fatal"] = "1";
+        ov["hold_arm_ms"] = "100";
+        ov["direct"] = "rows";
+        ov["iopoll"] = "1";
+        ov["fault_force_iopoll"] = "1";
+        ov["register"] = "none";
+        std::vector<int> before = threads_named("exl3-disk-poll");
+        Engine e(cfg_of(ov));
+        int poller = new_thread_named("exl3-disk-poll", before);
+        CHECK(poller != 0, "%s: no IOPOLL poller thread", what);
+        e.arm_hold();
+        std::vector<int64_t> ids = { 3, 100, 2000, 40000 };
+        std::vector<uint8_t> out(ids.size() * 256);
+        RowTable t { big.fd, 11, 256, out.data(), (int64_t) out.size() };
+        Options o2;
+        o2.cls = kPrefetch;
+        TicketId rows = e.submit_rows(ids.data(), (int64_t) ids.size(), 0, &t, 1, o2);
+        Guarded g(1 << 20);
+        ExtentReq x { big.fd, 4096, 1 << 19, g.p, (int64_t) g.n };
+        TicketId ext = e.submit_extents(&x, 1, o2, nullptr);
+        int r1 = e.wait(rows, 3000000000ll), r2 = e.wait(ext, 3000000000ll);
+        CHECK(r1 == -EBADFD && r2 == -EBADFD,
+              "%s: after a fatal enter: rows %d, extent %d (expected %d each)", what, r1, r2,
+              -EBADFD);
+        if (r1 == -ETIMEDOUT || r2 == -ETIMEDOUT)
+        {
+            std::fprintf(stderr, "FAIL: %s: stranded reads would hang the shutdown\n", what);
+            std::_Exit(3);
+        }
+        e.release(rows);
+        e.release(ext);
+        Stats s = e.stats(false);
+        CHECK(s.inflight_now == 0, "%s: %lld still in flight", what, (long long) s.inflight_now);
+        if (poller)
+        {
+            long t0 = thread_ticks(poller);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            long t1 = thread_ticks(poller);
+            CHECK(t0 >= 0 && t1 - t0 <= hz / 10, "%s: poller used %ld ticks in 0.5 s", what, t1 - t0);
+        }
+    }
+}
+
+// EXL3_DISK_AFFINITY reaches the io_uring workers of every submitting thread, not only of the
+// thread that created the engine
+void test_iowq_affinity(const Overrides& base, File& big, const char* what)
+{
+    int ncpu = (int) std::thread::hardware_concurrency();
+    if (ncpu < 4)
+    {
+        std::printf("   (%s: fewer than 4 CPUs)\n", what);
+        return;
+    }
+    Overrides ov = base;
+    ov["affinity"] = "1-2";
+    ov["uring_async"] = "1";                // every buffered read goes to io-wq
+    ov["direct"] = "none";
+    std::vector<int> before = threads_named("exl3-disk-reap");
+    Engine e(cfg_of(ov));
+    int reaper = new_thread_named("exl3-disk-reap", before);
+    std::string bad;
+    int seen = 0;
+    auto check_workers = [&](int owner)
+    {
+        std::string name = "iou-wrk-" + std::to_string(owner);
+        for (int tid : threads_named(name.c_str()))
+        {
+            ++seen;
+            std::string cpus = task_status_field(tid, "Cpus_allowed_list");
+            if (cpus != "1-2") bad += " " + name + "/" + std::to_string(tid) + ":" + cpus;
+        }
+    };
+    std::thread caller([&]
+    {
+        (void) ::posix_fadvise(big.fd, 0, 0, POSIX_FADV_DONTNEED);
+        std::vector<int64_t> ids;
+        for (int i = 0; i < 64; ++i) ids.push_back((int64_t) i * 509);
+        std::vector<uint8_t> out(ids.size() * 256);
+        RowTable t { big.fd, 0, 256, out.data(), (int64_t) out.size() };
+        Options o;
+        for (int it = 0; it < 4; ++it)
+            CHECK(e.gather_rows(ids.data(), (int64_t) ids.size(), 0, &t, 1, o) == 0, "%s: gather", what);
+        // a submitting task's workers are named after it
+        check_workers((int) ::gettid());
+        // an asynchronous ticket: the reaper submits it
+        Options o3;
+        o3.cls = kRefill;
+        (void) ::posix_fadvise(big.fd, 0, 0, POSIX_FADV_DONTNEED);
+        TicketId id = e.submit_rows(ids.data(), (int64_t) ids.size(), 0, &t, 1, o3);
+        CHECK(wait_or_die(e, id, what) == 0, "%s: async gather", what);
+        e.release(id);
+        if (reaper) check_workers(reaper);
+    });
+    caller.join();
+    CHECK(bad.empty(), "%s: caller's io_uring workers not pinned:%s", what, bad.c_str());
+    if (!seen) std::printf("   (%s: no io_uring worker of the caller seen)\n", what);
+}
+
+// Forked children: no Engine entry point locks what the parent's threads held at fork time,
+// and the default engine's mutex is released in the child
+void test_fork_busy(const Overrides& base, File& big, const char* what)
+{
+    Engine e(cfg_of(base));
+    std::atomic<bool> stop { false };
+    std::vector<std::thread> th;
+    for (int k = 0; k < 4; ++k)
+        th.emplace_back([&, k]
+        {
+            std::vector<int64_t> ids;
+            for (int i = 0; i < 48; ++i) ids.push_back((int64_t) i * 97 + k);
+            std::vector<uint8_t> out(ids.size() * 256);
+            RowTable t { big.fd, 0, 256, out.data(), (int64_t) out.size() };
+            Options o;
+            while (!stop.load()) (void) e.gather_rows(ids.data(), (int64_t) ids.size(), 0, &t, 1, o);
+        });
+    uint8_t out[64];
+    int64_t ids[1] = { 1 };
+    RowTable t { big.fd, 0, 64, out, 64 };
+    Options o3;
+    o3.cls = kRefill;
+    TicketId id = e.submit_rows(ids, 1, 0, &t, 1, o3);
+    int hung = 0, wrong = 0;
+    for (int i = 0; i < (g_quick ? 40 : 150); ++i)
+    {
+        pid_t pid = ::fork();
+        if (pid == 0)
+        {
+            ::alarm(5);
+            int ok = 0;
+            auto one = [&](const std::function<void()>& f)
+            {
+                try { f(); }
+                catch (const Error& err) { if (err.code() == ECHILD) ++ok; }
+            };
+            one([&] { (void) e.done(id); });
+            one([&] { (void) e.times(id); });
+            one([&] { e.cancel(id); });
+            one([&] { e.promote(id, 0); });
+            one([&] { e.arm_hold(); });
+            one([&] { (void) e.stats(false); });
+            one([&] { (void) e.trace(false); });
+            one([&] { (void) e.wait(id, 0); });
+            e.release(id);                  // a no-op in a child
+            std::_Exit(ok == 8 ? 0 : 2);
+        }
+        int st = 0;
+        ::waitpid(pid, &st, 0);
+        if (WIFSIGNALED(st)) ++hung;
+        else if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) ++wrong;
+    }
+    stop.store(true);
+    for (auto& x : th) x.join();
+    CHECK(hung == 0 && wrong == 0, "%s: forked children: %d hung, %d wrong", what, hung, wrong);
+    CHECK(wait_or_die(e, id, what) == 0, "%s: parent ticket", what);
+    e.release(id);
+}
+
+// The process-wide engine in forked children while other threads use it
+void test_fork_default(File& big)
+{
+    const char* what = "fork-default";
+#if EXL3_TEST_TSAN
+    // TSan kills a child of a multi-threaded process that starts threads (die_after_fork)
+    std::printf("   (%s: skipped under TSan)\n", what);
+    (void) big;
+#elif EXL3_TEST_GCC_ASAN
+    // the child builds a fresh engine (allocations) while four threads allocate in the parent:
+    // GCC's ASan runtime can deadlock the child (see EXL3_TEST_GCC_ASAN at the top)
+    std::printf("   (%s: skipped under GCC's AddressSanitizer)\n", what);
+    (void) big;
+#else
+    configure_default({ { "backend", "pread" } });
+    std::atomic<bool> stop { false };
+    std::vector<std::thread> th;
+    for (int k = 0; k < 4; ++k)
+        th.emplace_back([&, k]
+        {
+            std::vector<int64_t> ids;
+            for (int i = 0; i < 16; ++i) ids.push_back((int64_t) i * 31 + k);
+            std::vector<uint8_t> out(ids.size() * 264);
+            while (!stop.load())
+                (void) ngram_gather(big.fd, 0, 264, ids.data(), (int64_t) ids.size(), 0, out.data(),
+                                    (int64_t) out.size());
+        });
+    int hung = 0, wrong = 0;
+    for (int i = 0; i < (g_quick ? 40 : 120); ++i)
+    {
+        pid_t pid = ::fork();
+        if (pid == 0)
+        {
+            ::alarm(10);
+            int64_t ids[2] = { 4, 5 };
+            uint8_t out[2 * 264], ref[2 * 264];
+            int r = ngram_gather(big.fd, 0, 264, ids, 2, 0, out, sizeof out);
+            ref_read(big.fd, 4 * 264, 2 * 264, ref);
+            std::_Exit(r == 0 && std::memcmp(out, ref, sizeof out) == 0 ? 0 : 2);
+        }
+        int st = 0;
+        ::waitpid(pid, &st, 0);
+        if (WIFSIGNALED(st)) ++hung;
+        else if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) ++wrong;
+    }
+    stop.store(true);
+    for (auto& x : th) x.join();
+    shutdown_default();
+    CHECK(hung == 0 && wrong == 0, "%s: children: %d hung, %d wrong", what, hung, wrong);
+#endif
+}
+
 // ---- knobs -------------------------------------------------------------------------------------
 
 void test_config()
@@ -1009,6 +1649,13 @@ void test_config()
     CHECK(!err({ { "qd", "8" }, { "reserve0", "8" } }).empty(), "%s: reserve0 >= qd", what);
     CHECK(!err({ { "window_prefetch", "8M/16M" } }).empty(), "%s: lo > hi", what);
     CHECK(!err({ { "window_expert", "8M/0" } }).empty(), "%s: expert lo", what);
+    // a zero hi window would never admit its class
+    for (const char* k : { "window_expert", "window_prefetch", "window_refill" })
+        for (const char* v : { "0", "0K", "0/0" })
+            CHECK(!err({ { k, v } }).empty(), "%s: %s=%s accepted", what, k, v);
+    CHECK(err({ { "window_prefetch", "8M/0" } }).empty(), "%s: lo 0 refused", what);
+    CHECK(err({ { "fault_enter_fatal", "3" }, { "fault_force_iopoll", "1" } }).empty(),
+          "%s: test knobs", what);
     CHECK(!err({ { "chunk", "100K" } }).empty(), "%s: chunk not 64K multiple", what);
     CHECK(!err({ { "align", "1000" } }).empty(), "%s: align not pow2", what);
     CHECK(!err({ { "affinity", "3-1" } }).empty(), "%s: cpu range", what);
@@ -1152,6 +1799,19 @@ int main(int argc, char** argv)
         { "io_uring-iopoll", { { "backend", "io_uring" }, { "direct", "all" }, { "iopoll", "1" } } },
         { "io_uring-refused", { { "backend", "io_uring" }, { "fault_no_uring", "1" } } },
         { "odirect-iopoll", { { "backend", "odirect" }, { "iopoll", "1" } } },
+        // IOPOLL ring really used (the device's io_poll check is skipped; a disk without poll
+        // queues still completes polled reads), with and without registered buffers
+        { "io_uring-iopoll-forced", { { "backend", "io_uring" }, { "direct", "all" }, { "iopoll", "1" },
+                                      { "fault_force_iopoll", "1" } } },
+        { "io_uring-iopoll-forced-noreg", { { "backend", "io_uring" }, { "direct", "all" }, { "iopoll", "1" },
+                                            { "fault_force_iopoll", "1" }, { "register", "none" } } },
+        { "odirect-iopoll-forced", { { "backend", "odirect" }, { "iopoll", "1" }, { "fault_force_iopoll", "1" } } },
+        // slot geometry above 4 KiB and small chunks
+        { "odirect-align8k", { { "backend", "odirect" }, { "align", "8192" } } },
+        { "odirect-align64k", { { "backend", "odirect" }, { "align", "65536" } } },
+        { "io_uring-direct-align16k", { { "backend", "io_uring" }, { "direct", "all" }, { "align", "16384" } } },
+        { "io_uring-chunk64k", { { "backend", "io_uring" }, { "direct", "all" }, { "chunk", "64K" } } },
+        { "pread-chunk64k", { { "backend", "pread" }, { "direct", "extents" }, { "chunk", "64K" } } },
     };
 
     auto run = [&](const std::string& name, const std::function<void()>& f)
@@ -1184,9 +1844,22 @@ int main(int argc, char** argv)
         run(n + "/shutdown", [&] { test_shutdown(b.ov, big, (n + "/shutdown").c_str()); });
         run(n + "/registered", [&] { test_registered(b.ov, big, (n + "/registered").c_str()); });
         run(n + "/fork", [&] { test_fork(b.ov, big, (n + "/fork").c_str()); });
+        run(n + "/fork-busy", [&] { test_fork_busy(b.ov, big, (n + "/fork-busy").c_str()); });
+        run(n + "/release-race", [&] { test_release_race(b.ov, big, (n + "/release-race").c_str()); });
+        run(n + "/hold-class", [&] { test_hold_class(b.ov, big, (n + "/hold-class").c_str()); });
+        run(n + "/overflow", [&] { Engine e(cfg_of(b.ov)); test_overflow(e, big, (n + "/overflow").c_str()); });
+        run(n + "/forget", [&] { test_forget(b.ov, (n + "/forget").c_str()); });
+        bool uring = b.ov.at("backend") == "io_uring" && !b.ov.count("fault_no_uring");
+        if (uring && !b.ov.count("sqpoll"))
+        {
+            run(n + "/broken-submit", [&] { test_broken_submit(b.ov, big, (n + "/broken-submit").c_str()); });
+            run(n + "/fatal-quiet", [&] { test_fatal_quiet(b.ov, big, (n + "/fatal-quiet").c_str()); });
+            run(n + "/iowq-affinity", [&] { test_iowq_affinity(b.ov, big, (n + "/iowq-affinity").c_str()); });
+        }
     }
     run("edf", [&] { test_edf(big, "edf"); });
     run("default-engine", [&] { test_default(big); });
+    run("fork-default", [&] { test_fork_default(big); });
 
     ::close(big.fd);
     ::close(small.fd);

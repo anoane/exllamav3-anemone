@@ -217,7 +217,7 @@ def test_errors(ext, data):
 def test_ticket_lifetime(ext, data):
     """Dropping every reference while reads are in flight: the ticket waits them out."""
     path, fd, buf = data
-    ext.disk_engine_configure({"backend": "io_uring", "direct": "all", "window_refill": "0/0",
+    ext.disk_engine_configure({"backend": "io_uring", "direct": "all", "hold_arm_ms": 10000,
                                "refill_age_ms": 0})
     slot = 14 << 20
     for _ in range(4):
@@ -226,7 +226,9 @@ def test_ticket_lifetime(ext, data):
                                   dst, torch.tensor([0]), slot, cls = 1)
         del dst
         del t                           # releases: waits for the reads in flight
-    # a ticket that can never be admitted (class 3, window 0): times out, cancels, releases
+    # a ticket that is not admitted (class 3 under an armed hold, lo window 0): times out, is
+    # promoted, completes; another is cancelled
+    ext.disk_arm_hold()
     dst = aligned_u8(slot)
     t = ext.disk_read_extents(torch.tensor([fd]), torch.tensor([0]), torch.tensor([1 << 20]),
                               dst, torch.tensor([0]), slot, cls = 3)

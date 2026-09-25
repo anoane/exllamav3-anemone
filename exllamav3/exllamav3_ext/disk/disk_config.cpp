@@ -43,6 +43,7 @@ const char* const kKnobs[] =
     "refill_age_ms", "sqpoll", "sqpoll_idle_ms", "sqpoll_cpu", "iopoll", "register",
     "uring_async", "iowq_workers", "affinity", "fadvise", "extent_dontneed", "verbose", "trace",
     "fault_eio", "fault_short", "fault_eintr", "fault_delay_us", "fault_no_uring",
+    "fault_enter_fatal", "fault_force_iopoll",
 };
 
 std::string env_name(const std::string& key)
@@ -196,6 +197,8 @@ std::vector<int> parse_cpu_list(const Knobs& k, const std::string& key)
     return cpus;
 }
 
+// hi must be positive or unlimited: a class whose window is 0 outside the hold rule would
+// never be admitted. lo may be 0 (nothing new while the hold rule is active, which ends)
 void parse_window(const Knobs& k, const std::string& key, bool allow_lo, int64_t def_hi,
                   int64_t def_lo, int64_t* hi, int64_t* lo)
 {
@@ -204,9 +207,13 @@ void parse_window(const Knobs& k, const std::string& key, bool allow_lo, int64_t
     *lo = def_lo;
     if (v.empty() || lower(v) == "auto") return;
     size_t slash = v.find('/');
+    const char* positive = allow_lo
+        ? "a positive byte size or inf, optionally /lo (hi 0 would never admit the class)"
+        : "a positive byte size or inf (0 would never admit the class)";
     if (slash == std::string::npos)
     {
         *hi = k.size(key, v, true);
+        if (*hi == 0) k.bad(key, v, positive);
         *lo = allow_lo ? std::min<int64_t>(def_lo, *hi < 0 ? def_lo : *hi) : *hi;
         return;
     }
@@ -215,6 +222,7 @@ void parse_window(const Knobs& k, const std::string& key, bool allow_lo, int64_t
                       "window)");
     *hi = k.size(key, v.substr(0, slash), true);
     *lo = k.size(key, v.substr(slash + 1), true);
+    if (*hi == 0) k.bad(key, v, positive);
     if (*hi >= 0 && (*lo < 0 || *lo > *hi))
         k.bad(key, v, "hi/lo with lo <= hi (lo applies while a decode row batch is held)");
 }
@@ -323,6 +331,8 @@ Config config_from_env(const Overrides& ov)
     c.fault_eintr = (int) k.integer("fault_eintr", 0, 1 << 30, 0);
     c.fault_delay_us = (int) k.integer("fault_delay_us", 0, 1000000, 0);
     c.fault_no_uring = k.boolean("fault_no_uring", false);
+    c.fault_enter_fatal = (int) k.integer("fault_enter_fatal", 0, 1 << 30, 0);
+    c.fault_force_iopoll = k.boolean("fault_force_iopoll", false);
 
     // Knobs that do not apply to the chosen backend: noted, not fatal
     auto note_if = [&](bool set, const std::string& key, const std::string& why)

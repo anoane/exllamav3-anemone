@@ -91,11 +91,14 @@ static bool mul_ok(int64_t a, int64_t b, int64_t* r) { return !__builtin_mul_ove
 static bool add_ok(int64_t a, int64_t b, int64_t* r) { return !__builtin_add_overflow(a, b, r); }
 static bool sub_ok(int64_t a, int64_t b, int64_t* r) { return !__builtin_sub_overflow(a, b, r); }
 
+// a: a power of two <= 65536; v in [0, kMaxFileEnd + 2^40] (callers check against kMaxFileEnd
+// and kMaxExtentBytes first), so v + a - 1 cannot overflow
 static inline int64_t round_up(int64_t v, int64_t a) { return (v + a - 1) & ~(a - 1); }
 
 // ---- files ------------------------------------------------------------------------------------
 
 static constexpr size_t kMaxFiles = 256;
+static constexpr uint64_t kSweepEvery = 64;     // acquires between checks for unlinked files
 
 static int reopen(int fd, int flags)
 {
@@ -299,7 +302,8 @@ FileRef FileTable::acquire(int fd, bool want_direct, int advice, const Config& c
         if (ne->chunk % ne->geom_align) ne->chunk = round_up(ne->chunk, ne->geom_align);
 
         // Polled completions need poll queues on the device (NVMe with nvme.poll_queues > 0)
-        if (cfg.iopoll)
+        if (cfg.iopoll && cfg.fault_force_iopoll) ne->poll_ok = true;
+        else if (cfg.iopoll)
         {
             std::string v;
             if (!read_sysfs(qdir + "/queue/io_poll", &v))
@@ -314,24 +318,29 @@ FileRef FileTable::acquire(int fd, bool want_direct, int advice, const Config& c
         map.emplace(key, std::move(ne));
         if (ex) ex->file_opened(e);
     }
-    else e = it->second.get();
+    else
+    {
+        e = it->second.get();
+        if (e->doomed)
+        {
+            // forgotten while busy, and wanted again before it went idle: keep it
+            e->doomed = false;
+            --n_doomed;
+        }
+    }
 
     e->refs.fetch_add(1, std::memory_order_acq_rel);
     e->last_use = ++clock;
     if (map.size() > kMaxFiles) evict_locked(ex);
+    else if (n_doomed > 0 || clock % kSweepEvery == 0) sweep_locked(ex);
 
     if (want_direct && e->fd_dir == -1) open_direct(*e, cfg, ex);
-    if (cfg.iopoll && want_direct && !e->poll_ok && !e->poll_warned.exchange(true))
+    if (cfg.iopoll && want_direct && !e->poll_ok && !e->poll_warned.exchange(true) &&
+        std::find(poll_refused.begin(), poll_refused.end(), e->dev) == poll_refused.end())
     {
-        static std::mutex once_mx;
-        static std::vector<dev_t> once;
-        std::lock_guard<std::mutex> g(once_mx);
-        if (std::find(once.begin(), once.end(), e->dev) == once.end())
-        {
-            once.push_back(e->dev);
-            warn("EXL3_DISK_IOPOLL=1 refused for " + e->name + ": " + e->poll_why +
-                 "; reading it with interrupt-driven completions");
-        }
+        poll_refused.push_back(e->dev);
+        warn("EXL3_DISK_IOPOLL=1 refused for " + e->name + ": " + e->poll_why +
+             "; reading it with interrupt-driven completions");
     }
     if (advice >= 0 && e->advice != advice)
     {
@@ -364,6 +373,7 @@ void FileTable::close_ent(FileEnt* e, Executor* ex)
 
 void FileTable::evict_locked(Executor* ex)
 {
+    sweep_locked(ex);
     std::vector<std::pair<uint64_t, Key>> idle;
     for (auto& kv : map)
         if (kv.second->refs.load(std::memory_order_acquire) == 0)
@@ -381,6 +391,54 @@ void FileTable::evict_locked(Executor* ex)
     }
 }
 
+// Idle files that were forgotten while busy, or whose last name was removed (an unloaded or
+// replaced model file must not keep its blocks allocated through the engine's descriptors)
+void FileTable::sweep_locked(Executor* ex)
+{
+    for (auto it = map.begin(); it != map.end(); )
+    {
+        FileEnt* e = it->second.get();
+        bool close = false;
+        if (e->refs.load(std::memory_order_acquire) == 0)
+        {
+            struct stat st;
+            if (e->doomed) close = true;
+            else if (!e->is_blk && e->fd_buf >= 0 && ::fstat(e->fd_buf, &st) == 0 &&
+                     st.st_nlink == 0)
+                close = true;
+        }
+        if (!close)
+        {
+            ++it;
+            continue;
+        }
+        if (e->doomed) --n_doomed;
+        close_ent(e, ex);
+        it = map.erase(it);
+    }
+}
+
+int FileTable::forget(dev_t dev, ino_t ino, Executor* ex)
+{
+    std::lock_guard<std::mutex> lk(mx);
+    auto it = map.find(Key { dev, ino });
+    if (it == map.end()) return 0;
+    FileEnt* e = it->second.get();
+    if (e->refs.load(std::memory_order_acquire) != 0)
+    {
+        if (!e->doomed)
+        {
+            e->doomed = true;
+            ++n_doomed;
+        }
+        return -1;
+    }
+    if (e->doomed) --n_doomed;
+    close_ent(e, ex);
+    map.erase(it);
+    return 1;
+}
+
 void FileTable::close_all(Executor* ex)
 {
     std::lock_guard<std::mutex> lk(mx);
@@ -391,6 +449,7 @@ void FileTable::close_all(Executor* ex)
         close_ent(kv.second.get(), ex);
     }
     map.clear();
+    n_doomed = 0;
 }
 
 int64_t FileTable::size()
@@ -1055,16 +1114,19 @@ void check_cls(int cls)
         throw Error(EINVAL, "disk engine: class " + std::to_string(cls) + " is not in [0, 3]");
 }
 
-// Drops the file references of a ticket that never got queued
+// Drops the file references of a ticket that never got queued. It refers to the owning
+// pointer, not to the ticket: enqueue() moves the ticket into the table only after its last
+// throw point, so on every unwind the ticket is still owned here (and alive) when this runs,
+// and after a successful enqueue the pointer is empty and there is nothing to drop. Declared
+// after the pointer, so it runs first.
 struct RefGuard
 {
-    std::vector<FileEnt*>* files;
-    bool armed = true;
+    std::unique_ptr<Ticket>& t;
     ~RefGuard()
     {
-        if (!armed) return;
-        for (FileEnt* f : *files) FileTable::unref(f);
-        files->clear();
+        if (!t) return;
+        for (FileEnt* f : t->files) FileTable::unref(f);
+        t->files.clear();
     }
 };
 
@@ -1152,6 +1214,15 @@ bool forked_child(pid_t owner)
     return g_forked.load(std::memory_order_relaxed) && ::getpid() != owner;
 }
 
+// Every Engine entry point: a forked child must not touch the parent's engine at all (its
+// mutexes may have been held by threads that do not exist in the child)
+void check_not_forked(pid_t owner)
+{
+    if (forked_child(owner))
+        throw Error(ECHILD, "disk engine: an engine does not survive fork(); this process is a "
+                            "child of the one that created it");
+}
+
 }  // namespace
 
 static void shutdown_core(Core& c)
@@ -1222,40 +1293,55 @@ Engine::~Engine()
 
 static void check_usable(Core& c)
 {
-    if (forked_child(c.pid))
-        throw Error(ECHILD, "disk engine: an engine does not survive fork(); this process is a "
-                            "child of the one that created it");
+    check_not_forked(c.pid);
     int b = c.broken.load();
     if (b) throw Error(-b, "disk engine: stopped after a fatal I/O error: " + errstr(-b));
 }
 
-static TicketId enqueue(Core& c, std::unique_ptr<Ticket> t, RefGuard& guard, bool will_wait)
+// Queue a fully built ticket. On success t is empty (the ticket table owns it); on a throw t
+// still owns the ticket, nothing of it was queued and no reference was taken (the caller's
+// RefGuard drops the file references). Everything that can throw happens before the ticket
+// moves into the table; everything after is noexcept.
+static TicketId enqueue(Core& c, std::unique_ptr<Ticket>& t, bool will_wait)
 {
-    size_t pre = will_wait ? c.ex->prepass(t.get()) : 0;
+    Ticket* tp = t.get();
+    size_t pre = will_wait ? c.ex->prepass(tp) : 0;
+    // at most one registered buffer per destination range, and at most kMaxUserBuffers
+    tp->buffers.reserve(std::min<size_t>(tp->dst.size(), kMaxUserBuffers));
     std::unique_lock<std::mutex> lk(c.mx);
     if (c.stopping) throw Error(ESHUTDOWN, "disk engine: shutting down");
     int b = c.broken.load();
     if (b) throw Error(-b, "disk engine: stopped after a fatal I/O error: " + errstr(-b));
+    uint64_t id = c.next_id;
+    auto slot = c.tickets.emplace(id, nullptr);       // may throw: t is untouched
+    if (!slot.second) throw Error(EEXIST, "disk engine: ticket id reused");   // 64-bit counter
+    ++c.next_id;
+    slot.first->second = std::move(t);               // noexcept from here on
     int64_t now = now_ns();
-    Ticket* tp = t.get();
-    tp->id = c.next_id++;
+    tp->id = id;
     tp->t_submit = now;     // when the scheduler saw it (the hold rule starts here)
-    // io_uring: registered buffers holding extent slots
-    for (Op& op : tp->ops)
+    // io_uring: destinations inside a registered buffer are read with READ_FIXED. One lookup
+    // per destination range (a table's output, an extent's slot), and none while no buffer
+    // is registered. (A prepass reorders ops; only the pools have one, and they register no
+    // buffers.)
+    if (pre == 0 && c.ex->user_buffers() > 0)
     {
-        if (op.bounce || !op.dst) continue;
-        op.buf_index = c.ex->find_buffer(op.dst, op.dev_len);
-        if (op.buf_index >= 0 &&
-            std::find(tp->buffers.begin(), tp->buffers.end(), op.buf_index) == tp->buffers.end())
+        for (const DstRange& d : tp->dst)
         {
-            tp->buffers.push_back(op.buf_index);
-            c.ex->buffer_ref(op.buf_index, 1);
+            int bi = c.ex->find_buffer(d.p, d.n);
+            if (bi < 0) continue;
+            for (size_t i = d.op_begin; i < d.op_end; ++i)
+                if (!tp->ops[i].bounce) tp->ops[i].buf_index = bi;
+            if (std::find(tp->buffers.begin(), tp->buffers.end(), bi) == tp->buffers.end())
+            {
+                // distinct buffers <= ranges, so this stays within the capacity reserved above
+                tp->buffers.push_back(bi);
+                c.ex->buffer_ref(bi, 1);
+            }
         }
     }
     if (c.cfg.uring_async > 0 && tp->ops.size() >= (size_t) c.cfg.uring_async)
         for (Op& op : tp->ops) if (!op.direct) op.async = 1;
-    c.tickets.emplace(tp->id, std::move(t));
-    guard.armed = false;
     if (tp->hold) ++c.hold_pending;
     if (pre) c.op_done_inline(tp, pre, now);
     if (pre == tp->ops.size()) c.complete_ticket(tp, now);
@@ -1265,16 +1351,31 @@ static TicketId enqueue(Core& c, std::unique_ptr<Ticket> t, RefGuard& guard, boo
         c.queued_ops += (int64_t) (tp->ops.size() - pre);
         c.ex->kick(lk);
     }
-    TicketId id = tp->id;
     bool queued = tp->q_cls >= 0;
+    // io_uring: only a class-0 caller submits its own reads (read here: cls changes under mx)
+    bool submit_inline = will_wait && tp->cls == kEngram;
     lk.unlock();
-    if (queued) c.ex->submitted(tp, will_wait);   // tp stays valid: nobody knows its id yet
+    if (queued)
+    {
+        // tp stays valid: nobody knows its id yet. The ticket is queued, so a failure to
+        // submit here only delays it: the reaper admits queued work on its own (<= 50 ms)
+        try
+        {
+            c.ex->submitted(tp, submit_inline);
+        }
+        catch (...)
+        {
+        }
+    }
     return id;
 }
 
 static std::unique_ptr<Ticket> new_ticket(const Options& o)
 {
     check_cls(o.cls);
+    if (o.hold && o.cls >= kPrefetch)
+        throw Error(EINVAL, "disk engine: hold applies to class 0 and 1 tickets only (a class " +
+                            std::to_string(o.cls) + " ticket would be held by its own rule)");
     if (o.flag && (reinterpret_cast<uintptr_t>(o.flag) & 3))
         throw Error(EINVAL, "disk engine: the completion flag must be 4-byte aligned");
     std::unique_ptr<Ticket> t(new Ticket());
@@ -1298,7 +1399,7 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
         throw Error(EINVAL, "disk engine: between 1 and " + std::to_string(kMaxTables) +
                             " tables per call");
     std::unique_ptr<Ticket> t = new_ticket(o);
-    RefGuard guard { &t->files };
+    RefGuard guard { t };
     int advice = advice_for(c.cfg.fadvise, true);
 
     std::vector<FileRef> refs((size_t) ntables);
@@ -1326,10 +1427,12 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
     if (ranges_overlap(outs)) throw Error(EINVAL, "disk engine: output buffers overlap");
 
     t->ops.reserve((size_t) n * (size_t) ntables);
+    t->dst.reserve((size_t) ntables);
     for (int k = 0; k < ntables; ++k)
     {
         const RowTable& tb = tables[k];
         const FileRef& r = refs[(size_t) k];
+        size_t first_op = t->ops.size();
         bool direct = c.cfg.direct_rows && r.fd_dir >= 0;
         if (direct && (r.off_align > kBounceBytes / 4 || r.mem_align > 4096))
         {
@@ -1352,17 +1455,22 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
                                     std::to_string(uids[i]) + " is below uid_base " +
                                     std::to_string(uid_base));
             if (!mul_ok(row, tb.row_bytes, &off) || !add_ok(off, tb.base_offset, &off) ||
-                !mul_ok(j - i, tb.row_bytes, &len) || !add_ok(off, len, &end) || end > r.size)
-                throw Error(ERANGE, "disk engine: table " + std::to_string(k) + ": rows " +
-                                    std::to_string(uids[i] - uid_base) + ".." +
-                                    std::to_string(uids[j - 1] - uid_base) +
-                                    " end beyond the file (" + std::to_string(r.size) +
+                !mul_ok(j - i, tb.row_bytes, &len) || !add_ok(off, len, &end) || end > r.size ||
+                end > kMaxFileEnd)
+                // the ids as given (their difference to uid_base may not fit in int64_t)
+                throw Error(ERANGE, "disk engine: table " + std::to_string(k) + ": row ids " +
+                                    std::to_string(uids[i]) + ".." + std::to_string(uids[j - 1]) +
+                                    " (uid_base " + std::to_string(uid_base) +
+                                    ") end beyond the file (" + std::to_string(r.size) +
                                     " bytes)");
             build_segment(t->ops, t.get(), r, direct, off, len, tb.out + i * tb.row_bytes);
             i = j;
         }
+        if (n > 0)
+            t->dst.push_back({ first_op, t->ops.size(), tb.out,
+                               (size_t) n * (size_t) tb.row_bytes });
     }
-    return enqueue(c, std::move(t), guard, will_wait);
+    return enqueue(c, t, will_wait);
 }
 
 static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, const Options& o,
@@ -1371,7 +1479,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
     check_usable(c);
     if (n < 0 || (n > 0 && !ex)) throw Error(EINVAL, "disk engine: bad extent list");
     std::unique_ptr<Ticket> t = new_ticket(o);
-    RefGuard guard { &t->files };
+    RefGuard guard { t };
     int advice = advice_for(c.cfg.fadvise, false);
 
     std::vector<std::pair<int, FileRef>> seen;    // per-call cache: fd -> file
@@ -1380,7 +1488,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
     {
         const ExtentReq& e = ex[i];
         std::string what = "extent " + std::to_string(i);
-        if (e.offset < 0 || e.length < 0 || e.length > (int64_t) 1 << 40)
+        if (e.offset < 0 || e.length < 0 || e.length > kMaxExtentBytes)
             throw Error(EINVAL, "disk engine: " + what + ": bad offset or length");
         const FileRef* r = nullptr;
         for (auto& s : seen) if (s.first == e.fd) { r = &s.second; break; }
@@ -1394,7 +1502,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
         int64_t G = r->geom_align;
         int64_t delta = e.offset & (G - 1);
         int64_t end = 0, span = 0;
-        if (!add_ok(e.offset, e.length, &end) || end > r->size)
+        if (!add_ok(e.offset, e.length, &end) || end > r->size || end > kMaxFileEnd)
             throw Error(ERANGE, "disk engine: " + what + " [" + std::to_string(e.offset) + ", +" +
                                 std::to_string(e.length) + ") ends beyond the file (" +
                                 std::to_string(r->size) + " bytes)");
@@ -1412,15 +1520,17 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
                                 std::to_string(e.slot_bytes) + " bytes, the extent spans " +
                                 std::to_string(span));
         slots.push_back({ sa, sa + (uintptr_t) span });
+        size_t first_op = t->ops.size();
+        t->dst.push_back({ first_op, first_op, e.slot, (size_t) span });   // end set below
 
         bool direct = c.cfg.direct_extents && r->fd_dir >= 0;
         if (!direct)
         {
             // same geometry as O_DIRECT, so the payload offset does not depend on the backend
-            size_t first = t->ops.size();
             build_segment(t->ops, t.get(), *r, false, e.offset, e.length, e.slot + delta);
             if (c.cfg.extent_dontneed)
-                for (size_t k = first; k < t->ops.size(); ++k) t->ops[k].dontneed = 1;
+                for (size_t k = first_op; k < t->ops.size(); ++k) t->ops[k].dontneed = 1;
+            t->dst.back().op_end = t->ops.size();
             continue;
         }
         // O_DIRECT: aligned superset [a0, aend) straight into the slot, in chunks
@@ -1439,9 +1549,10 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
                 0, std::min<int64_t>(d + dl, end) - std::max<int64_t>(d, e.offset));
             t->ops.push_back(op);
         }
+        t->dst.back().op_end = t->ops.size();
     }
     if (ranges_overlap(slots)) throw Error(EINVAL, "disk engine: extent slots overlap");
-    return enqueue(c, std::move(t), guard, will_wait);
+    return enqueue(c, t, will_wait);
 }
 
 TicketId Engine::submit_rows(const int64_t* uids, int64_t n, int64_t uid_base,
@@ -1460,28 +1571,45 @@ ExtentGeom Engine::extent_geometry(int fd, int64_t offset, int64_t length)
 {
     Core& c = *core_;
     check_usable(c);
-    if (offset < 0 || length < 0) throw Error(EINVAL, "disk engine: bad offset or length");
+    // the same bounds as submit_extents: every rounding below then stays inside int64_t
+    if (offset < 0 || length < 0 || length > kMaxExtentBytes || offset > kMaxFileEnd)
+        throw Error(EINVAL, "disk engine: bad offset or length");
     FileRef r = c.files.acquire(fd, false, -1, c.cfg, c.ex.get());
     FileTable::unref(r.ent);
     ExtentGeom g;
     int64_t G = r.geom_align;
     g.payload_offset = offset & (G - 1);
-    int64_t s = 0;
-    if (!add_ok(g.payload_offset, length, &s)) throw Error(ERANGE, "disk engine: length");
-    g.span_bytes = round_up(s, G);
+    g.span_bytes = round_up(g.payload_offset + length, G);   // < 2^40 + 2^17
     return g;
+}
+
+namespace
+{
+// A thread inside Engine::wait / release for a ticket (Core::mx held on construction and
+// destruction): the ticket is not destroyed before it leaves
+struct Waiter
+{
+    Ticket* t;
+    explicit Waiter(Ticket* x) : t(x) { ++t->waiters; }
+    ~Waiter()
+    {
+        if (--t->waiters == 0 && t->releasing) t->cv.notify_all();
+    }
+    Waiter(const Waiter&) = delete;
+    Waiter& operator=(const Waiter&) = delete;
+};
 }
 
 int Engine::wait(TicketId id, int64_t timeout_ns)
 {
     Core& c = *core_;
-    if (forked_child(c.pid))
-        throw Error(ECHILD, "disk engine: an engine does not survive fork()");
+    check_not_forked(c.pid);
     std::unique_lock<std::mutex> lk(c.mx);
     Ticket* t = c.find(id);
     if (!t) throw Error(ENOENT, "disk engine: unknown ticket " + std::to_string(id));
     if (!t->complete.load(std::memory_order_acquire))
     {
+        Waiter w(t);        // ex->wait may drop and retake the lock; t outlives it
         int64_t deadline = timeout_ns < 0 ? -1 : now_ns() + timeout_ns;
         if (!c.ex->wait(t, lk, deadline)) return -ETIMEDOUT;
     }
@@ -1491,6 +1619,7 @@ int Engine::wait(TicketId id, int64_t timeout_ns)
 bool Engine::done(TicketId id)
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     std::lock_guard<std::mutex> lk(c.mx);
     Ticket* t = c.find(id);
     if (!t) throw Error(ENOENT, "disk engine: unknown ticket " + std::to_string(id));
@@ -1500,6 +1629,7 @@ bool Engine::done(TicketId id)
 TicketTimes Engine::times(TicketId id)
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     std::lock_guard<std::mutex> lk(c.mx);
     Ticket* t = c.find(id);
     if (!t) throw Error(ENOENT, "disk engine: unknown ticket " + std::to_string(id));
@@ -1520,9 +1650,24 @@ void Engine::release(TicketId id)
         std::unique_lock<std::mutex> lk(c.mx);
         Ticket* t = c.find(id);
         if (!t) return;
+        if (t->releasing)
+        {
+            // another thread releases it: return once it completed (no read lands after this
+            // returns), and let that thread destroy it
+            Waiter w(t);
+            if (!t->complete.load(std::memory_order_acquire)) c.ex->wait(t, lk, -1);
+            return;
+        }
+        t->releasing = true;
         c.cancel_queued(t, -ECANCELED, now_ns());
-        if (!t->complete.load(std::memory_order_acquire)) c.ex->wait(t, lk, -1);
+        {
+            Waiter w(t);
+            if (!t->complete.load(std::memory_order_acquire)) c.ex->wait(t, lk, -1);
+        }
+        // threads still inside wait() / release() for it leave once they see it complete
+        while (t->waiters > 0) t->cv.wait(lk);
         auto it = c.tickets.find(id);
+        if (it == c.tickets.end() || it->second.get() != t) return;   // cannot happen
         owned = std::move(it->second);
         c.tickets.erase(it);
     }
@@ -1536,6 +1681,7 @@ void Engine::release(TicketId id)
 void Engine::cancel(TicketId id)
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     std::lock_guard<std::mutex> lk(c.mx);
     Ticket* t = c.find(id);
     if (!t) throw Error(ENOENT, "disk engine: unknown ticket " + std::to_string(id));
@@ -1545,6 +1691,7 @@ void Engine::cancel(TicketId id)
 void Engine::promote(TicketId id, int cls)
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     check_cls(cls);
     {
         std::unique_lock<std::mutex> lk(c.mx);
@@ -1565,6 +1712,7 @@ void Engine::promote(TicketId id, int cls)
 void Engine::arm_hold()
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     std::lock_guard<std::mutex> lk(c.mx);
     if (c.cfg.hold_arm_ms > 0) c.hold_armed_until = now_ns() + (int64_t) c.cfg.hold_arm_ms * 1000000;
 }
@@ -1613,9 +1761,34 @@ void Engine::unregister_buffer(int idx)
     c.ex->unregister_buffer(idx);
 }
 
+int Engine::forget(int fd)
+{
+    Core& c = *core_;
+    check_not_forked(c.pid);
+    struct stat st;
+    if (fd < 0 || ::fstat(fd, &st) != 0)
+        throw Error(EBADF, "disk engine: forget: invalid file descriptor " + std::to_string(fd));
+    return c.files.forget(st.st_dev, st.st_ino, c.ex.get());
+}
+
+int Engine::forget_path(const std::string& path)
+{
+    Core& c = *core_;
+    check_not_forked(c.pid);
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0)
+    {
+        int e = errno;
+        if (e == ENOENT) return 0;          // gone: an unlinked file is swept once idle
+        throw Error(e, "disk engine: forget: stat(" + path + ") failed: " + errstr(e));
+    }
+    return c.files.forget(st.st_dev, st.st_ino, c.ex.get());
+}
+
 Stats Engine::stats(bool reset)
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     Stats s;
     s.files_open = c.files.size();
     std::lock_guard<std::mutex> lk(c.mx);
@@ -1656,6 +1829,7 @@ Stats Engine::stats(bool reset)
 std::vector<TraceRec> Engine::trace(bool clear)
 {
     Core& c = *core_;
+    check_not_forked(c.pid);
     std::lock_guard<std::mutex> lk(c.mx);
     std::vector<TraceRec> out;
     if (c.trace.empty()) return out;
@@ -1691,10 +1865,32 @@ std::shared_ptr<Engine>* g_engine = nullptr;     // leaked on purpose: never des
 pid_t g_engine_pid = 0;
 std::atomic<int> g_route { -1 };                 // -1 unknown, 0 original gather, 1 engine
 thread_local int t_class = kEngram;
+
+// g_mx is held across fork(), so a child never inherits it locked by a thread it does not
+// have (it only guards a pointer swap and engine creation, never anything that waits for the
+// forking thread)
+void install_default_fork_handler()
+{
+    static std::once_flag once;
+    std::call_once(once, []
+    {
+        (void) pthread_atfork(+[] { g_mx.lock(); }, +[] { g_mx.unlock(); },
+                              +[] { g_mx.unlock(); });
+    });
+}
+}
+
+std::shared_ptr<Engine> default_engine_if_created()
+{
+    install_default_fork_handler();
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (g_engine && g_engine_pid == ::getpid()) return *g_engine;
+    return nullptr;
 }
 
 std::shared_ptr<Engine> default_engine()
 {
+    install_default_fork_handler();
     std::lock_guard<std::mutex> lk(g_mx);
     pid_t me = ::getpid();
     if (g_engine && g_engine_pid != me) g_engine = nullptr;   // forked child: leave it alone
@@ -1709,6 +1905,7 @@ std::shared_ptr<Engine> default_engine()
 
 std::shared_ptr<Engine> configure_default(const Overrides& ov)
 {
+    install_default_fork_handler();
     Config cfg = config_from_env(ov);
     std::shared_ptr<Engine> e = std::make_shared<Engine>(cfg);
     std::shared_ptr<Engine> old;
@@ -1728,6 +1925,7 @@ std::shared_ptr<Engine> configure_default(const Overrides& ov)
 
 void shutdown_default()
 {
+    install_default_fork_handler();
     std::shared_ptr<Engine> old;
     {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -1808,6 +2006,8 @@ int Engine::read_extents(const ExtentReq*, int64_t, const Options&, int64_t*, in
 { unsupported(); }
 int Engine::register_buffer(void*, size_t) { unsupported(); }
 void Engine::unregister_buffer(int) { unsupported(); }
+int Engine::forget(int) { return 0; }
+int Engine::forget_path(const std::string&) { return 0; }
 Stats Engine::stats(bool) { unsupported(); }
 std::vector<TraceRec> Engine::trace(bool) { unsupported(); }
 const Config& Engine::config() const { unsupported(); }
@@ -1815,6 +2015,7 @@ std::string Engine::describe() const { unsupported(); }
 std::vector<std::string> Engine::fallbacks() const { unsupported(); }
 
 std::shared_ptr<Engine> default_engine() { unsupported(); }
+std::shared_ptr<Engine> default_engine_if_created() { return nullptr; }
 std::shared_ptr<Engine> configure_default(const Overrides&) { unsupported(); }
 void shutdown_default() {}
 bool ngram_route_engine() { return false; }
