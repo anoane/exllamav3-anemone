@@ -1491,7 +1491,8 @@ pool, `O_DIRECT`) and `io_uring` (raw syscalls, no liburing).
 
 Who uses it: `ngram_gather_cpu` (PLE n-gram tables, DeepSeek-V4.1 engram) when
 `EXL3_DISK_BACKEND` names a backend; with the variable unset or `auto`, `ngram_gather_cpu` runs
-its original thread pool verbatim. The Python entry points (`disk_gather_rows`,
+its original thread pool verbatim. The DeepSeek-V4.1 engram reads both of a layer's tables in
+one engine call under the same condition. The Python entry points (`disk_gather_rows`,
 `disk_read_extents`, `DiskTicket`, ...) always use the engine.
 
 All `EXL3_DISK_*` variables are read when the engine is first created (the first read that
@@ -2205,6 +2206,10 @@ set holds about 34 MiB, and the blocks a set gives up when it grows stay cached,
 Longer chunks stage through a transient pageable buffer instead. Read once per process, when the
 first DeepSeek-V4.1 model object is built (`Model.from_config`); set it before that. Its effect on
 prefill throughput has not been measured in isolation; it is an A/B switch.
+
+With `EXL3_DISK_BACKEND` naming a backend, the rows are read by the disk engine instead of
+`ngram_gather_cpu`: one call per layer for both tables, in class 2 on the prefetch worker and in
+class 0 inline, where decode-sized chunks also hold bulk reads back (Disk I/O engine, above).
 
 ### `EXL3_DSV41_PIPELINE` (default: `0`), `EXL3_DSV41_PIPELINE_CHUNK` (default: `4096`)
 

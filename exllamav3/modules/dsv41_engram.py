@@ -100,6 +100,10 @@ from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
 
 PREFETCH_ENABLED = os.environ.get("EXL3_DSV41_ENGRAM_PREFETCH", "1") != "0"   # A/B switch
+# EXL3_DISK_BACKEND naming a backend (doc/disk_engine.md) moves the row reads onto the disk
+# engine: one native call per layer for both tables, staged with a class (prefetch worker: 2;
+# inline at decode: 0, holding bulk reads back). Unset or auto: two ngram_gather_cpu calls
+DISK_ENGINE = os.environ.get("EXL3_DISK_BACKEND", "").strip().lower() not in ("", "auto")
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines: decode
                             # gathers are ~48 parallel preads, cheaper than the thread hop
 MAX_PIN_SETS = 2            # one with the last forward's uploads in flight, one being staged
@@ -447,7 +451,7 @@ class DSV41Engram(Module):
         fds = []
         for h in (self.w_handle, self.s_handle):
             fd = h._ensure_open()           # stc.close() at the end of load closes it; reopen
-            if hasattr(os, "posix_fadvise"):
+            if hasattr(os, "posix_fadvise") and not DISK_ENGINE:   # the engine advises its own
                 # 256-byte rows scattered over 91 GiB: readahead only evicts useful pages
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
             fds.append(fd)
@@ -481,9 +485,11 @@ class DSV41Engram(Module):
         return pin
 
     @torch.inference_mode()
-    def _stage(self, hist: torch.Tensor, pin: _PinSet, measure: bool, fds = None) -> int:
+    def _stage(self, hist: torch.Tensor, pin: _PinSet, measure: bool, fds = None,
+               cls: int = 0, hold: bool = False) -> int:
         """Hash, dedup and gather one chunk into pin; returns the unique row count. Runs on
-        the prefetch worker or inline (inference mode is thread-local)."""
+        the prefetch worker or inline (inference mode is thread-local). cls / hold: the disk
+        engine's request class and hold rule (EXL3_DISK_BACKEND only)."""
         if pin.event is not None:
             # the previous forward's non-blocking uploads read this set
             pin.event.synchronize()
@@ -508,10 +514,17 @@ class DSV41Engram(Module):
         pin.inv[:n].copy_(inv)
         if U:
             fw, fs = fds if fds is not None else self._fds()
-            ext.ngram_gather_cpu(fw, self.w_handle.abs_offset, self.w_handle.row_bytes,
-                                 uids, 0, pin.w[:U])
-            ext.ngram_gather_cpu(fs, self.s_handle.abs_offset, self.s_handle.row_bytes,
-                                 uids, 0, pin.s[:U])
+            if DISK_ENGINE:
+                # rows land at row i of the whole staging tensors: no slicing in Python
+                ext.disk_gather_rows(uids, 0, [fw, fs],
+                                     [self.w_handle.abs_offset, self.s_handle.abs_offset],
+                                     [self.w_handle.row_bytes, self.s_handle.row_bytes],
+                                     [pin.w, pin.s], cls = cls, hold = hold)
+            else:
+                ext.ngram_gather_cpu(fw, self.w_handle.abs_offset, self.w_handle.row_bytes,
+                                     uids, 0, pin.w[:U])
+                ext.ngram_gather_cpu(fs, self.s_handle.abs_offset, self.s_handle.row_bytes,
+                                     uids, 0, pin.s[:U])
         return U
 
     def _match(self, hist: torch.Tensor) -> dict | None:
@@ -565,7 +578,7 @@ class DSV41Engram(Module):
         self._pending.append({
             "hist": hist,
             "pin": pin,
-            "future": self.engram_ctx.executor.submit(self._stage, hist, pin, False, fds),
+            "future": self.engram_ctx.executor.submit(self._stage, hist, pin, False, fds, 2),
         })
 
     # ---- forward ----
@@ -613,7 +626,8 @@ class DSV41Engram(Module):
             self.prefetch_stats["miss"] += 1
             pin = self._acquire_pin(n)
             try:
-                U = self._stage(hist, pin, measure)
+                # decode-sized: rows the next block needs now, bulk reads held back meanwhile
+                U = self._stage(hist, pin, measure, cls = 0, hold = B * L < PREFETCH_MIN_TOKENS)
             except BaseException:
                 pin.held = False
                 raise
