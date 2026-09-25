@@ -5,12 +5,16 @@ the CUDA stream, event and device objects with stand-ins, so the eligibility rul
 schedule of the two stages, the job-state snapshots, the failure poisoning, the event waits,
 the allocator ownership records, the threads of prefetches and CPU-MoE passes and the stream
 ownership run without a GPU. The model is a two-module stand-in (one module per device).
+CrossingTests also cover EXL3_DSV41_XDEV_BF16 in the block that receives the streams at the
+split (DSV41Block.prepare_for_device, compiled from the source and run against stand-ins).
 
     python tests/test_dsv41_pipeline_.py
     pytest tests/test_dsv41_pipeline_.py
 """
 import contextlib
+import importlib.util
 import os
+from pathlib import Path
 import sys
 import threading
 import types
@@ -23,6 +27,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dsv41_ref import load_package_file, load_pipeline
 
 P = load_pipeline()
+spec = importlib.util.spec_from_file_location("stable_helpers", Path(__file__).with_name("test_stable_arithmetic_.py"))
+helpers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helpers)
 
 
 class Event:
@@ -442,6 +449,89 @@ class PipelineTests(unittest.TestCase):
                 self.assertRaises(RuntimeError, P.prefill_pipelined, m,
                                   torch.ones(1, 12, dtype = torch.long), params(State()))
             self.assertEqual(first.stream_waits, [plan.side1])
+
+
+class CrossingTests(unittest.TestCase):
+    """EXL3_DSV41_XDEV_BF16: what crosses the split, in the block and in the pipelined prefill"""
+
+    class X:
+        """A tensor on a stated device (the check never touches CUDA)"""
+        def __init__(self, t, device):
+            self.t, self.device, self.dtype = t, torch.device(device), t.dtype
+
+        def to(self, dtype):
+            return CrossingTests.X(self.t.to(dtype), self.device)
+
+        def float(self):
+            return self.to(torch.float)
+
+    def block(self, switch):
+        moved, fallback = [], []
+        ns = dict(torch = torch, dsv41_placement = types.SimpleNamespace(XDEV_BF16 = switch),
+                  to_device = lambda x, device: moved.append((x.dtype, str(device))) or self.X(x.t, device),
+                  super = lambda: types.SimpleNamespace(
+                      prepare_for_device = lambda x, p: fallback.append(x.dtype) or x))
+        method = helpers.method("exllamav3/modules/dsv41_block.py", "DSV41Block", "prepare_for_device", ns)
+        return (lambda x: method(types.SimpleNamespace(device = torch.device("cuda:1")), x, {})), moved, fallback
+
+    def test_block_rounds_and_widens_only_under_the_switch(self):
+        t = torch.tensor([1.0 + 2 ** -12, -3.0e38, 1.0e-30, 0.1])
+        prepare, moved, fallback = self.block(True)
+        y = prepare(self.X(t, "cuda:0"))
+        self.assertEqual(moved, [(torch.bfloat16, "cuda:1")])
+        self.assertEqual((y.dtype, str(y.device)), (torch.float, "cuda:1"))
+        self.assertTrue(torch.equal(y.t, t.to(torch.bfloat16).float()))
+        self.assertFalse(torch.equal(y.t, t))
+        # a BF16 input (rounded by the pipelined prefill's first stage) is only widened
+        moved.clear()
+        y = prepare(self.X(t.to(torch.bfloat16), "cuda:0"))
+        self.assertEqual(moved, [(torch.bfloat16, "cuda:1")])
+        self.assertTrue(torch.equal(y.t, t.to(torch.bfloat16).float()))
+        # not a GPU-to-GPU crossing of the FP32 streams: the plain move
+        moved.clear()
+        for x in (self.X(t, "cuda:1"), self.X(t, "cpu"), self.X(t.half(), "cuda:0")):
+            self.assertIs(prepare(x), x)
+        self.assertEqual(moved, [])
+        self.assertEqual(fallback, [torch.float, torch.float, torch.half])
+        # without the switch nothing is rounded or widened, BF16 input included
+        prepare, moved, fallback = self.block(False)
+        for x in (self.X(t, "cuda:0"), self.X(t.to(torch.bfloat16), "cuda:0")):
+            self.assertIs(prepare(x), x)
+        self.assertEqual(moved, [])
+        self.assertEqual(fallback, [torch.float, torch.bfloat16])
+
+    def test_pipeline_rounds_at_the_end_of_stage_1_only_under_the_switch(self):
+        for target, name, value in (
+            (P, "PIPELINE", True), (P, "SUB_CHUNK", 4),
+            (torch.cuda, "Stream", Stream), (torch.cuda, "Event", Event),
+            (torch.cuda, "device", lambda device: contextlib.nullcontext()),
+            (torch.cuda, "stream", lambda stream: contextlib.nullcontext()),
+            (torch.cuda, "current_stream", lambda device: Stream(device)),
+        ):
+            p = patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        for switch in (False, True):
+            with self.subTest(switch = switch):
+                seen = []
+
+                def run(m, mods, x, p):
+                    if stage_of(mods) == 1:
+                        return x + 1 / 3
+                    seen.append(x)
+                    return x
+
+                with patch.object(P.placement, "XDEV_BF16", switch), patch.object(P, "_run", run):
+                    P.prefill_pipelined(model(), torch.ones(1, 12, dtype = torch.long), params(State()))
+                self.assertEqual(len(seen), 3)
+                expect = torch.full((1, 4), 1 + 1 / 3)
+                for x in seen:
+                    if switch:
+                        self.assertEqual(x.dtype, torch.bfloat16)
+                        self.assertTrue(torch.equal(x, expect.to(torch.bfloat16)))
+                    else:
+                        self.assertEqual(x.dtype, torch.float)
+                        self.assertTrue(torch.equal(x, expect))
 
 
 if __name__ == "__main__":

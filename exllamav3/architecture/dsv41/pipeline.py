@@ -25,7 +25,9 @@ that waits on that event; its destination work uses the caller's second-device s
 When the call returns, the caller's first-device stream waits for the side stream.
 Source allocation ownership is recorded separately from producer-event ordering. The
 residual streams cross the split exactly as in the plain forward (the block's
-prepare_for_device), so both paths compute the same function.
+prepare_for_device), so both paths compute the same function; with EXL3_DSV41_XDEV_BF16=1
+S1 rounds them to BF16 on the first GPU, as that crossing would, so that only the BF16 copy
+waits for S2.
 
 The job state's scalar bookkeeping (position, window_beg, wshift) is shared by every layer
 and read live by the layer forwards, so the two halves need different values at the same
@@ -54,6 +56,7 @@ import threading
 import torch
 
 from ...cache.recurrent_util import advance_recurrent_states
+from . import placement
 
 PIPELINE = os.environ.get("EXL3_DSV41_PIPELINE", "0") != "0"
 
@@ -326,6 +329,10 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
             for m in plan.pf1:
                 m.prefetch(x, p)
             x = _run(model, plan.st1, x, p)
+            if placement.XDEV_BF16 and x.dtype == torch.float:
+                # the crossing's rounding (DSV41Block.prepare_for_device, which widens it on the
+                # second GPU), done here: the first GPU then holds half the bytes until S2's copy
+                x = x.to(torch.bfloat16)
             done = torch.cuda.Event()
             done.record(torch.cuda.current_stream(plan.dev1))
             # the second half runs this chunk from its start; the job moves on for the next S1

@@ -1992,12 +1992,12 @@ Memory: while the second GPU works on sub-chunk k, the first GPU already holds s
 working set, and sub-chunk k's first-GPU products stay allocated until both the next first half
 and this second half have finished (the calling thread and the worker both hold them): its
 residual streams, 80 KiB per token on DeepSeek-V4.1-Flash (4 streams x 5120 x FP32), 320 MiB at
-4096 tokens, and its params, which hold the top-k selections of the index sources before the
-split (2 KiB per row each), the candidate blocks when the candidate source (layer 20) is before
-it (8 KiB per row), the rope tables and block-table copies: with the split at layer 22 and 4096
-tokens, about 64 MiB more. Stage 2's own first-GPU buffers (the pool-replica staging of up to
-8 MiB across the split of an explicit placement, index-select outputs) are allocated on its side
-stream and come from that stream's own
+4096 tokens (half that with `EXL3_DSV41_XDEV_BF16=1`, below), and its params, which hold the
+top-k selections of the index sources before the split (2 KiB per row each), the candidate blocks
+when the candidate source (layer 20) is before it (8 KiB per row), the rope tables and
+block-table copies: with the split at layer 22 and 4096 tokens, about 64 MiB more. Stage 2's own
+first-GPU buffers (the pool-replica staging of up to 8 MiB across the split of an explicit
+placement, index-select outputs) are allocated on its side stream and come from that stream's own
 allocator pool, which the default stream does not reuse. The autosplit reserves none of this;
 leave that much headroom on the first GPU (its `-gs` budget or `EXL3_AUTOSPLIT_MARGIN_MB`). One
 extra CUDA stream on the first GPU, and one worker thread per sub-chunk.
@@ -2009,11 +2009,11 @@ and `-mcs` cannot place experts that way), 4096-token sub-chunks, 65,024 prompt 
 direct `model.prefill` calls of up to 16,384 tokens followed by a
 512-token continuation: 82.4 s plain and 67.2 s pipelined (1.23x) with the split crossing as in
 this code (FP32 residual streams) and every GPU arithmetic path fixed to be independent of the
-row count; 54.4 s and 40.6 s (1.34x) in a build with other options on as well, among them
-BF16 rounding of the crossing. Single unpublished runs that include continuation scoring and
-overlapped other host work, not a controlled prefill benchmark. The gain depends on how evenly
-the layers divide the work between the GPUs and on how much of each half the host spends
-waiting.
+row count; 54.4 s and 40.6 s (1.34x) in a build that also rounded the crossing to BF16
+(`EXL3_DSV41_XDEV_BF16=1`, with other options on as well). Single unpublished runs that include
+continuation scoring and overlapped other host work, not a controlled prefill benchmark. The gain
+depends on how evenly the layers divide the work between the GPUs and on how much of each half
+the host spends waiting.
 
 Determinism: each sub-chunk runs the same layers with the same inputs as a plain prefill in
 sub-chunk-sized calls, only overlapped; with arithmetic independent of the row count
@@ -2048,6 +2048,85 @@ model = Model.from_config(config)
 cache = Cache(model, max_num_tokens = 131072)
 model.load(max_chunk_size = 4096, use_per_device = [70, 130])   # layers 0-13 on the first GPU
 generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 16384)
+```
+
+### `EXL3_DSV41_XDEV_BF16` (default: `0`)
+
+Moves DeepSeek-V4.1's residual streams across a change of device in BF16 instead of FP32: half
+the bytes, at the cost of rounding them. Lossy and not measured on its own; off by default.
+
+What it changes: DeepSeek-V4.1 carries `hc_mult` = 4 residual streams per token in FP32 (the
+hyper-connection streams), 4 x `hidden_size` x 4 bytes = 80 KiB per token on DeepSeek-V4.1-Flash.
+When the model is split across GPUs, the first decoder layer past each change of device copies them
+from the previous GPU once per forward: 320 MiB for a 4096-token prefill chunk, 80 KiB per decoded
+token. With this switch the copy is rounded to BF16 on the source GPU (round to nearest even),
+moved (40 KiB per token, 160 MiB per 4096 tokens), and widened back to FP32 on the destination
+(`DSV41Block.prepare_for_device`). Each GPU keeps computing on FP32 streams; only the copy is
+narrowed. Nothing else that crosses changes: the carried hyper-connection pre-mix, and across the
+split of an explicit placement the pool replica rows, the top-k selections and the candidate
+blocks, cross as before, and a change of device right before the final head collapse (not a decoder
+layer) stays FP32.
+
+Values: `0` off (default), any other value on. Read once when `exllamav3` is imported: set it
+before the import. Python, for an A/B in one process: set
+`exllamav3.architecture.dsv41.placement.XDEV_BF16` to `True` or `False`; the block and the
+pipelined prefill read that attribute on every forward, so it takes effect at the next forward
+without reloading. Other architectures ignore it.
+
+What the rounding does to a value: BF16 keeps FP32's exponent range and 8 significant bits, so an
+ordinary value moves by at most 2^-8 (0.39%) of itself, a subnormal keeps 7 fraction bits,
+NaN stays NaN, and a finite FP32 value of magnitude 3.3962e38 or more (exactly: from
+(2 - 2^-8) x 2^127 = 3.39618e38, halfway above BF16's largest finite value 3.38953e38, which
+rounds to nearest even up to infinity) becomes an infinity. The residual streams stay many orders of
+magnitude below that; there is no range check. The rounded streams feed every layer past the
+split, so the effect on the output is not bounded by the per-value error.
+
+Interactions:
+
+- Only GPU-to-GPU crossings into a decoder layer: a load on one GPU has no crossing and is
+  unaffected, and so is a move from system RAM. With more than one change of device (three GPUs),
+  every crossing into a decoder layer is narrowed.
+- Pipelined prefill (`EXL3_DSV41_PIPELINE`, above): the first stage rounds the streams to BF16 on
+  the first GPU as soon as its half is done, and the block past the change only widens them. The
+  bits are the same as in the plain path, and the first GPU holds 40 instead of 80 KiB per token
+  of the sub-chunk waiting for the second stage (160 MiB less at 4096 tokens).
+- Without peer-to-peer access between the GPUs (`EXLLAMA_NO_P2P_COPY`), both legs of the copy
+  through system RAM move half the bytes.
+- `EXL3_STABLE_ARITHMETIC=1`: the rounding is elementwise, so results stay independent of the
+  chunk size and of decode versus prefill; they differ from those with the FP32 crossing.
+- Tensor-parallel loads (`-tp`) do not apply (DeepSeek-V4.1 refuses them); the tensor-parallel
+  backends have their own wire formats (`EXL3_TP_NO_FP16_WIRE`, `EXL3_TP_NCCL_FP32`).
+
+Performance and memory: the rounding and the widening are one elementwise conversion each; the
+saving is half of the copy's time, which depends on the link: at an effective 1 GB/s a
+4096-token chunk's crossing takes about 0.34 s in FP32 and 0.17 s in BF16, at 12 GB/s about 0.03
+and 0.014 s; decode moves 80 KiB per token either way, which is negligible. During the copy
+each side holds a transient BF16 copy next to the FP32 streams (40 KiB per token; the autosplit's
+measuring forward goes through the same crossing). The speed gain has not been measured on its
+own: the one pipelined-prefill timing with this switch on (54.4 s plain, 40.6 s pipelined, see
+`EXL3_DSV41_PIPELINE`) also had other options on and different arithmetic, so it measures
+neither the switch nor its absence.
+
+Determinism: the conversion is deterministic, so repeated runs give the same bits; the results
+differ from those with the FP32 crossing.
+
+Quality: not measured in isolation. The only comparison is one unpublished 20K-token teacher-forced
+run with ordinary arithmetic and two other options on (an FP32 router bias and FP32 fused compressor
+pooling): the change in negative log-likelihood against a vLLM reference capture was -0.00066 with
+the BF16 crossing and -0.00043 without, and both runs failed the same early-position agreement
+gates. One run with other options on is not evidence either way.
+
+When to use it: long prefills on a layer split where the copy at the change of device is a large
+part of the forward, e.g. GPUs without peer-to-peer access or on a narrow PCIe link. Keep it off
+when results must match the FP32 crossing, and for accuracy comparisons.
+
+```sh
+EXL3_DSV41_XDEV_BF16=1 EXL3_PLACEMENT="0-11=cuda:0; 12-39=cuda:1" python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 ...
+```
+
+```python
+from exllamav3.architecture.dsv41 import placement
+placement.XDEV_BF16 = True             # from the next forward on
 ```
 
 ### `EXL3_DSV41_ROUTER_BIAS` (default: unset)

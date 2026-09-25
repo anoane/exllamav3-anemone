@@ -50,12 +50,20 @@ These routes of one split stay exact with any number of other changes of device,
 those are free cuts: nothing is shared across a free cut, so no layer that reads across the split
 reads across another change of device too.
 
+The residual streams (hc_mult FP32 streams per token) cross every change of device once per
+forward, into the first block past it. XDEV_BF16 (EXL3_DSV41_XDEV_BF16=1) narrows that copy to
+BF16; the block widens it back to FP32 on its own device (modules/dsv41_block.py,
+DSV41Block.prepare_for_device), and the pipelined prefill rounds on the first device at the end of
+its first stage (pipeline.py).
+
 This module imports only the standard library at module scope (torch is imported inside
 DSV41LoadGuard.check), so tests and tools that must not import the compiled extension can load
 it by path.
 """
 
 from __future__ import annotations
+
+import os
 
 # Why DeepseekV41Model.load_gen and DSV41MoE.make_tp_allocation refuse tensor-parallel loading
 TP_REFUSAL = ("DeepSeek-V4.1: tensor-parallel loading is not implemented; load it as a layer "
@@ -70,6 +78,11 @@ PLACEMENT_DOC_REF = 'doc/placement.md, "DeepSeek-V4.1"'
 REPLICA_HINT = ("An explicit placement (EXL3_PLACEMENT / --placement) can instead change device "
                 "inside one kv group; the layers past it then read a replica of its pool "
                 f"({PLACEMENT_DOC_REF})")
+
+# EXL3_DSV41_XDEV_BF16=1: the FP32 residual streams cross a change of device as BF16, half the
+# bytes, at the cost of rounding them (doc/env_vars.md). Read once at import; the block and the
+# pipelined prefill read this attribute on every call
+XDEV_BF16 = os.environ.get("EXL3_DSV41_XDEV_BF16", "0") != "0"
 
 
 # ---------------------------------------------------------------------------

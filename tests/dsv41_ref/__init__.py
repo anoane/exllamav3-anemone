@@ -80,7 +80,8 @@ def load_numerics():
 def load_pipeline():
     """
     architecture/dsv41/pipeline.py, loaded by path into a stand-in package together with the
-    one module it imports (cache/recurrent_util.py), so its scheduling runs with torch alone.
+    two modules it imports (cache/recurrent_util.py and architecture/dsv41/placement.py), so its
+    scheduling runs with torch alone.
     """
     pkg = "_dsv41_pipeline_pkg"
     for name in (pkg, f"{pkg}.architecture", f"{pkg}.architecture.dsv41", f"{pkg}.cache"):
@@ -89,6 +90,8 @@ def load_pipeline():
             m.__path__ = []
             sys.modules[name] = m
     load_package_file("exllamav3/cache/recurrent_util.py", f"{pkg}.cache.recurrent_util", f"{pkg}.cache")
+    load_package_file("exllamav3/architecture/dsv41/placement.py",
+                      f"{pkg}.architecture.dsv41.placement", f"{pkg}.architecture.dsv41")
     return load_package_file("exllamav3/architecture/dsv41/pipeline.py",
                              f"{pkg}.architecture.dsv41.pipeline", f"{pkg}.architecture.dsv41")
 

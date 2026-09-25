@@ -43,6 +43,7 @@ import torch
 import torch.nn.functional as F
 from typing_extensions import override
 
+from ..architecture.dsv41 import placement as dsv41_placement
 from ..ext import exllamav3_ext as ext
 from ..model.math_policy import STABLE_ARITHMETIC
 from ..util.device_copy import to_device
@@ -191,6 +192,17 @@ class DSV41Block(TransformerBlock):
     def tp_export(self, plan, producer):
         # V4's export would rebuild V4 mixing (and has no engram)
         raise NotImplementedError("DSV41Block: tensor-parallel loading is not supported")
+
+    @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # EXL3_DSV41_XDEV_BF16: the FP32 residual streams cross between GPUs as BF16 and are
+        # widened back to FP32 here. A BF16 input was rounded on the other side already (the
+        # pipelined prefill does that at the end of its first stage). Without the switch nothing
+        # is rounded or widened
+        if dsv41_placement.XDEV_BF16 and x.device != self.device and x.device.type == "cuda" \
+                and x.dtype in (torch.float, torch.bfloat16):
+            return to_device(x.to(torch.bfloat16), self.device).float()
+        return super().prepare_for_device(x, params)
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
