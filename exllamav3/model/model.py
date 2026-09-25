@@ -445,6 +445,21 @@ class Model(Model_TPMixin, Model_LSMixin):
         return placement
 
 
+    def _apply_logits_dtype(self):
+        """
+        config.infer_params.fp32_logits: every logits-output module with an output dtype produces
+        FP32 logits instead of its own dtype. Applied at each load, before any module loads (the
+        output buffers, the autosplit's estimate and a tensor-parallel export take the dtype from
+        the module), so clearing the flag and loading again restores the module's own dtype
+        """
+        fp32 = self.config.infer_params.fp32_logits
+        for module in self.modules:
+            if module.caps.get("logits_output") and hasattr(module, "out_dtype"):
+                if not hasattr(module, "_own_out_dtype"):
+                    module._own_out_dtype = module.out_dtype
+                module.out_dtype = torch.float if fp32 else module._own_out_dtype
+
+
     def load_gen(
         self,
         device: torch.device | str | int | None = None,
@@ -560,6 +575,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
         # shares the config but loads after the main model's worker has already started)
         self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+
+        self._apply_logits_dtype()
 
         # An explicit placement names the device of every decoder layer. It applies to the text
         # component, whose layers its indices name

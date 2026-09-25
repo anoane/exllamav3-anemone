@@ -1413,6 +1413,73 @@ weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing 
 a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
 component.
 
+### `EXL3_FP32_LOGITS` (default: `0`)
+
+Default for `Config.infer_params.fp32_logits`: the output layer stores its logits in FP32
+instead of its own output dtype, which is FP16 on every architecture (none sets another). The
+output GEMM's FP32 result is then kept as it is instead of being rounded to FP16. Also settable
+per load via `config.infer_params.fp32_logits = True` or `-fp32_logits` / `--fp32_logits` in
+`model_init`-based scripts. No measured benefit on the one model it was compared on (below);
+off by default.
+
+What FP16 logits cost: FP16 has 11 significant bits, so a logit between 16 and 32 is rounded to a
+multiple of 2^-6 (0.016), between 32 and 64 to a multiple of 2^-5. Every log-probability computed
+from the logits (a `log_softmax` over the whole vocabulary, as perplexity and teacher-forced
+scoring do) inherits that rounding. With the flag on it is gone; the GEMM, its inputs and its
+accumulation are unchanged.
+
+Values: `0` off (default), any other value on. The variable is read when a config is built
+(`Config.from_directory`, as for every `infer_params` default); the attribute overrides it either
+way, and the flag (a switch) can only turn it on, not off. Set before loading: `Model.load` applies
+it to every module that produces logits (the modules with the `logits_output` capability that have
+an output dtype) before anything loads, so the output buffers, the autosplit's size estimate of the
+output layer and a tensor-parallel export all use FP32. Changing it on a loaded model has no effect
+until the next load; clearing it and loading again restores FP16.
+
+Interactions:
+
+- Every architecture, text and multimodal alike. An MTP head that shares the main model's config
+  (`--mtp`) produces FP32 logits too; a separate draft model (`-dm`) builds its own config, which
+  takes the variable but not the command-line flag.
+- The generator, the samplers and the evaluation scripts accept FP16 and FP32 logits (they
+  convert to FP32 themselves). Code of your own that assumes FP16 logits has to handle FP32.
+- Tensor-parallel loads gather twice the bytes of logits; not tested with tensor parallelism.
+
+Memory and performance: the logits buffer doubles, `vocab_size` x output rows x 4 bytes instead
+of x 2, e.g. 1 GiB instead of 0.5 GiB for 2048 rows over a 129,280-token vocabulary; the
+generator asks for the last token's logits only, so it matters mostly for scoring every position.
+The autosplit accounts for it (see `max_output_size` and `max_output_factor` of `Model.load`). In
+the runs below, which score every position, 64K prefill speed stayed within 1 tok/s of the same
+run without it (794-800 tok/s).
+
+Determinism: the logits are the same GEMM results without the final rounding, so they are exactly
+as reproducible as without the flag.
+
+What it measured: DeepSeek-V4.1-Flash (EXL3, 3.0 bpw), 65,535 teacher-forced predictions of one
+real text, arithmetic independent of the row count, one process per setting. The negative
+log-likelihood rose by 0.000005 under both attention numerics settings (95% block-bootstrap
+intervals [-0.000007, +0.000018] and [-0.000010, +0.000021]), 21 of 65,535 top-1 predictions
+changed, and the agreement with the vLLM reference captures stayed the same (confident flips per
+100K 161 without and 163 with it under `precise`, 150 and 153 under `deepseek:index`; certain
+misses unchanged); added to an FP32 router bias or an FP32 activation it changed their results
+by as little. The FP16 rounding of the logits is not a measurable source of error there.
+
+When to use it: measurements of log-probabilities (perplexity, teacher-forced comparisons with
+engines that keep FP32 logits) where the FP16 rounding of the logits should be ruled out. It gave
+nothing measurable for generation quality.
+
+```sh
+python eval/ppl.py -m /path/to/model -fp32_logits
+EXL3_FP32_LOGITS=1 python eval/ppl.py -m /path/to/model
+```
+
+```python
+config = Config.from_directory(model_dir)
+config.infer_params.fp32_logits = True     # before model.load()
+model = Model.from_config(config)
+model.load()
+```
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

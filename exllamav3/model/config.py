@@ -71,6 +71,10 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Logits in FP32 instead of the logits-output module's own output dtype (FP16 unless the
+        # architecture sets one): the head's output is stored without rounding it to FP16, in a
+        # buffer twice as large. Applied when the model loads
+        self.fp32_logits = os.environ.get("EXL3_FP32_LOGITS", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
