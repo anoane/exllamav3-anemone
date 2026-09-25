@@ -22,6 +22,8 @@ and skips):
                          tokenizer.json, safetensors shards including the engram tables)
     DSV41_DEEPSEEK_REF   DeepSeek's reference inference code for V4.1-Flash (model.py,
                          engram.py, kernel.py)
+    DSV41_VLLM_REF       a vLLM prompt-logprob capture of V4.1-Flash (tools/dsv41_capture_ref.py;
+                         the validation-harness tests)
 """
 
 import contextlib
@@ -99,6 +101,11 @@ def load_pipeline():
 def model_dir() -> str | None:
     """DSV41_MODEL_DIR, or None when it is not set."""
     return os.environ.get("DSV41_MODEL_DIR") or None
+
+
+def vllm_ref() -> str | None:
+    """DSV41_VLLM_REF, or None when it is not set."""
+    return os.environ.get("DSV41_VLLM_REF") or None
 
 
 def skip(test: str, reason: str):
