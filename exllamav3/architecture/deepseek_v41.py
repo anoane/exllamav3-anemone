@@ -42,7 +42,7 @@ from ..model.config import Config
 from ..model.model import Model
 from ..model.placement import parse as parse_placement
 from ..model.math_policy import STABLE_ARITHMETIC
-from .dsv41 import numerics, pipeline
+from .dsv41 import numerics, pipeline, router_bias
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
 V41_VALID_RATIOS = (0, 1, 2)
@@ -319,6 +319,16 @@ class DeepseekV41Config(Config):
         # sequences on a loaded model
         self._dsv41_packed_pools = weakref.WeakSet()
         self.dsv41_numerics = os.environ.get(numerics.ENV_NUMERICS)
+
+        # ---- router selection bias ----
+        # EXL3_DSV41_ROUTER_BIAS: a safetensors file with the original FP32 selection bias of
+        # every routed layer, checked against this checkpoint and added to its tensors, so the
+        # routers load FP32 values instead of the stored copy (architecture/dsv41/router_bias.py).
+        # The resolved path, or None
+        self.dsv41_router_bias = None
+        path = os.environ.get(router_bias.ENV_ROUTER_BIAS)
+        if path:
+            self.dsv41_router_bias = router_bias.attach(self, path)
 
     @property
     def dsv41_numerics(self) -> numerics.Numerics:

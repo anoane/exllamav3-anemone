@@ -2050,6 +2050,123 @@ model.load(max_chunk_size = 4096, use_per_device = [70, 130])   # layers 0-13 on
 generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 16384)
 ```
 
+### `EXL3_DSV41_ROUTER_BIAS` (default: unset)
+
+Loads DeepSeek-V4.1's router selection biases in FP32 from a separate file, for checkpoints that
+store them in FP16. An experiment switch: in the comparisons below it gave no measured gain.
+
+What it changes: every routed MoE layer adds a per-expert selection bias (`layers.N.ffn.gate.bias`)
+to its router scores before the top-k choice; the bias decides which experts are chosen, not their
+weights. DeepSeek keeps it in FP32. The DeepSeek-V4.1-Flash EXL3 checkpoints store it in FP16, where
+the values are large next to their spread: about 9 to 16 on layers 0-35 and 31 to 58 on layers
+36-39, where FP16 steps are 0.008 to 0.031, against a spread of 0.16 to 2.2 within a layer, so
+nearby biases share a value (layer 39's 384 fall on 11 distinct values, and each of layers 36-39 on
+10 to 11). The loader already keeps a selection bias wider than FP16 at its stored precision and
+gives the FP16 top-k kernels a copy centered on its mean (selection does not change when every bias
+moves by the same amount; centering leaves steps of about 1e-3 at these magnitudes), as it does for
+checkpoints that ship an FP32 bias. This variable supplies the FP32 values for that path. It cannot
+recover them from the FP16 checkpoint: the file must hold the original values.
+
+Value: the path of a safetensors file (relative to the working directory, or absolute) holding
+exactly the checkpoint's router biases, one tensor per routed layer, under the checkpoint's own
+names: `layers.N.ffn.gate.bias` for every `N` the checkpoint has one for (0-39 on
+DeepSeek-V4.1-Flash; the MTP blocks' `mtp.*` biases are not part of it), each FP32 with shape
+`[n_routed_experts]` (384 on Flash). Unset or empty: the checkpoint's biases, unchanged. Python:
+set the variable before `Config.from_directory`; afterwards `config.dsv41_router_bias` holds the
+resolved path of the file in use, or `None` (for information: changing it has no effect).
+
+When it is read: once, when a DeepSeek-V4.1 config is built (`Config.from_directory`). The file
+is then checked against the checkpoint and added to the config's tensor collection
+(`config.stc`), where its tensors replace the checkpoint's tensors of the same names, the way a
+quantized n-gram table is added during conversion. One line is printed:
+` !! EXL3_DSV41_ROUTER_BIAS: FP32 router selection bias of 40 layers from /path/to/file`. Every
+later load of those layers reads the FP32 values through the unchanged loader, whether the
+experts are in VRAM, in system RAM (`-mcl`, `-mcs`, `--placement ... experts=cpu|stream|split`)
+or split, including the expert reordering of a split load. The variable applies to every
+DeepSeek-V4.1 config built while it is set, e.g. a draft model's too (which then has to match
+the same file, see below); other architectures ignore it.
+
+Refused with a `ValueError` naming the variable when the config is built, before any weight is
+loaded (the tensor collection is left unchanged):
+
+- the path is not a file, or not a readable safetensors file;
+- the file lacks a router bias the checkpoint has, or holds any other tensor;
+- a bias is not FP32, not of shape `[n_routed_experts]`, or contains a NaN or an infinity;
+- a bias does not round to the checkpoint's stored copy exactly (FP32 to FP16, round to
+  nearest even): the file was taken from another model, revision or conversion. This ties a
+  file to its checkpoint;
+- the checkpoint has no router bias at all.
+
+Interactions:
+
+- A tensor override (`-or` / `--override` in `model_init`) is applied after the config is built,
+  as a layer over its collection; an override that names the same tensors takes precedence over
+  this file.
+- The attention numerics (`EXL3_DSV41_NUMERICS`), the arithmetic profile
+  (`EXL3_STABLE_ARITHMETIC`) and the other DeepSeek-V4.1 switches are independent of it; the
+  comparisons below ran it with each of them.
+- The file is read twice: when the config is built (to check it) and when the layers load. Do
+  not replace it in between.
+
+Performance and memory: the check reads the file (60 KiB on Flash) and the 40 stored biases once
+when the config is built. On the device each layer keeps its bias in FP32 plus the centered FP16
+copy for the top-k kernels: 2.25 KiB per layer instead of 0.75 KiB, 60 KiB more on Flash in
+total. Routing runs the same kernels on the same FP16 operands, so its speed does not change
+(64K prefill measured 799 against 798 tok/s under `precise`, and 794 against 796 under
+`deepseek:index`, in the runs below).
+
+Determinism: none of the arithmetic changes, only the bias values, so a run is as reproducible
+as without it. Results differ from the default, as they do for any change of the selection bias.
+
+What it measured. DeepSeek-V4.1-Flash (EXL3, 3.0 bpw), 65,535 teacher-forced predictions of one
+real text, arithmetic independent of the row count (`EXL3_STABLE_ARITHMETIC=1`), one process per
+setting; the interval is a 95% moving-block bootstrap (blocks of 1024 positions) of the change in
+negative log-likelihood (NLL) per prediction; confident and certain flips count, per 100K such
+positions, the positions where the top-1 token differs from that of a capture of vLLM's V4.1 path
+on the same checkpoint that gives its top-1 at least 50% and 90% probability (the mean over two
+captures):
+
+| Numerics | NLL without / with | Change [95% interval] | Top-1 changed | Confident flips | Certain flips |
+|---|---|---|---|---|---|
+| `precise` | 0.250939 / 0.250773 | -0.000166 [-0.000836, +0.000584] | 349 of 65,535 | 161 / 180 | 0.0 / 3.1 |
+| `deepseek:index` | 0.249963 / 0.250483 | +0.000521 [-0.000168, +0.001227] | 379 of 65,535 | 150 / 166 | 0.8 / 2.3 |
+
+Both intervals include zero, the NLL moves in opposite directions under the two numerics
+settings, and both add confident flips: about +12 and +15 per 100K as a main effect over every
+combination with FP32 logits and an FP32 activation that clamps and evaluates SiLU as
+DeepSeek's reference code does. With it, the 64K run failed the agreement gates against the
+first reference capture, which the run without it passed. Together with that activation it gave
+the highest NLL of all combinations under both settings: +0.000359 without and +0.000365 with
+FP32 logits under `precise`, +0.000821 without and +0.000817 with FP32 logits under
+`deepseek:index`, where both intervals ([+0.000068, +0.001550] without FP32 logits) exclude zero
+and no other interval does. The reading:
+the FP32 biases move a few hundred selections the way any change of the last bits does in this
+model, without a measurable gain; the lost precision of the FP16 biases is not a measurable
+source of error here. It was not measured at longer lengths.
+
+When to use it: to study the router bias's precision, or to compare with an engine that routes
+with the original FP32 biases. Not for serving: keep it unset.
+
+Making the file from the original checkpoint, which names the biases the same way:
+
+```python
+import glob, re
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+bias = {}
+for shard in glob.glob("/path/to/DeepSeek-V4.1-Flash/*.safetensors"):
+    with safe_open(shard, "pt") as f:
+        for key in f.keys():
+            if re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias", key):
+                bias[key] = f.get_tensor(key).float().contiguous()
+save_file(bias, "router_bias_fp32.safetensors")
+```
+
+```sh
+EXL3_DSV41_ROUTER_BIAS=router_bias_fp32.safetensors python eval/ppl.py -m /path/to/DeepSeek-V4.1-Flash-exl3
+```
+
 ### `EXL3_DSV41_ABLATE` (default: unset; tests and validation only)
 
 A comma-separated list of deliberate errors in DeepSeek-V4.1's function. Each token makes the
