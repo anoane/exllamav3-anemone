@@ -5,7 +5,8 @@ the explicit placement (EXL3_PLACEMENT) as V4.1 reads it when the model is built
 (its changes of device, the one allowed split and that split's pool routes and
 replica), the load guard's refusal of a cut kv group while a Cache is attached --
 through exllamav3's REAL autosplit loop (Model_LSMixin._load_autosplit) with CUDA
-stubbed out of it -- the checks at load and the post-load check.
+stubbed out of it -- the checks at load and the post-load check. Part C checks
+tools/dsv41_fit.py on the real headers.
 
 No GPU memory is allocated and no kernel runs: devices are torch.device
 objects, module loads are replaced by bookkeeping that raises
@@ -16,7 +17,8 @@ initializes the CUDA runtime, as it does for every test that imports it.)
     PYTHONPATH=$PWD python3 tests/test_dsv41_placement_.py [checkpoint-dir]    (default: $DSV41_MODEL_DIR)
 
 Part A needs only the checkpoint's config.json; part B also needs a working
-exllamav3 import (the built extension; nothing is compiled).
+exllamav3 import (the built extension; nothing is compiled); part C the
+checkpoint's shard headers.
 """
 import contextlib, importlib.util, io, json, os, sys, types
 
@@ -700,8 +702,91 @@ def run_post_load_check(path):
           "an explicit placement one summary line and no error past its split")
 
 
+# ---------------------------------------------------------------------------
+# C. tools/dsv41_fit.py on the real headers
+
+# The fit plan's figures for DeepSeek-V4.1-Flash 3.0 bpw at 1M tokens, chunk 2048, fp16 pools:
+# (layout, cuda:0 GiB, cuda:1 GiB, arena GiB), on the plan's capacities of 64.00 and 95.59 GiB
+FIT_PLAN = (("0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1", 59.73, 86.96, 52.38),
+            ("0-7=cuda:0; 8-22=cuda:1 experts=cpu; 23-39=cuda:1", 39.64, 87.56, 71.43),
+            ("0-10=cuda:0; 11-22=cuda:1 experts=cpu; 23-39=cuda:1", 54.9, None, 57.14))
+FIT_DEVICES = [("first", 64.00), ("second", 95.59)]
+
+
+def part_c(path):
+    if not any(f.endswith(".safetensors") for f in os.listdir(path)):
+        skip("fit tool (part C)", f"no shard headers in {path}")
+        return
+    F = load_by_path("_dsv41_fit", "tools/dsv41_fit.py")
+    sizes = F.Sizes(path)
+    topo, ne = sizes.topo, sizes.num_experts()
+    n = topo.num_hidden_layers
+    kw = dict(max_seq_len = 1048576, chunk = 2048, devices = FIT_DEVICES, context_gib = [0.5, 0.8])
+
+    # the fit tool routes an explicit placement with the engine's own rule: its split's routes,
+    # replica and crossings
+    lay = F.build_layout(topo, ne, placement = "0-11=cuda:0; 12-39=cuda:1")
+    ref = F.P.DSV41Placement(topo, (12,))
+    assert lay.split_at == 12 and lay.routes == ref.routes and lay.replicas == ref.replicas
+    assert lay.topk_cross == ref.topk_cross and lay.cand_cross == ref.cand_cross
+    # -mcl takes the first layers in load order, on the first device; -mcs without a placement is
+    # every layer on one device
+    r = F.compute(sizes, F.build_layout(topo, ne, mcl = 11), **kw)
+    assert r["arena_layers"] == list(range(11)) and r["devices"][0]["cpu"] == list(range(11))
+    r = F.compute(sizes, F.build_layout(topo, ne, mcs = 128), **kw)
+    assert r["arena_layers"] == list(range(n)), r["arena_layers"]
+    assert r["devices"][0]["split"] == r["arena_layers"] and not r["devices"][0]["resident"]
+    # experts=stream keeps the same bytes in RAM as experts=cpu
+    cpu = F.compute(sizes, F.build_layout(topo, ne, placement = FIT_PLAN[0][0]), **kw)
+    stream = F.compute(sizes, F.build_layout(topo, ne, placement = FIT_PLAN[0][0].replace("cpu", "stream")), **kw)
+    assert [d["total"] for d in cpu["devices"]] == [d["total"] for d in stream["devices"]]
+    assert cpu["arena"] == stream["arena"]
+    print("  OK  fit layouts: explicit placement routed as the engine routes it; -mcl on the first "
+          "layers; -mcs on every layer; experts=stream accounted as experts=cpu")
+
+    if sizes.rest[0] + sizes.routed_total(0) != RESIDENT or sizes.rest[0] + sizes.aux_total(0) != CPU_KEEP:
+        skip("fit plan figures", "they are for the DeepSeek-V4.1-Flash 3.0 bpw checkpoint; this one differs")
+        return
+    for spec, first, second, arena in FIT_PLAN:
+        r = F.compute(sizes, F.build_layout(topo, ne, placement = spec), **kw)
+        d0, d1 = r["devices"]
+        tol = 0.01 if not spec.startswith("0-10=") else 0.05     # the plan rounds split 11 to 0.1
+        assert abs(d0["total_gib"] - first) <= tol, (spec, d0["total_gib"], first)
+        if second is not None:
+            assert abs(d1["total_gib"] - second) <= 0.01, (spec, d1["total_gib"], second)
+        assert abs(r["arena_gib"] - arena) <= 0.01, (spec, r["arena_gib"], arena)
+        assert r["ok"], spec
+        print(f"  OK  fit {spec}: cuda:0 {d0['total_gib']:.2f} (plan {first}) | cuda:1 "
+              f"{d1['total_gib']:.2f} (plan {second}) | arena {r['arena_gib']:.2f} (plan {arena})")
+    # split 13 cannot fit a 64 GiB first device at any chunk: 13 resident layers are 63.34 GiB of
+    # weights, 64.60 GiB with the two rate-2 pools at 1M; the CLI exits non-zero for it and zero
+    # for split 12
+    s13 = "0-12=cuda:0; 13-22=cuda:1 experts=cpu; 23-39=cuda:1"
+    r13 = F.compute(sizes, F.build_layout(topo, ne, placement = s13), **dict(kw, chunk = 1))
+    assert r13["devices"][0]["total_gib"] > 64.0 and not r13["devices"][0]["fits"]
+    cli = ["--model", path, "--devices", "first:64.00,second:95.59", "--context-gib", "0.5,0.8",
+           "--host-ram-gib", "134.28"]
+    env = {k: os.environ.pop(k) for k in ("EXL3_PLACEMENT", "EXL3_MOE_CPU_OFFLOAD", "EXL3_MOE_CPU_SPLIT",
+                                          "EXL3_MOE_CPU_SPLIT_LAYERS") if k in os.environ}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert F.main(cli + ["--placement", s13]) == 1
+            assert F.main(cli + ["--placement", FIT_PLAN[0][0]]) == 0
+    finally:
+        os.environ.update(env)
+    # the frontier: no split past 12 fits, and 12 is where the fewest layers need RAM experts
+    rows = F.search(sizes, **dict(kw, host_ram_gib = 134.28))
+    assert all(r["cuts"][0] <= 12 for r in rows), [r["placement"] for r in rows]
+    best = min(rows, key = lambda r: len(r["arena_layers"]))
+    assert best["placement"] == "0-11=cuda:0; 12-21=cuda:1 experts=cpu; 22-39=cuda:1", best["placement"]
+    print(f"  OK  fit: split 13 needs {r13['devices'][0]['total_gib']:.2f} GiB on cuda:0 (exit 1); "
+          f"fewest layers in RAM at chunk 2048: {best['placement']} (cuda:1 headroom "
+          f"{best['devices'][1]['headroom_gib']:+.2f} GiB)")
+
+
 def main(path):
     P, _ = part_a(path)
+    part_c(path)
     part_b(path, P)
     print("  OK  test_dsv41_placement_")
 

@@ -91,6 +91,7 @@ def main(path):
 
     check_assembly(model)
     check_conversion_refused(path)
+    check_keymap(model, path)
     check_per_forward(model)
     check_chat_prompt(model, path)
 
@@ -254,6 +255,39 @@ def check_assembly(model):
 
     print(f"  OK  assembly: {n} DSV41Block + DSV41MoE, DSV41HeadCollapse, recurrent_state_cls "
           f"DSV41State, pools on {pools}")
+
+
+def check_keymap(model, path):
+    """tools/dsv41_keymap.py claims every tensor the checkpoint carries for the text model, and
+    every stem it claims has an owner in the real graph"""
+    import importlib.util
+    from exllamav3.modules.dsv41_block import DSV41HyperConnection
+    spec = importlib.util.spec_from_file_location(
+        "_dsv41_keymap", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                      "tools", "dsv41_keymap.py"))
+    km = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(km)
+    c = model.config
+    n = c.num_hidden_layers
+    blocks = model.modules[model.first_block_idx : model.first_block_idx + n]
+    r = km.check(path)
+    assert not r["missing"] and not r["unclaimed"], (r["missing"][:5], r["unclaimed"][:5])
+    owners = {m.key for m in model}
+    for m in model:
+        if isinstance(m, DSV41HyperConnection):
+            owners |= {f"{m.key}_{t}" for t in ("fn", "base", "scale")}
+    for b in blocks:
+        owners.add(f"{b.attn.key}.attn_sink")
+    for eg in model.engram_modules.values():
+        owners |= {f"{eg.key}.{t}" for t in ("wkv", "q_weight", "k_weight", "embed")}
+    orphan = sorted(set(km.expected(dict(
+        num_hidden_layers = n, o_groups = c.o_groups, compress_ratios = c.compress_ratios,
+        kv_source_layer_ids = c.kv_source_layer_ids,
+        index_source_layer_ids = c.index_source_layer_ids,
+        n_routed_experts = c.n_routed_experts, engram_layer_ids = c.engram_layer_ids))) - owners)
+    assert not orphan, f"keymap claims {len(orphan)} stems no module owns, e.g. {orphan[:5]}"
+    print(f"  OK  keymap claims all {r['expected']:,} text stems, each owned by a graph module "
+          f"({len(r['skipped'])} mtp/vision/aligner stems not loaded)")
 
 
 if __name__ == "__main__":

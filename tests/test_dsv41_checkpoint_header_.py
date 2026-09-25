@@ -1,12 +1,15 @@
 """
 Malformed checkpoint metadata is rejected before any payload allocation/read: the V4.1
 safetensors header checks (architecture/dsv41/checkpoint_header.py) and the reference engram
-table reader built on them (tests/dsv41_ref/engram_tables.py), on synthetic shards. CPU only;
-the compiled extension is not imported.
+table reader built on them (tests/dsv41_ref/engram_tables.py), on synthetic shards; and the
+checkpoint tools that read headers through the same checks (tools/dsv41_keymap.py,
+tools/dsv41_topology_check.py, tools/dsv41_fit.py). CPU only; the compiled extension is not
+imported.
 
     python -m pytest tests/test_dsv41_checkpoint_header_.py
 """
 
+import importlib.util
 import json
 import os
 import struct
@@ -22,6 +25,19 @@ from dsv41_ref import engram_tables as tables
 
 h = load_package_file("exllamav3/architecture/dsv41/checkpoint_header.py", "_dsv41_checkpoint_header")
 WK, SK = "layers.1.engram.embed.weight", "layers.1.engram.embed.scale"
+
+
+def load_tool(name):
+    spec = importlib.util.spec_from_file_location(f"_{name}_test", os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+keymap = load_tool("dsv41_keymap")
+topology = load_tool("dsv41_topology_check")
+fit = load_tool("dsv41_fit")
 
 
 def metadata():
@@ -143,3 +159,66 @@ def test_reference_reader_drains_workers_before_closing_files(monkeypatch):
     table.close()
     assert order == [("workers", {"wait": True}), ("map", None), ("fd", 123)]
     assert not table._maps and not table._fds
+
+
+@pytest.mark.parametrize("mutation", [None, "negative_offset", "overlap", "short_file", "bad_shape",
+                                      "nan", "unknown_dtype", "invalid_metadata", "bool_offset"])
+def test_checkpoint_tools_read_headers_through_the_same_checks(tmp_path, mutation):
+    header = metadata()
+    payload = b"\x38" * 96 + b"\x7f" * 3
+    if mutation == "negative_offset":
+        header[WK]["data_offsets"] = [-1, 95]
+    elif mutation == "overlap":
+        header[SK]["data_offsets"] = [95, 98]
+    elif mutation == "short_file":
+        payload = payload[:-1]
+    elif mutation == "bad_shape":
+        header[WK]["shape"] = [3, 33]
+    elif mutation == "nan":
+        header[WK]["shape"] = [float("nan"), 32]
+    elif mutation == "unknown_dtype":
+        header[WK]["dtype"] = "UNKNOWN"
+    elif mutation == "invalid_metadata":
+        header["__metadata__"]["format"] = 7
+    elif mutation == "bool_offset":
+        header[WK]["data_offsets"][0] = False
+    write(tmp_path / "table.safetensors", header, payload)
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 2, "compress_ratios": [0, 2],
+        "kv_source_layer_ids": [1], "index_source_layer_ids": [1]}))
+    readers = (lambda: keymap.ckpt_stems(tmp_path), lambda: topology.layer_stems(tmp_path),
+               lambda: fit.Sizes(tmp_path))
+    if mutation is None:
+        assert keymap.ckpt_stems(tmp_path) == ({"layers.1.engram.embed"}, 2)
+        assert topology.layer_stems(tmp_path) == {1: {"engram.embed"}}
+        sizes = fit.Sizes(tmp_path)
+        assert sizes.engram_table == [0, 99] and sizes.total == 99
+        return
+    for call in readers:
+        with pytest.raises(ValueError):
+            call()
+
+
+@pytest.mark.parametrize("missing", [None, "compressor.wkv", "compressor.norm",
+                                     "indexer.weights_proj", "indexer.k_norm"])
+def test_topology_checks_each_secondary_component(tmp_path, missing):
+    stems = ["compressor.wkv", "compressor.norm", "compressor.wgate", "indexer.wq_b",
+             "indexer.weights_proj", "indexer.wk", "indexer.k_norm"]
+    stems = [stem for stem in stems if stem != missing]
+    header = {f"layers.0.attn.{stem}.weight": {"dtype": "U8", "shape": [1], "data_offsets": [i, i+1]}
+              for i, stem in enumerate(stems)}
+    write(tmp_path / "table.safetensors", header, bytes(len(stems)))
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 1, "compress_ratios": [2],
+        "kv_source_layer_ids": [0], "index_source_layer_ids": [0], "engram_layer_ids": []}))
+    assert topology.main(tmp_path) == (0 if missing is None else 1)
+
+
+def test_keymap_claims_follow_the_topology():
+    cfg = dict(num_hidden_layers = 3, o_groups = 2, compress_ratios = [0, 2, 1],
+               kv_source_layer_ids = [1, 2], index_source_layer_ids = [1, 2], n_routed_experts = 2,
+               engram_layer_ids = [0])
+    stems = set(keymap.expected(cfg))
+    assert {"layers.1.attn.compressor.wgate", "layers.1.attn.indexer.wk", "layers.2.attn.compressor.wkv",
+            "layers.0.engram.embed", "layers.2.attn.wo_a.slice.1", "layers.2.ffn.experts.1.w3"} <= stems
+    assert "layers.2.attn.compressor.wgate" not in stems        # rate 1: no gate
+    assert not any(s.startswith("layers.0.attn.compressor") for s in stems)
+    assert not any(s.startswith("layers.1.engram") for s in stems)
