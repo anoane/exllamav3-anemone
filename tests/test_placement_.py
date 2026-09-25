@@ -67,9 +67,11 @@ class GrammarTests(unittest.TestCase):
                               f"{word.split('#')[0].strip(' ;').strip()!r}", e)
                 self.assertIn("leave EXL3_PLACEMENT unset or empty, pass --placement \"\", or set "
                               "config.infer_params.placement = None", e)
-        # ... but they are only refused as the whole value
-        with self.assertRaisesRegex(ValueError, "must look like"):
+        # ... but they are only refused as the whole value (a rule headed by one is an unknown rule)
+        with self.assertRaises(ValueError) as cm:
             P.parse("none=cuda:0")
+        self.assertIn("unknown rule 'none'", str(cm.exception))
+        self.assertNotIn("no placement is written", str(cm.exception))
 
     def test_refusals(self):
         for bad, why in (
@@ -89,8 +91,9 @@ class GrammarTests(unittest.TestCase):
             ("0-3=cuda:0 experts=split cpu=\u0667", "positive integer"),
             ("0-3=cuda:0 experts=split cpu=\u00b2", "positive integer"),
             ("0-3=cuda:0 experts=cpu node=0", "unknown attribute"),
-            ("0-3=cuda:0 hot=4", "unknown attribute"),
-            ("0-3=cuda:0 experts=hybrid", "must be one of"),
+            ("0-3=cuda:0 hot=4", r"hot= applies to experts=cache, stream and cpu \(experts=vram keeps"),
+            ("0-3=cuda:0 experts=hybrid", "experts=hybrid needs hot="),
+            ("0-3=cuda:0 experts=hybrid cpu=4", "cpu= only applies to experts=split"),
             ("0-3=cuda:0 experts=stream experts=cpu", "given twice"),
             ("embed=cuda:0; embed=cuda:1", "placed twice"),
             ("*=cuda:0; *=cuda:1", "placed twice"),

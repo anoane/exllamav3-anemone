@@ -23,11 +23,15 @@ is described under [No placement](#no-placement).
 
 ## Syntax
 
-One rule per layer range. Rules are separated by `;` or newlines, and `#` starts a comment that
-runs to the end of the line:
+One rule per layer range, plus optional storage rules. Rules are separated by `;` or newlines,
+and `#` starts a comment that runs to the end of the line. Double quotes protect a value that
+holds spaces, `;`, `#` or `"` (`\"` and `\\` escape inside them):
 
 ```
-<layers>=cuda:<n> [experts=<mode>] [cpu=<k>]
+<layers>=cuda:<n> [experts=<mode>] [hot=<k>|<p>%] [cpu=<k>] [prefetch=...] [profile=...]
+cuda:<n> <cache attributes>     # the expert cache of one GPU (experts=cache layers)
+ram <attributes>                # RAM budgets of the component, the RAM tier's policy
+disk <attributes>               # where experts and n-gram rows are read from at runtime
 ```
 
 | Part | Values |
@@ -35,16 +39,38 @@ runs to the end of the line:
 | `<layers>` | Decoder-layer indices counted from 0, as the model numbers them (the `N` of `layers.N` in its tensor names): a single layer `7`, an inclusive range `0-11`, or a list of both `0-3,8-11` (ASCII digits). `*` places every layer that no other rule lists. `embed` places the modules before the first layer, `head` the modules after the last one (final norm, output head). |
 | `cuda:<n>` | The device, a logical CUDA index after `CUDA_VISIBLE_DEVICES` remapping (as `torch` numbers it, not necessarily as `nvidia-smi` does). |
 | `experts=<mode>` | Where an MoE layer's routed experts live. Default `vram`. See below. |
+| `hot=<k>` or `hot=<p>%` | With `experts=cache`, `stream` or `cpu`: routed experts per layer kept resident in VRAM, a count or a share of the layer's routed experts (rounded half up). `hot=0` is the default. At least one expert must stay non-resident (`hot=E` asks for `experts=vram`). |
 | `cpu=<k>` | With `experts=split` only, and required there: routed experts per layer held in system RAM. |
+| `prefetch=` | With `experts=cache` or `stream`: `auto` (default), `off`, or methods joined by `+`: `layer[:<depth>]` (read the next layers' experts during prefill), `router[:<depth>]` (fetch predicted experts during decode). Not available in this build yet (see below). |
+| `profile=` | Not with `vram`: an expert profile (names or paths with weights, e.g. `code:3,wiki:1`) that seeds the hot and cached experts. Not available in this build yet. |
 
 The expert modes, with the older settings each one corresponds to:
 
 | `experts=` | Storage | Computation | Older equivalent |
 |---|---|---|---|
 | `vram` | GPU memory of the layer's device | that GPU | no offload |
+| `cache` | the GPU's expert cache, over the RAM tier and the disk ([expert_tiers.md](expert_tiers.md)) | the layer's GPU, from VRAM | new; not available in this build yet |
 | `stream` | system RAM | every expert a call selects is streamed to the layer's GPU and computed there, one-token decode included; no CPU expert arithmetic | `-mcl` with `-mcm stream_only` (`EXL3_MOE_CPU_MODE`) |
+| `stream hot=<k>` | `k` routed experts per layer in GPU memory, the rest in system RAM | the resident ones on the GPU, the others streamed to it; dynamic placement (`EXL3_MOE_CPU_SWAP`) re-chooses the resident ones between generations | `-mcs E-k` with `-mcm stream_only` |
 | `cpu` | system RAM | the CPU expert worker; during prefill the experts with at least `EXL3_MOE_STREAM_T` assignments in a chunk of at least `EXL3_MOE_STREAM_MIN_ROWS` rows are streamed to the GPU | `-mcl` |
-| `split` | the last `k` routed experts in system RAM, the others in GPU memory | the worker computes the RAM share, overlapping the GPU's share; with dynamic placement (`EXL3_MOE_CPU_SWAP`, on by default) the most-selected experts move to the GPU slots between generations | `-mcs k` |
+| `cpu hot=<k>` | `k` routed experts per layer in GPU memory, the rest in system RAM | the worker computes the RAM share, overlapping the GPU's share; dynamic placement as for `split` | `-mcs E-k` |
+| `split cpu=<k>` | the last `k` routed experts in system RAM, the others in GPU memory | the worker computes the RAM share, overlapping the GPU's share; with dynamic placement (`EXL3_MOE_CPU_SWAP`, on by default) the most-selected experts move to the GPU slots between generations | `-mcs k` |
+| `hybrid hot=<k>` | the older spelling of `cpu hot=<k>` (`hot=` required), printed as `cpu hot=<k>` | | |
+
+`cpu hot=<k>` and `split cpu=<E-k>` are the same layout, counted from the two sides; both
+spellings stay as written (turning one into the other needs the layer's number of experts).
+
+The storage rules, in short (each is described in full, with its defaults and checks, in
+[expert_tiers.md](expert_tiers.md)):
+
+| Rule | Attributes | In this build |
+|---|---|---|
+| `cuda:<n>` | `cache=auto\|0\|<size>`, `spare=<k>`, `evict=lru\|lfu`, `admit=adaptive\|heat\|always`: the expert cache of that GPU | needs `experts=cache` (not yet) |
+| `ram` | `experts=auto\|all\|<size>`, `ngram=auto\|all\|<size>`, `pagecache=auto\|<size>`: the component's RAM budgets; `policy=`, `demote=`, `evict=`: the RAM tier of `cache` layers | `experts=`, `ngram=` and `pagecache=` apply to `stream` / `cpu` / `split` layers and n-gram tables; the tier words need `experts=cache` |
+| `disk` | `experts=model\|off\|<dir>`, `ngram=model\|off\|<dir>`, `io=auto\|direct\|buffered` | `ngram=off` (with `ram ngram=all`); the rest needs `experts=cache` or is not yet available |
+
+Sizes are written as for the RAM budgets: `48GiB` (binary), `48GB` (decimal), `48` (GiB), never
+the ambiguous `48G`; see [expert_tiers.md](expert_tiers.md).
 
 Details:
 
@@ -61,16 +87,35 @@ Details:
 - `experts=` applies to layers with routed experts. On other layers (the dense layers of a model
   that mixes both, or every layer of a dense model) it has no effect, so a `*` rule may carry it
   over a mixed model.
-- Case does not matter (`CUDA:1`, `Experts=Stream`). Whitespace around rules and around the
-  first `=` is ignored; attributes are written without spaces (`experts=stream`, not
-  `experts = stream`), and so are ranges (`0-11`); whitespace around a comma in a list is ignored
-  (`0-3, 8-11` and `0-3 ,8-11` read as `0-3,8-11`). Numbers are ASCII digits.
+- Case does not matter for keywords and keys (`CUDA:1`, `Experts=Stream`, `RAM Experts=48gib`);
+  values that name things (paths, profiles) keep their case. Whitespace around rules and around
+  the first `=` of a layer rule is ignored; attributes are written without spaces
+  (`experts=stream`, not `experts = stream`, and `48GiB`, not `48 GiB`), and so are ranges
+  (`0-11`); whitespace around a comma in a list is ignored (`0-3, 8-11` and `0-3 ,8-11` read as
+  `0-3,8-11`). Numbers are ASCII digits.
+- Each storage rule appears at most once (one `cuda:<n>` rule per GPU, one `ram`, one `disk`); a
+  rule that only restates defaults is dropped (`ram pagecache=auto` says nothing).
 - The placement prints, and compares, in one canonical order: `embed`, the explicit layer rules
-  by first layer, `*`, `head`. `str()` of a parsed placement is that text, and parses back to an
-  equal placement.
-- One kind of RAM-held experts per GPU: `stream` layers and `cpu` / `split` layers must be placed
-  on different GPUs. The CPU worker keeps one streamed-prefill state per GPU (its bandwidth probe
-  and streaming threshold), which the two kinds use differently.
+  by first layer, `*`, `head`, then the `cuda:<n>` rules by index, `ram`, `disk`; attributes in a
+  fixed order (layer: `experts hot cpu prefetch profile`; device: `cache spare evict admit`;
+  ram: `experts ngram pagecache policy demote evict`; disk: `experts ngram io`), defaults
+  omitted, sizes in the largest exact unit, `hybrid hot=K` as `cpu hot=K`, values quoted only
+  when they need it. `str()` of a parsed placement is that text, and parses back to an equal
+  placement; placements are equal when their canonical texts are.
+- One kind of RAM-held experts per GPU: GPU-computed layers (`stream`, `cache`) and CPU-computed
+  layers (`cpu`, `split`) must be placed on different GPUs. The CPU worker keeps one
+  streamed-prefill state per GPU (its bandwidth probe and streaming threshold), which the two
+  kinds use differently.
+- Other forms of the same placement: a dict (`Placement.to_dict()`: `{"rules": [{"layers": "0-11",
+  "device": "cuda:0", "experts": "cpu"}, ...], "devices": {"cuda:1": {...}}, "ram": {...},
+  "disk": {...}}`), the same as a JSON object in a string, or `@<path>` to a file holding the rule
+  text (comments and newlines included) or the JSON. `parse()` takes all of them, and
+  `config.infer_params.placement` accepts a dict too.
+- Words the grammar has but this build cannot run yet (`experts=cache` and the storage words that
+  need it, `prefetch=`, `profile=`, `disk ngram=<dir>`, `disk io=`) are checked like any other
+  word, then refused with their own message, e.g. `placement '*=cuda:0 experts=cache':
+  experts=cache is not available in this build yet; it needs the expert tier runtime (a VRAM
+  expert cache per GPU over the RAM tier and the disk) (see doc/expert_tiers.md)`.
 
 ## No placement
 
@@ -87,6 +132,8 @@ is `None`, and the model loads as it would without this feature (the autosplit p
 | `--placement ""` | `model_init` scripts | `None`, also when `EXL3_PLACEMENT` is set: the option overrides the variable, so this clears it |
 | `config.infer_params.placement = None` | Python | `None` |
 | `config.infer_params.placement = ""` | Python | `None` (parsed when the model is built or loaded) |
+| `@<path>` to a file holding only whitespace, `;` separators and `#` comments (e.g. `@/dev/null`) | environment, `--placement`, attribute | `None` |
+| a dict, or a JSON object in a string, whose `rules` list is empty and that has no storage rule (`devices`, `ram` and `disk` absent or empty), e.g. `{"rules": []}` | attribute (dict); environment, `--placement`, attribute (JSON) | `None` |
 
 Refused with a `ValueError`, whatever the case: a whole value of `none`, `off`, `auto`,
 `default`, `0` or `false` (also with surrounding whitespace, `;` or a `#` comment), e.g.
@@ -98,10 +145,14 @@ mistake (a variable meant for another setting, a half-edited script) than a requ
 autosplit. The variable's value is refused when a `Config` is created, `--placement`'s when
 `model_init` builds the `Config`, and the attribute's when the model is built (DeepSeek-V4.1) or
 loaded.
+The same words are refused as the whole content of an `@<path>` file; the message then names
+the `@<path>` value.
 
 A placement that puts every layer on one GPU (`*=cuda:0`) is a placement, not "no placement": it
 fixes the device (the budgets no longer choose it), replaces `-mcl` / `-mcs` / `-mcm`, and is
-refused next to them like any other placement.
+refused next to them like any other placement. Storage rules without layer rules (`ram
+experts=48GiB` alone) are not "no placement" either: they are refused (without a placement, RAM
+budgets are set with `--expert_ram` / `--ngram_ram`).
 
 ## Examples
 
@@ -150,6 +201,28 @@ RAM-held experts, on different GPUs):
 0-14=cuda:0; 15-29=cuda:1; 30-44=cuda:2 experts=stream; 45-59=cuda:3 experts=cpu
 ```
 
+One GPU, 32 of every layer's 128 routed experts resident, the rest on the CPU worker (the same as
+`experts=split cpu=96`, i.e. `-mcs 96`):
+
+```
+*=cuda:0 experts=cpu hot=32
+```
+
+GPU streaming with a resident slice: 64 experts per layer in VRAM, the rest streamed from RAM
+(`-mcs E-64 -mcm stream_only`):
+
+```
+*=cuda:1 experts=stream hot=64
+```
+
+The serving layout of DeepSeek-V4.1 with the RAM of its CPU-computed layers capped at 56 GiB,
+and a PLE model's n-gram tables held in RAM up to 12 GiB:
+
+```
+0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1; ram experts=56GiB
+*=cuda:0; ram ngram=12GiB
+```
+
 A multi-line value, e.g. in a shell script:
 
 ```sh
@@ -172,10 +245,22 @@ cache = Cache(model, max_num_tokens = 65536)
 model.load(use_per_device = [22, 44])       # budgets cap memory; they do not move layers
 ```
 
+The same as a dict, as JSON, or from a file:
+
+```python
+config.infer_params.placement = {"rules": [{"layers": "0-11", "device": "cuda:0"},
+                                           {"layers": "12-22", "device": "cuda:1", "experts": "stream"},
+                                           {"layers": "23-39", "device": "cuda:1"}]}
+```
+
+```sh
+python examples/chat.py -m /path/to/model --placement @/etc/exl3/v41.placement
+```
+
 `exllamav3.model.placement.parse(text)` returns the parsed `Placement` (or `None` for an empty
 value, see [No placement](#no-placement)) and raises `ValueError` on a malformed one;
 `placement.layer_map(range(num_layers))` checks that it covers a model's layers, without loading
-anything.
+anything; `placement.to_dict()` gives the dict form.
 
 ## How a load applies it
 
@@ -207,6 +292,13 @@ headroom checks as the autosplit:
 - The loader reports RAM-held layers as with `-mcl` / `-mcs`, e.g. `-- CPU-offloaded experts
   (streamed to cuda:1, no CPU compute): model.layers.12.mlp` or `-- CPU-offloaded experts
   (worker): model.layers.12.mlp`.
+- `hot=<k>` on `stream` / `cpu` layers runs through the split machinery (as `-mcs E-k`, with
+  `-mcm stream_only` for `stream`), so the layer's resident slice holds `k` experts.
+- The `ram` rule's requests are checked before anything loads, against the flags (`ram
+  experts=64GiB` next to `--expert_ram 48GiB` is refused: the flags are caps), against what the
+  `stream` / `cpu` / `split` layers take (`ram experts=48GiB` below it is refused), and with the
+  n-gram tables against the host memory; `ram ngram=` decides which n-gram tables load in RAM.
+  See [expert_tiers.md](expert_tiers.md).
 
 ## Refusals
 
@@ -219,12 +311,19 @@ When the value is parsed (at `Config` creation for `EXL3_PLACEMENT`, in `model_i
   `cpu` or `split`, and the token embedding already lives in system RAM);
 - malformed or backwards layer ranges (digits other than ASCII included), a layer listed twice in
   one rule or placed by two rules, `*`, `embed` or `head` placed twice;
-- an unknown attribute or `experts=` value, an attribute given twice, `experts=` on `embed` /
-  `head`, `split` without `cpu=`, `cpu=` without `split`, `cpu=` not a positive integer of ASCII
-  digits;
-- `stream` and `cpu` / `split` layers on the same GPU;
-- a whole value of `none`, `off`, `auto`, `default`, `0` or `false` (see
-  [No placement](#no-placement)).
+- an unknown attribute or `experts=` value (with a did-you-mean hint, or the rule a misplaced
+  key belongs to), an attribute given twice, `experts=` on `embed` / `head`, `split` without
+  `cpu=`, `cpu=` without `split`, `cpu=` not a positive integer of ASCII digits;
+- `hot=` on `vram` or `split`, `hybrid` without `hot=`, a share outside (0%, 100%), `prefetch=`
+  on `vram` or `cpu`, `profile=` on `vram`;
+- GPU-computed (`stream`, `cache`) and CPU-computed (`cpu`, `split`) layers on the same GPU;
+- an unknown rule (`rams ...`), a storage rule given twice or with `=<value>`, a malformed size
+  (`48G` is ambiguous), and every storage check of [expert_tiers.md](expert_tiers.md) (e.g. `ram
+  experts=` with every layer in VRAM, a storage rule without layer rules, `disk ngram=off`
+  without `ram ngram=all`);
+- a whole value of `none`, `off`, `auto`, `default`, `0` or `false`, also as the whole content of
+  an `@<path>` file (see [No placement](#no-placement));
+- a word this build cannot run yet, after all of the above.
 
 At `model.load()`, before anything loads, a `ValueError` for:
 
@@ -235,7 +334,17 @@ At `model.load()`, before anything loads, a `ValueError` for:
   `moe_cpu_mode` value is reported as invalid first.);
 - a single-device load (`model.load(device = ...)`) or tensor-parallel loading (`-tp`);
 - a rule naming a layer the model does not have, or a layer no rule places;
-- a device beyond the visible GPUs, or one the budgets exclude.
+- a device beyond the visible GPUs, or one the budgets exclude;
+- a `ram` request above its flag (`placement asks ram experts=64GiB (64.0 GiB) but --expert_ram
+  caps this component at 48GiB`, the same for `ngram=` and `--ngram_ram`), and `stream` / `cpu`
+  / `split` layers that keep more experts in RAM than `ram experts=` or `--expert_ram` allows
+  (`placement: the stream / cpu layers keep 52.4 GiB of routed experts in RAM, more than ram
+  experts=48GiB; ...`); `disk ngram=off` next to DeepSeek-V4.1 engram tables, which are always
+  read from disk.
+
+Then a `RuntimeError` when the host cannot hold what the load keeps in RAM (the RAM-held experts
+and n-gram tables together, plus `EXL3_HOST_MEM_RESERVE_MB`, against MemAvailable or the memory
+cgroup's limit; see [expert_tiers.md](expert_tiers.md)).
 
 While the layers load: a `ValueError` for a `split` layer whose `cpu=` is not below its number of
 routed experts, and the two `RuntimeError`s described above (a module that does not fit its

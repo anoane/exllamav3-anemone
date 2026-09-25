@@ -322,6 +322,81 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(b.worth_reporting())
 
 
+class PlacementRequestTests(unittest.TestCase):
+    """The placement's ram rule: requests, capped by the flags (placement.py loaded by path)"""
+
+    P = load("_placement_budget_subject", "exllamav3/model/placement.py")
+
+    def plan(self, mdl, text, avail = 150):
+        with patch.dict(os.environ, {"EXL3_HOST_MEM_RESERVE_MB": "2048"}):
+            return RB.plan_component(mdl, self.P.parse(text), memory = memory(avail))
+
+    def offloaded(self, n = 11):
+        stc, moes = v41(range(n))
+        for m in moes:
+            m._plan = ("ram", "hybrid", 0)
+        return stc, moes
+
+    def test_expert_requests(self):
+        stc, moes = self.offloaded()
+        # a request above the cap
+        with self.assertRaises(ValueError) as cm:
+            self.plan(model(moes, stc, expert_ram = RB.as_expert_ram("48GiB")), "*=cuda:0 experts=cpu; ram experts=64GiB")
+        self.assertEqual(str(cm.exception), "placement asks ram experts=64GiB (64.0 GiB) but --expert_ram caps this "
+                                            "component at 48GiB")
+        # the stream / cpu arenas above the request
+        with self.assertRaises(ValueError) as cm:
+            self.plan(model(moes, stc), "0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1; ram experts=48GiB")
+        self.assertEqual(str(cm.exception), "placement: the stream / cpu layers keep 52.4 GiB of routed experts in RAM, "
+                                            "more than ram experts=48GiB; raise it, or keep fewer layers' experts in RAM")
+        with self.assertRaisesRegex(ValueError, "more than ram experts=0; raise it"):
+            self.plan(model(moes, stc), "*=cuda:0 experts=cpu; ram experts=0")
+        # all is what the layers need, and still within the cap
+        with self.assertRaises(ValueError) as cm:
+            self.plan(model(moes, stc, expert_ram = RB.as_expert_ram("48GiB")), "*=cuda:0 experts=cpu; ram experts=all")
+        self.assertEqual(str(cm.exception), "placement asks ram experts=all (52.4 GiB) but --expert_ram caps this "
+                                            "component at 48GiB")
+        # a request that fits: the ledger holds what the arenas take, not the request
+        b = self.plan(model(moes, stc, expert_ram = RB.as_expert_ram("64GiB")), "*=cuda:0 experts=cpu; ram experts=64GiB",
+                      avail = 55)
+        self.assertEqual((str(b.expert_request), b.expert_bytes), ("64GiB", 11 * 384 * V41_EXPERT))
+        for req in ("all", "auto"):
+            self.plan(model(moes, stc), f"*=cuda:0 experts=cpu; ram experts={req}", avail = 55)
+        with self.assertRaisesRegex(RuntimeError, r"^placement: ram experts=52.4 GiB needs .*; lower the budgets or use auto$"):
+            self.plan(model(moes, stc), "*=cuda:0 experts=cpu; ram experts=all", avail = 54)
+
+    def test_ngram_requests(self):
+        stc = Checkpoint()
+        tables = [NGram("a.ngram", 10 * GiB), NGram("b.ngram", 3 * GiB), NGram("c.ngram", 5 * GiB)]
+        with self.assertRaises(ValueError) as cm:
+            self.plan(model(tables, stc, ngram_ram = RB.as_ngram_ram("6GiB")), "*=cuda:0; ram ngram=8GiB")
+        self.assertEqual(str(cm.exception), "placement asks ram ngram=8GiB but --ngram_ram caps this component at 6GiB")
+        with self.assertRaisesRegex(ValueError, "placement asks ram ngram=all but --ngram_ram caps this component at 17GiB"):
+            self.plan(model(tables, stc, ngram_ram = RB.as_ngram_ram("17GiB")), "*=cuda:0; ram ngram=all")
+        # the request is the budget; -ngr all caps nothing
+        b = self.plan(model(tables, stc, ngram_ram = RB.ALL), "*=cuda:0; ram ngram=8GiB")
+        self.assertEqual(sorted(t.key for t in b.ngram_held), ["b.ngram", "c.ngram"])
+        b = self.plan(model(tables, stc), "*=cuda:0; ram ngram=all; disk ngram=off")
+        self.assertEqual(b.ngram_bytes, 18 * GiB)
+        # auto: what is left after the reserve, the page cache and the experts
+        b = self.plan(model(tables, stc), "*=cuda:0; ram ngram=auto pagecache=16GiB", avail = 30)
+        self.assertEqual(sorted(t.key for t in b.ngram_held), ["b.ngram", "c.ngram"])       # room 12 GiB
+        b = self.plan(model(tables, stc), "*=cuda:0; ram ngram=auto pagecache=10GiB", avail = 30)
+        self.assertEqual(len(b.ngram_held), 3)                                              # room 18 GiB
+        b = self.plan(model(tables, stc), "*=cuda:0; ram ngram=auto", avail = 30)          # MemTotal / 8 = 20 GiB
+        self.assertEqual(sorted(t.key for t in b.ngram_held), ["b.ngram", "c.ngram"])       # room 8 GiB
+        b = self.plan(model(tables, stc), "*=cuda:0; ram ngram=auto", avail = 29.9)
+        self.assertEqual(sorted(t.key for t in b.ngram_held), ["b.ngram"])
+
+    def test_engram_never_off_the_disk(self):
+        mdl = model([DSV41Engram("model.layers.1.engram")], Checkpoint())
+        with self.assertRaises(ValueError) as cm:
+            self.plan(mdl, "*=cuda:0; ram ngram=all; disk ngram=off")
+        self.assertEqual(str(cm.exception), "placement: 'disk ngram=off' would never read n-gram rows from disk, but the "
+                                            "DeepSeek-V4.1 engram tables of model.layers.1.engram are always read from "
+                                            "disk; remove disk ngram=off")
+
+
 class NgramDecisionTests(unittest.TestCase):
 
     def test_plan_then_budget(self):

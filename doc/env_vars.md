@@ -1368,7 +1368,8 @@ layer-split mode. One rule per range of decoder layers gives their GPU and, for 
 the routed experts live:
 
 ```
-<layers>=cuda:<n> [experts=vram|stream|cpu|split] [cpu=<k>]
+<layers>=cuda:<n> [experts=vram|stream|cpu|split|cache] [hot=<k>|<p>%] [cpu=<k>]
+ram [experts=<size>|all|auto] [ngram=<size>|all|auto] [pagecache=<size>|auto]
 ```
 
 Layers are `7`, `0-11`, `0-3,8-11`, `*` (every layer no other rule lists), `embed` (the modules
@@ -1376,14 +1377,19 @@ before the first layer) or `head` (after the last); rules are separated by `;` o
 starts a comment. `experts=vram` (default) keeps the experts in the GPU's memory, `stream` keeps
 them in system RAM and computes them on the layer's GPU only (as `-mcl` with
 `EXL3_MOE_CPU_MODE=stream_only`), `cpu` computes them on the CPU worker (as `-mcl`), and
-`split cpu=<k>` keeps `k` of every layer's routed experts on the worker (as `-mcs k`). The complete
-grammar, the loader's behaviour and worked examples are in [placement.md](placement.md).
+`split cpu=<k>` keeps `k` of every layer's routed experts on the worker (as `-mcs k`);
+`stream hot=<k>` / `cpu hot=<k>` keep `k` of them resident in VRAM (as `-mcs E-k`). The storage
+rules `cuda:<n>`, `ram` and `disk` add the component's RAM budgets (the `ram` rule's requests,
+capped by `EXL3_EXPERT_RAM` / `EXL3_NGRAM_RAM`) and the expert tier (`experts=cache`, not
+available in this build yet). The value may also be a JSON object or `@<path>` to a file holding
+either form. The complete grammar, the loader's behaviour and worked examples are in
+[placement.md](placement.md) and [expert_tiers.md](expert_tiers.md).
 
-No placement: unset, empty, or only whitespace, `;` and `#` comments; `--placement ""` clears a
-set variable; the Python attribute `None` (or `""`). The autosplit and `-mcl` / `-mcs` / `-mcm`
-then decide, as before. A whole value of `none`, `off`, `auto`, `default`, `0` or `false` is
-refused with a `ValueError`, not read as "no placement" (placement.md, "No placement", says why
-and lists every spelling).
+No placement: unset, empty, or only whitespace, `;` and `#` comments (also as the content of an
+`@<path>` file); `--placement ""` clears a set variable; the Python attribute `None` (or `""`).
+The autosplit and `-mcl` / `-mcs` / `-mcm` then decide, as before. A whole value of `none`,
+`off`, `auto`, `default`, `0` or `false` is refused with a `ValueError`, not read as "no
+placement" (placement.md, "No placement", says why and lists every spelling).
 
 When it is read: the variable when a `Config` is created (a malformed value raises a `ValueError`
 there); `--placement` when `model_init` builds the `Config`, overriding the variable; the Python

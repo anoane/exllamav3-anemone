@@ -15,7 +15,16 @@ It is the reference for:
 | Host memory kept free by every check | none | `EXL3_HOST_MEM_RESERVE_MB` | none | `2048` |
 
 The explicit placement ([placement.md](placement.md)) says which layers keep their experts in
-system RAM. The budgets say how much RAM they may take in total.
+system RAM. The budgets say how much RAM they may take in total. The placement's storage rules
+(`cuda:<n>`, `ram`, `disk`, below) extend it with the three levels of the expert tier; the flags
+are caps, the placement's `ram` rule is the request.
+
+**In this build.** The budgets, the `ram` rule's `experts=` / `ngram=` / `pagecache=` for
+`stream` / `cpu` / `split` layers and n-gram tables, `hot=` on `stream` / `cpu`, `disk ngram=off`
+and the dict / JSON / file forms work. The expert tier itself (`experts=cache`, the `cuda:<n>`
+rule, the RAM tier's `policy=` / `demote=` / `evict=`, `disk experts=`) and `prefetch=`,
+`profile=`, `disk ngram=<dir>`, `disk io=` are parsed and checked in full, then refused as not
+available yet (`placement_storage.PENDING`).
 
 ## Sizes
 
@@ -122,6 +131,23 @@ contradiction. `config.infer_params.ngram_stream_from_disk` is now derived: `Fal
 | `draft_expert_ram` | `-der` > no cap |
 | `ngram_ram` | `-ngr` > `EXL3_NGRAM_RAM` > `EXL3_NGRAM_STREAM=0` (= `all`) > `0` |
 
+With a placement, its `ram` rule is the request and the flags stay caps:
+
+| | `ram experts=` (request) | `--expert_ram` (cap) | Result |
+|---|---|---|---|
+| neither | | | the layers take what they need |
+| cap only | | `48GiB` | the layers' need, refused above 48 GiB |
+| request only | `64GiB` | | refused when the `stream` / `cpu` / `split` layers need more than 64 GiB |
+| both | `64GiB` | `48GiB` | refused: `placement asks ram experts=64GiB (64.0 GiB) but --expert_ram caps this component at 48GiB` |
+| `all` / `auto` | `all` | `48GiB` | `all` is what the layers need: refused when that exceeds the cap |
+
+`ram ngram=` works the same way against `--ngram_ram` (`placement asks ram ngram=8GiB but
+--ngram_ram caps this component at 6GiB`; `-ngr all` caps nothing). `ram ngram=auto` takes what
+the host has left after `EXL3_HOST_MEM_RESERVE_MB`, the page cache kept free (`ram pagecache=`,
+default `auto` = max(8 GiB, MemTotal / 8)) and the RAM-held experts, and fills it with whole
+tables as a size would. The placement names the main model's layers, so its `ram` rule applies to
+the main model's text component only.
+
 The variables are read when a `Config` is created (a malformed value raises a `ValueError`
 there); the flags when `model_init` builds it (argparse refuses a malformed value with the size
 error); the Python attributes accept a size string, a number (GiB), `None` and, for `ngram_ram`,
@@ -203,3 +229,205 @@ with the same view of the cgroup.
 
 Refusals of sizes and flags are `ValueError`s (argparse exits with the message for the flags);
 the host check and the worker's guard raise `RuntimeError`.
+
+## The placement's storage rules
+
+Three rules, headed by the resource they govern, join the layer rules of a placement:
+
+```
+0-11=cuda:0; 12-39=cuda:1 experts=cache hot=16; cuda:1 cache=75GiB spare=12; ram experts=48GiB ngram=6GiB; disk experts=model
+```
+
+### Grammar
+
+```ebnf
+placement   = [ rule ] , { separator , [ rule ] } ;        (* or a JSON object, or "@" path *)
+separator   = ";" | newline ;
+comment     = "#" , { char - newline } ;                  (* outside quotes; ignored *)
+
+rule        = layer-rule | module-rule | device-rule | ram-rule | disk-rule ;
+layer-rule  = layers , [ws] , "=" , [ws] , device , { ws , layer-attr } ;
+module-rule = ( "embed" | "head" ) , [ws] , "=" , [ws] , device ;
+device-rule = device , ws , device-attr , { ws , device-attr } ;
+ram-rule    = "ram" , ws , ram-attr , { ws , ram-attr } ;
+disk-rule   = "disk" , ws , disk-attr , { ws , disk-attr } ;
+
+layers      = "*" | range , { [ws] , "," , [ws] , range } ;
+range       = uint , [ "-" , uint ] ;
+device      = "cuda:" , uint ;
+
+layer-attr  = "experts=" , ( "vram" | "cache" | "stream" | "cpu" | "split" | "hybrid" )
+            | "hot=" , ( uint | share )                          (* cache, stream, cpu, hybrid *)
+            | "cpu=" , uint                                      (* split only *)
+            | "prefetch=" , ( "auto" | "off" | method , { "+" , method } )
+            | "profile=" , value ;
+method      = ( "layer" | "router" ) , [ ":" , uint ] ;          (* depth, default 1 *)
+
+device-attr = "cache=" , ( "auto" | size )
+            | "spare=" , uint
+            | "evict=" , ( "lru" | "lfu" )
+            | "admit=" , ( "adaptive" | "heat" | "always" ) ;
+
+ram-attr    = "experts=" , budget
+            | "ngram=" , budget
+            | "pagecache=" , ( "auto" | size )
+            | "policy=" , ( "lazy-exclusive" | "exclusive" | "inclusive" )
+            | "demote=" , ( "swap" | "heat" | "all" | "off" )
+            | "evict=" , ( "lfu" | "lru" ) ;
+
+disk-attr   = "experts=" , source
+            | "ngram=" , source
+            | "io=" , ( "auto" | "direct" | "buffered" ) ;
+source      = "model" | "off" | value ;                         (* value: a directory *)
+
+budget      = "auto" | "all" | size ;                           (* "0" is a size *)
+size        = number , [ unit ] ;                               (* no unit: GiB *)
+unit        = "B" | "KiB" | "Ki" | "KB" | "MiB" | "Mi" | "MB"
+            | "GiB" | "Gi" | "GB" | "TiB" | "Ti" | "TB" ;        (* case-insensitive; bare K/M/G/T refused *)
+share       = number , "%" ;
+number      = uint , [ "." , digit , { digit } ] ;
+uint        = digit , { digit } ;                               (* ASCII digits *)
+value       = bare | quoted ;
+bare        = vchar , { vchar } ;                               (* no space, ";", "#", '"' *)
+quoted      = '"' , { char - ( '"' | "\" ) | "\" , char } , '"' ;
+ws          = ( " " | tab ) , { " " | tab } ;
+```
+
+Keywords and keys are case-insensitive; values that name things (paths, profiles) keep their
+case.
+
+### `cuda:<n>`: the expert cache of one GPU
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `cache=` | `auto` | the VRAM pool of this GPU's `experts=cache` layers, shared by all of them (one global least-recently-used pool per GPU). `auto` = what the device has left inside its `-gs` budget after the placed modules, the Cache, the generator's statics, the prefill staging, `EXL3_AUTOSPLIT_MARGIN_MB` and `EXL3_MOE_TIER_HEADROOM_MB`. `0` = no cache (every miss streams through staging). A size is at least top-k + `spare` slots. `all` is refused: write `experts=vram` |
+| `spare=` | `8` | free slots kept ready, so a promotion never waits on a demotion's copy |
+| `evict=` | `lru` | which slot a promotion replaces: `lru` (least recently used, the slots of the current step protected) or `lfu` (lowest decayed heat) |
+| `admit=` | `adaptive` | which decode misses enter the cache: `adaptive` (with a probability adapted so the VRAM and RAM tiers' cache lives match), `heat` (when warmer than the slot it would replace), `always` |
+
+### `ram`: the component's RAM budgets and the RAM tier
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `experts=` | the `--expert_ram` cap; else `auto` for `cache` layers; else what the layers need | system RAM for the component's routed experts: the static arenas of its `stream` / `cpu` / `split` layers first, the rest is the RAM tier of its `cache` layers. `all` = what the layers need (with `cache` layers: every cached expert outside VRAM, so none is read from disk after load); `auto` = the smaller of `all` and what the host has left after the reserve, the page cache and the other budgets; `0` = no RAM tier |
+| `ngram=` | the `--ngram_ram` cap, else `0` | system RAM for n-gram tables: `0` streams every row, `all` holds every table whole, a size the tables that fit (whole, smallest first), `auto` what the host has left |
+| `pagecache=` | `auto` = max(8 GiB, MemTotal / 8) | RAM that `auto` budgets leave unpinned (the page cache is the n-gram rows' warm tier); it does not limit explicit sizes. `all` is refused |
+| `policy=` | `lazy-exclusive` | the RAM tier against the VRAM cache: `lazy-exclusive` (a promotion leaves the RAM copy as a reclaimable duplicate), `exclusive` (a promotion frees the RAM copy), `inclusive` (RAM keeps what it holds) |
+| `demote=` | `swap` | what happens to a VRAM victim with no RAM copy: `swap` (copied back only into the RAM slot its replacement left, and only when warmer than RAM's coldest), `heat` (into any free slot, or over RAM's coldest when warmer), `all` (every victim), `off` (dropped; the disk still has it) |
+| `evict=` | `lfu` | RAM tier victims: `lfu` (lowest heat of a 16-entry sample) or `lru` |
+
+### `disk`: where experts and n-gram rows are read
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `experts=` | `model` | `model`: the checkpoint's shards, read in place. `<dir>`: a copy on another drive. `off`: never read an expert at runtime; the load refuses unless VRAM and RAM hold every cached expert, and every victim returns to RAM |
+| `ngram=` | `model` | the same for n-gram tables; `off` needs `ram ngram=all` |
+| `io=` | `auto` | `auto`: experts `O_DIRECT` (buffered if refused), n-gram rows buffered; `direct` / `buffered` force one mode |
+
+### Checks the grammar cannot express (parse time)
+
+- Coverage as for layer rules: every layer placed exactly once.
+- One kind of host-held experts per GPU: GPU-computed (`stream`, `cache`) and CPU-computed
+  (`cpu`, `split`) layers on different GPUs.
+- `hot=` applies to `cache`, `stream`, `cpu` (and is required by `hybrid`); `cpu=` only to
+  `split`; `prefetch=` only to `cache` and `stream`; `profile=` not to `vram`.
+- One `cuda:<n>` rule per GPU, one `ram` rule, one `disk` rule. A `cuda:<n>` rule needs an
+  `experts=cache` layer on that GPU; `cache=0` takes no `spare=` / `evict=` / `admit=`;
+  `spare=0` needs `ram demote=off` or `policy=inclusive` (no free slot would take a demoted
+  victim).
+- `ram experts=` needs a layer that keeps experts in RAM. `policy=`, `demote=`, `evict=` need a
+  `cache` layer and a RAM tier (`experts=0` has none). `demote=` has no effect with
+  `policy=inclusive` and is refused there. At most one of `experts=` and `ngram=` can be `auto`.
+- `disk experts=<dir|off>` needs a `cache` layer. `disk experts=off` refuses `demote=off` unless
+  the policy is `inclusive`. `disk ngram=off` needs `ngram=all`. `io=` with both `experts=off` and
+  `ngram=off` has nothing to configure.
+- Storage rules need layer rules: without a placement, the flags carry the budgets.
+
+### Canonical form
+
+Rules in the order `embed`, layer rules by first layer, `*`, `head`, `cuda:<n>` by index, `ram`,
+`disk`; attributes in a fixed order (layer `experts hot cpu prefetch profile`; device `cache
+spare evict admit`; ram `experts ngram pagecache policy demote evict`; disk `experts ngram io`);
+defaults omitted, and a storage rule left with only defaults dropped; sizes in the largest exact
+unit; `hybrid hot=K` as `cpu hot=K`; values quoted only when needed. Placements are equal when
+their canonical texts are, and the canonical text, the dict form and the JSON form all parse back
+to an equal placement. Placements without storage rules print exactly as before.
+
+### Examples
+
+| # | Meaning | Canonical form | In this build |
+|---|---|---|---|
+| T1 | one GPU, every expert in VRAM | `*=cuda:0` | yes |
+| T3 | one GPU, 32 of 128 experts per layer resident, the rest on the CPU worker (`-mcs 96`) | `*=cuda:0 experts=cpu hot=32` | yes |
+| T3c | the same, in the older spelling (`experts=hybrid hot=32`, normalized) | `*=cuda:0 experts=cpu hot=32` | yes |
+| T4 | DeepSeek-V4.1 serving layout, CMP + PRO | `0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1` | yes |
+| T5 / (c) | V4.1, CMP + PRO: layers 12-39 cached on the PRO over RAM that holds the rest; the disk never read for experts | `0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off` | no |
+| (a) | the PRO alone, RAM for every expert outside VRAM | `*=cuda:0 experts=cache; ram experts=all; disk experts=off` | no |
+| (b) | the PRO alone, 96 GiB of RAM tier, the SSD for the rest | `*=cuda:0 experts=cache; ram experts=96GiB` | no |
+| T6 | the PRO alone: 75 GiB cache, 96 GiB RAM tier, n-gram budget | `*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB ngram=6GiB` | no |
+| T7 | a RAM-limited box: 16 experts per layer pinned; the tier takes what is free after 24 GiB of page cache | `*=cuda:0 experts=cache hot=16; ram experts=auto pagecache=24GiB` | no |
+| T8 | no RAM tier: the VRAM cache straight over the SSD | `*=cuda:0 experts=cache; ram experts=0` | no |
+| T10 | a big-RAM host: inclusive RAM, whole n-gram tables | `*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive` | no |
+| T11 | every policy knob | `*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; ram experts=64GiB pagecache=16GiB policy=exclusive demote=heat evict=lru; disk io=direct` | no |
+| T12 | no D2H copies at all | `*=cuda:0 experts=cache; ram experts=48GiB demote=off` | no |
+| T13 | CPU-computed layers on one GPU, cached layers on the other | `0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB` | no |
+| T14 | experts and n-gram tables read from other drives | `*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"` | no |
+| T16 | GPU streaming with a resident slice (`-mcs k -mcm stream_only`) | `*=cuda:1 experts=stream hot=64` | yes |
+| T17 | units: `cache=1.5`, `ram experts=48GB ngram=512mi` | `*=cuda:0 experts=cache; cuda:0 cache=1536MiB; ram experts=48GB ngram=512MiB` | no |
+| T18 | an n-gram budget only, for a PLE model | `*=cuda:0; ram ngram=12GiB` | yes |
+| R1 | the RAM of stream layers capped by the placement | `0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1; ram experts=64GiB` | yes |
+| R2 | whole n-gram tables, never read from disk | `*=cuda:0; ram ngram=all; disk ngram=off` | yes |
+
+A multi-line value with comments; the written-out defaults vanish from the canonical form
+(`0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB`):
+
+```sh
+export EXL3_PLACEMENT="
+0-11  = cuda:0                                  # CMP: resident
+12-39 = cuda:1 experts=cache                    # PRO: cached
+cuda:1 cache=auto spare=8 evict=lru admit=adaptive
+ram experts=52GiB pagecache=auto policy=lazy-exclusive demote=swap evict=lfu
+disk experts=model ngram=model io=auto
+"
+```
+
+### Parse-time refusals
+
+Each is a `ValueError`, prefixed with `placement rule <n> '<rule>': ` where one rule is at fault:
+
+| Written | Message |
+|---|---|
+| `rams experts=48GiB` | `unknown rule 'rams' (did you mean 'ram'?) (a rule starts with layers (7, 0-11, 0-3,8-11), '*', 'embed', 'head', 'cuda:<n>', 'ram' or 'disk')` |
+| `...; cuda:0=75GiB` | `cuda:0 takes attributes, not '=<value>': write e.g. 'cuda:0 cache=75GiB'` |
+| `*=cuda:0 experts=cache cache=75GiB` | `unknown attribute 'cache' for a layer rule (expected experts, hot, cpu, prefetch, profile); cache= belongs in a cuda:<n> rule` |
+| `*=cuda:0 experts=cache hott=16` | `unknown attribute 'hott' for a layer rule (expected experts, hot, cpu, prefetch, profile) (did you mean 'hot'?)` |
+| `...; ram expert=48GiB` | `unknown attribute 'expert' for the ram rule (expected experts, ngram, pagecache, policy, demote, evict) (did you mean 'experts'?)` |
+| `...; ram experts=48 GiB` | `'GiB' must be key=value (experts, ngram, pagecache, policy, demote, evict) (sizes are written without spaces: 48GiB)` |
+| `...; ram experts=48G` | `experts=48G: '48G' is ambiguous: write 48GiB (2^30 bytes) or 48GB (10^9 bytes)` |
+| `*=cuda:0 experts=cahce` | `experts='cahce' must be one of vram, cache, stream, cpu (or the older split cpu=<k> / hybrid hot=<k>) (did you mean 'cache'?)` |
+| `*=cuda:0 hot=16` | `hot= applies to experts=cache, stream and cpu (experts=vram keeps every routed expert in VRAM)` |
+| `*=cuda:0 experts=split cpu=96 hot=32` | `hot= applies to experts=cache, stream and cpu (experts=split counts the other side: cpu=<k>)` |
+| `*=cuda:0 experts=hybrid` | `experts=hybrid needs hot=<routed experts per layer kept in VRAM> (the same as experts=cpu hot=<k>)` |
+| `*=cuda:0 experts=cpu cpu=96` | `cpu= only applies to experts=split (write experts=cpu hot=<k> to keep k routed experts per layer in VRAM)` |
+| `*=cuda:0 experts=cache hot=100%` | `hot=100%: a share must lie between 0% and 100%, exclusive` |
+| `*=cuda:0 experts=cpu prefetch=layer` | `prefetch= applies to experts=cache and stream (experts=cpu computes on the CPU worker)` |
+| `*=cuda:0 profile=code` | `profile= chooses hot or cached experts; experts=vram has none to choose` |
+| `...; cuda:0 cache=all` | `cache=all would hold every expert of its layers: write experts=vram on them` |
+| `...; cuda:0 cache=0 spare=4` | `cache=0 has no slots for spare= / evict= / admit= to govern` |
+| `...; cuda:0 spare=0` | `placement: cuda:0 spare=0 leaves no free slot for a demoted victim; spare=0 needs ram demote=off or policy=inclusive` |
+| `*=cuda:0 experts=cache; cuda:1 cache=8GiB` | `placement: 'cuda:1 cache=8GiB' configures an expert cache, but no experts=cache layer is placed on cuda:1` |
+| `...; cuda:0 cache=8GiB; cuda:0 spare=4` | `cuda:0 is set twice (rules 2 and 3); merge them into one rule` |
+| `*=cuda:0; ram experts=48GiB` | `placement: 'ram experts=48GiB' but no layer keeps routed experts in system RAM (every rule is experts=vram)` |
+| `*=cuda:0 experts=cpu; ram experts=64GiB policy=exclusive` | `placement: ram policy= governs the RAM tier of experts=cache layers, and there are none` |
+| `...; ram experts=0 policy=inclusive` | `policy= governs the RAM tier, which experts=0 disables` |
+| `...; ram experts=auto ngram=auto` | `experts=auto and ngram=auto: at most one RAM budget can be auto` |
+| `...; ram experts=48GiB policy=inclusive demote=swap` | `demote= has no effect with policy=inclusive (every VRAM-cached expert keeps its RAM copy, so a victim is simply dropped); remove it` |
+| `...; ram experts=auto pagecache=all` | `pagecache=all: all is not allowed here (use auto or a size)` |
+| `*=cuda:0 experts=cpu; disk experts=/nvme1/v41` | `placement: 'disk experts=/nvme1/v41' applies to experts=cache layers (stream and cpu layers keep every expert in RAM), and there are none` |
+| `*=cuda:0; ram ngram=8GiB; disk ngram=off` | `placement: 'disk ngram=off' never reads n-gram rows from disk, which needs ngram=all, not ngram=8GiB` |
+| `...; ram experts=all demote=off; disk experts=off` | `placement: 'disk experts=off' keeps no copy of an expert outside VRAM and RAM, so demote=off would lose VRAM victims; drop demote=off (with the disk off, every victim moves back to the RAM slot its replacement left) or use policy=inclusive with ram experts=all` |
+| `0-19=cuda:0 experts=cpu; 20-39=cuda:0 experts=cache` | `placement: cuda:0 holds both GPU-computed (experts=stream / cache) and CPU-computed (experts=cpu / split) layers; one kind of host-held experts per GPU is supported` |
+| `ram ngram=6GiB` | `placement: storage rules (cuda:<n>, ram, disk) need layer rules to go with; without a placement, set RAM budgets with --expert_ram / --ngram_ram` |
+| `*=cuda:0 experts=cache` (in this build) | `placement '*=cuda:0 experts=cache': experts=cache is not available in this build yet; it needs the expert tier runtime (a VRAM expert cache per GPU over the RAM tier and the disk) (see doc/expert_tiers.md)` |
+
+`tests/test_placement_tiers_.py` holds every case with its full text.
