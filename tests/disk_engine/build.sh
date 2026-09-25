@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build and run the disk engine's standalone test driver in three variants:
+# Build the disk engine's standalone test driver and benchmark driver (disk_engine_bench) in
+# three variants, then run the test driver in each:
 #   release   -O2, -Werror, _FORTIFY_SOURCE, _GLIBCXX_ASSERTIONS
 #   asan      AddressSanitizer + UndefinedBehaviorSanitizer (leaks checked, first error fatal)
 #   tsan      ThreadSanitizer (first report fatal)
@@ -54,17 +55,23 @@ flags_for() {
 }
 
 pids=()
+bench_src="$ext/disk/disk_config.cpp $ext/disk/disk_engine.cpp $ext/disk/disk_uring.cpp"
+bench_src="$bench_src $here/disk_engine_bench.cpp"
 for m in $modes; do
     # shellcheck disable=SC2046
     $CXX $common $(flags_for "$m") $src -o "$out/disk_engine_test_$m" &
     pids+=($!)
+    # the benchmark driver: disk_engine_bench (release), disk_engine_bench_asan, ..._tsan
+    suffix="_$m"
+    [ "$m" = release ] && suffix=""
+    # shellcheck disable=SC2046,SC2086
+    $CXX $common $(flags_for "$m") $bench_src -o "$out/disk_engine_bench$suffix" &
+    pids+=($!)
 done
-# the benchmark (release flags only)
-$CXX $common $(flags_for release) "$ext/disk/disk_config.cpp" "$ext/disk/disk_engine.cpp" \
-    "$ext/disk/disk_uring.cpp" "$here/disk_engine_bench.cpp" -o "$out/disk_engine_bench" &
-pids+=($!)
-for p in "${pids[@]}"; do wait "$p"; done
-echo "built: $modes + disk_engine_bench -> $out"
+status=0
+for p in "${pids[@]}"; do wait "$p" || status=1; done
+[ "$status" = 0 ] || { echo "build FAILED" >&2; exit 1; }
+echo "built: disk_engine_test and disk_engine_bench, modes: $modes -> $out"
 [ "$run" = 1 ] || exit 0
 
 # Sanitizer runtimes can fail to map their shadow memory under the high mmap randomization of
