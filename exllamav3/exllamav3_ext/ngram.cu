@@ -7,6 +7,8 @@
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <climits>
+#include <cstring>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -14,6 +16,7 @@
 #include <atomic>
 #include "util.h"
 #include "util.cuh"
+#include "disk/disk_engine.h"
 
 namespace py = pybind11;
 
@@ -265,6 +268,30 @@ void ngram_gather_cpu
     uint8_t* op = (uint8_t*) out.data_ptr();
 
     py::gil_scoped_release release;
+
+    // EXL3_DISK_BACKEND named: the disk engine reads the rows (the same bytes); unset or auto:
+    // the original pool below
+    bool engine = false;
+    int res = 0;
+    try
+    {
+        engine = exl3_disk::ngram_route_engine();
+        if (engine)
+        {
+            TORCH_CHECK(fd >= 0 && fd <= INT_MAX, "ngram_gather_cpu: bad file descriptor");
+            res = exl3_disk::ngram_gather((int) fd, base_offset, row_bytes, up, U, uid_base, op,
+                                          out.numel() * (int64_t) out.element_size());
+        }
+    }
+    catch (const exl3_disk::Error& e)
+    {
+        TORCH_CHECK(false, "ngram_gather_cpu: ", e.what());   // knobs, arguments, rows past EOF
+    }
+    if (engine)
+    {
+        TORCH_CHECK(res == 0, "ngram_gather_cpu: short read (", strerror(-res), ")");
+        return;
+    }
 
     GatherCtx ctx { (int) fd, base_offset, row_bytes, uid_base, up, op };
 

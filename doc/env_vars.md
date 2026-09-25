@@ -1480,6 +1480,255 @@ model = Model.from_config(config)
 model.load()
 ```
 
+## Disk I/O engine
+
+A native engine (`exllamav3_ext/disk`, design in `doc/disk_engine.md`) for positioned reads
+from model files: scattered rows of n-gram and engram tables, and large contiguous extents
+(experts kept on disk). One engine per process serves every caller, so reads of different
+kinds share one admission point with request classes, byte windows and a hold rule. Three
+backends sit behind the same interface: `pread` (thread pool, page cache), `odirect` (thread
+pool, `O_DIRECT`) and `io_uring` (raw syscalls, no liburing).
+
+Who uses it: `ngram_gather_cpu` (PLE n-gram tables, DeepSeek-V4.1 engram) when
+`EXL3_DISK_BACKEND` names a backend; with the variable unset or `auto`, `ngram_gather_cpu` runs
+its original thread pool verbatim. The Python entry points (`disk_gather_rows`,
+`disk_read_extents`, `DiskTicket`, ...) always use the engine.
+
+All `EXL3_DISK_*` variables are read when the engine is first created (the first read that
+needs it) and cached for the process; `EXL3_DISK_BACKEND` alone decides the
+`ngram_gather_cpu` route, also read once. A bad value raises at that first use, naming the
+variable and the accepted values. A variable that does not apply to the chosen backend is
+reported once on stderr and ignored. `ext.disk_engine_configure({...})` replaces the engine
+with another configuration inside one process (tests, benchmarks); the keys are the variable
+names without `EXL3_DISK_`, in lower case.
+
+Linux only. On Windows, `ngram_gather_cpu` keeps its overlapped unbuffered `ReadFile` path:
+`EXL3_DISK_BACKEND=odirect` is accepted there (that path already bypasses the cache),
+`pread` and `io_uring` are refused with a message, and the new entry points raise.
+
+Smoke numbers from the test host (Proxmox guest, virtio-SCSI disk on a Samsung 9100 PRO, host
+cache mode unknown; a 1 GiB scratch file; `tests/disk_engine/`), per call of one engram layer
+(48 rows of a 256-byte and of an 8-byte table, 96 reads), p50:
+
+| | `pread` | `odirect` | `io_uring` |
+|---|---|---|---|
+| warm, 48 rows | 38 us | - | 45 us |
+| cold, 48 rows | 631 us | 548 us | 349 us |
+| cold, 8192 rows | 52 ms | 64 ms | 41 ms |
+| 13.3 MB extents, 2-8 at once | 5-6 GB/s (buffered, pages dropped) | 10.8-11.5 GB/s | 11.0-11.4 GB/s |
+
+The original two-call gather took ~270 us warm and ~830 us cold for the same rows. With a
+prefetch-class extent stream running at 9.9 GB/s, cold 48-row batches on `io_uring` stayed at
+271 us (250-280 us without it); an expert-demand stream (never held, 32 MiB window) pushed them
+to 2.9 ms. The Python share of a call is ~0.8 us for an empty call and 4-5 us for a real one
+(about 3 us going in, including the caller's own statements, and 1.5-2 us coming back after the
+reads): at most 8 % of the fastest warm gather (52 us), about 1 % of a cold one and under 0.5 %
+of extents and prefill-sized gathers. The backend `auto` resolves to is chosen by the
+maintenance-window benchmark, on the model files, with the service stopped.
+
+### `EXL3_DISK_BACKEND` (default: `auto`)
+
+- `pread`: a pool of `EXL3_DISK_THREADS` workers reads through the page cache. A synchronous
+  caller first reads, on its own thread, whatever the page cache already holds (`RWF_NOWAIT`,
+  for calls of up to 1024 reads; it gives up after a few misses, which the kernel has by then
+  started reading), then reads its own queued reads alongside the workers. Works everywhere
+  Linux runs (containers included).
+- `odirect`: the same pool with `O_DIRECT` reads. Rows are read as the aligned sector range
+  around them into per-thread bounce buffers and copied out; extents land directly in their
+  slots. No page-cache pollution, no page-cache warmth either.
+- `io_uring`: one ring per engine. A synchronous caller submits its own reads with one
+  `io_uring_enter`, and page-cache hits complete inside that call on the caller's thread; a
+  reaper thread submits everything else (asynchronous tickets, reads freed by the windows) and
+  completes. Rows are read through the page cache and extents with `O_DIRECT` unless
+  `EXL3_DISK_DIRECT` says otherwise. Needs Linux 5.11 or later; where `io_uring_setup` is
+  refused (a container's seccomp profile, `kernel.io_uring_disabled=2`) the engine falls back
+  to the thread pool and says so once.
+- `auto`: the backend measured fastest on the test host. Until the maintenance-window benchmark
+  has run it is `pread`, and `ngram_gather_cpu` keeps its original pool (not the engine) unless
+  a backend is named. One constant in `disk_config.cpp` (`kAutoBackend`) changes it.
+
+### `EXL3_DISK_DIRECT` (default: `auto`)
+
+Which reads bypass the page cache: `none`, `rows`, `extents` or `all` (`0`/`1` mean `none`/`all`).
+`auto` follows the backend: `pread` none, `odirect` all, `io_uring` extents. Rows through the page
+cache keep a warm tier for free (on the test host a warm engram layer-chunk costs 25 ms against
+1.04 s cold); extents through it would evict those rows and duplicate the RAM tier, so buffered
+extent reads drop their pages afterwards (`EXL3_DISK_EXTENT_DONTNEED`). When a file system
+refuses `O_DIRECT` (tmpfs on older kernels, some network file systems), that file is read through
+the page cache and a message names it.
+
+### `EXL3_DISK_QD` (default: `128` for `io_uring`, threads + 8 for the pools)
+
+Requests in flight at once, all classes together; `1`-`4096`. More than the device's own queue
+(`/sys/block/<dev>/queue/nr_requests`, 256 on the test host; `queue_depth` 128) only queues
+inside the kernel, where the engine can no longer order it. For the pools the thread count caps
+it anyway (a caller helping with its own reads adds one). On the test host random 4 KiB reads
+went from 150 K/s at depth 24 to 210 K/s at 96; on bare-metal NVMe, depth 128-256 per device is
+typical.
+
+### `EXL3_DISK_RESERVE0` (default: 3/4 of `EXL3_DISK_QD`)
+
+Slots only class 0 (rows the forward waits for) may use: classes 1-3 together never have more
+than `EXL3_DISK_QD - EXL3_DISK_RESERVE0` requests in flight, so a decode row batch always finds
+room. `0` to `QD - 1`. With the pool defaults (24 threads, qd 32, reserve 24) the bulk classes
+get 8 slots, 8 chunks in flight: on the test host that still read 13.3 MB extents at ~11 GB/s
+with `odirect`, but a device that needs more depth wants a larger `EXL3_DISK_THREADS` and `QD`.
+
+### `EXL3_DISK_ENGRAM_QD` (default: `EXL3_DISK_QD`)
+
+Requests in flight for class 0 alone. Random 4 KiB reads stop gaining past ~96 in flight on the
+test host; beyond that depth only adds latency to everything else. `1` to `QD`.
+
+### `EXL3_DISK_WINDOW_EXPERT` (default: `32M`), `EXL3_DISK_WINDOW_PREFETCH` (default: `8M/0`), `EXL3_DISK_WINDOW_REFILL` (default: `8M/0`)
+
+Bytes in flight per class: 1 (expert demand), 2 (prefetch, earliest deadline first) and 3
+(background refill). Sizes take `K`/`M`/`G` (binary); `inf` means unlimited. For classes 2 and 3,
+`hi/lo`: `lo` applies while the hold rule is active (below), `hi` otherwise; a single value sets
+`hi` and keeps `lo` at 0. Class 1 is never held and takes one value. A read larger than its
+window is admitted when nothing else of its class is in flight, so a window never starves a
+class. Why windows: the device serves roughly in order, so a row read queued behind B bytes of
+bulk waits about B / bandwidth (~0.8 ms behind 8 MiB at 10.5 GB/s); two 13 MB extents in flight
+already reach full bandwidth here. Chunks of `EXL3_DISK_CHUNK` make the window fine-grained.
+
+### `EXL3_DISK_HOLD_ARM_MS` (default: `50`)
+
+The hold rule keeps classes 2 and 3 at their `lo` window while a row batch submitted with `hold`
+is unfinished (the DeepSeek-V4.1 engram at decode), and from `disk_arm_hold()` until the next
+hold batch finishes, so the device drains before the rows arrive. This is the safety expiry of
+an arm that no hold batch follows. `0` disables arming.
+
+### `EXL3_DISK_REFILL_AGE_MS` (default: `250`)
+
+A class-3 ticket queued this long moves to class 2 (after the deadlined prefetches), so refills
+cannot starve behind a steady prefetch stream. `0` disables aging.
+
+### `EXL3_DISK_CHUNK` (default: `auto`)
+
+Bulk reads (extents, long row runs) are split into chunks of this size: `auto` uses the device's
+`queue/max_sectors_kb` (the block layer splits there anyway; 1280 KiB on the test host), clamped
+to 256 KiB - 4 MiB; otherwise a multiple of 64 KiB in [64K, 64M]. Smaller chunks let the windows
+act at a finer grain; the kernel sees the same requests either way.
+
+### `EXL3_DISK_ALIGN` (default: `auto`)
+
+`O_DIRECT` offset and length alignment. `auto` asks the file system (`statx`
+`STATX_DIOALIGN`, 512 bytes on the test host's ext4), then the device's logical block size, then
+assumes 4096. A power of two in [512, 65536] overrides it upwards (below the file system's own
+alignment is refused). Extent slots always use a 4 KiB-aligned geometry whatever this says:
+the payload of an extent at `offset` lands at `slot + offset % G`, `G` = max(4096, alignment),
+and the slot must hold `roundup(offset % G + length, G)` bytes (`disk_extent_geometry`).
+
+### `EXL3_DISK_THREADS` (default: `min(32, max(4, CPUs))`)
+
+Workers of the `pread` and `odirect` pools, `1`-`256` (24 on the test host, like the original
+gather). A pool thread keeps one read in flight, so the pools reach queue depth only with many
+threads: raise it (48-96) for cold row batches or extents on a fast device. Ignored by `io_uring`
+(see `EXL3_DISK_IOWQ_WORKERS`).
+
+### `EXL3_DISK_SPIN_US` (default: `50`)
+
+A waiting caller spins this long (draining completions itself with `io_uring`) before it
+sleeps. A sleeping waiter costs one wake-up (13 us p50, 35 us p99 on the test host) when its
+reads complete. `0`-`100000`.
+
+### `EXL3_DISK_SQPOLL` (default: `0`), `EXL3_DISK_SQPOLL_IDLE_MS` (default: `10`), `EXL3_DISK_SQPOLL_CPU` (default: `-1`)
+
+`io_uring` only. A kernel thread polls the submission queue, so submitting costs no system call.
+It burns a CPU while busy and sleeps after `IDLE_MS` of no work (the next submission wakes it with
+one call). `SQPOLL_CPU` pins that thread to one CPU (`-1`: anywhere). Worth trying on bare metal
+with CPUs to spare and very high request rates; on the test host the CPUs are shared with the
+CPU MoE workers. Refused at ring creation (old kernels without privileges): a message, and the
+engine continues without it.
+
+### `EXL3_DISK_IOPOLL` (default: `0`)
+
+Polled completions for `O_DIRECT` reads: `io_uring` puts them on a second ring created with
+`IORING_SETUP_IOPOLL` and a poller thread spins on the device while they are in flight; the
+pools read with `preadv2(RWF_HIPRI)`. Only an NVMe device with poll queues can do this
+(`nvme.poll_queues=N` on the kernel command line, visible as `queue/io_poll = 1`). The engine
+checks each file's device and refuses the flag for files that cannot poll, once per device, with
+the reason; virtio and SCSI disks (the test host's `sda`) have no poll queues, so it is refused
+there and the reads use interrupts as usual. Saves a few microseconds per read at the cost of a
+busy CPU; relevant for small `O_DIRECT` rows on bare metal. Not exercised on the test host beyond
+the refusal (a `null_blk` device with `poll_queues` would exercise it).
+
+### `EXL3_DISK_REGISTER` (default: `auto`)
+
+`io_uring` only: `none`, `files`, `buffers` or `all` (`auto` = `all`). Fixed files skip the per-read
+descriptor lookup; registered buffers (the `O_DIRECT` bounce arena, and caller buffers registered
+with `disk_register_buffer`, e.g. RAM-tier arena chunks of up to 1 GiB) make reads into them
+`READ_FIXED`, which skips pinning the pages per read. Registration failures fall back to plain
+reads with a message. A registered buffer stays referenced until `disk_unregister_buffer`, which
+refuses while reads still target it.
+
+### `EXL3_DISK_URING_ASYNC` (default: `0`)
+
+`io_uring` only: tickets with at least this many page-cache reads go to the kernel's worker
+threads (`IOSQE_ASYNC`) instead of being tried inline. Inline, a warm 8192-row gather is copied by
+one thread (5-7 ms here, against 2.3 ms across the `pread` pool); through the workers it spreads
+over CPUs at a wake-up per read. `0` never. A candidate for the benchmark, not a measured win.
+
+### `EXL3_DISK_IOWQ_WORKERS` (default: `0`)
+
+`io_uring` only: upper bound on the kernel's bounded worker threads for reads it must hand off
+(`IORING_REGISTER_IOWQ_MAX_WORKERS`); `0` keeps the kernel default.
+
+### `EXL3_DISK_AFFINITY` (default: unset)
+
+CPU list (`0-3,8`) for the engine's threads: pool workers, the reaper, the poller, and the
+kernel's `io_uring` workers. Keeps I/O off the CPUs the CPU MoE workers use; on a NUMA machine,
+pick CPUs near the NVMe device.
+
+### `EXL3_DISK_FADVISE` (default: `auto`)
+
+Page-cache advice the engine applies once to its own buffered descriptor of each file (the
+caller's descriptor is never touched): `auto` (`RANDOM` for row tables: a scattered 256-byte row
+then reads exactly its page, no readahead), `none`, `random`, `normal` or `sequential`.
+
+### `EXL3_DISK_EXTENT_DONTNEED` (default: `1`)
+
+After an extent is read through the page cache (the `pread` backend, or a file that refused
+`O_DIRECT`), drop its pages (`FADV_DONTNEED`), so expert bytes do not evict engram rows.
+
+### `EXL3_DISK_VERBOSE` (default: `0`)
+
+Print the resolved configuration once when the engine is created. Fallbacks and refusals are
+printed whatever this says.
+
+### `EXL3_DISK_TRACE` (default: `0`)
+
+Keep the last N reads (ticket, class, result, offset, length, submit / issue / done times) for
+`disk_trace()`; `0` off. For tests and scheduling analysis.
+
+### `EXL3_DISK_FAULT_EIO`, `EXL3_DISK_FAULT_SHORT`, `EXL3_DISK_FAULT_EINTR` (default: `0`), `EXL3_DISK_FAULT_DELAY_US` (default: `0`), `EXL3_DISK_FAULT_NO_URING` (default: `0`)
+
+Test only: one read attempt in N (a reproducible pseudo-random draw) fails with `EIO`, returns
+short, or fails with `EINTR`; every pool read sleeps first; `io_uring` setup is treated as refused. Short reads and `EINTR` must be
+resumed byte-exact, `EIO` must fail the ticket and nothing else, and a refused `io_uring` must
+leave a working thread pool behind.
+
+### Bare metal and virtual machines
+
+What the engine can reach depends on what the guest sees. The test host is a Proxmox guest whose
+model disk is `sda`, a "QEMU HARDDISK" on virtio-SCSI (24 hardware queues, scheduler `none`,
+512-byte logical blocks, `io_poll` 0) backed by a Samsung 9100 PRO; the host-side settings
+(iothread, aio mode, cache mode) were not confirmed, and every number above was measured through
+them. Settings on the Proxmox host (outside this code; each needs a VM restart):
+
+- **Controller**: `scsihw: virtio-scsi-single` with `iothread=1` on the disk gives the disk its
+  own I/O thread instead of QEMU's main loop. virtio-blk (`virtio0:`) with `iothread=1` is the
+  lighter alternative.
+- **aio**: `aio=io_uring` (the Proxmox default since 7.0) or `aio=native`; avoid `threads`.
+- **cache**: `cache=none` (the host opens the image with `O_DIRECT`): guest reads reach the
+  drive, and benchmark numbers mean what they say. With `writeback`, repeated reads can come
+  from host RAM and look faster than the drive.
+- **Best**: pass the NVMe controller through (`hostpci0: <bdf>`). The guest then drives the NVMe
+  itself: native queues, `nvme.poll_queues` for `EXL3_DISK_IOPOLL`, and none of the virtio hops.
+
+Inside a guest or on bare metal, leave the block device's scheduler at `none` for NVMe, do not
+change `read_ahead_kb` (the engine advises its own descriptors instead), and use
+`EXL3_DISK_AFFINITY` to keep the engine's threads away from busy CPUs.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

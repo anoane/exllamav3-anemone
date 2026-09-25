@@ -70,6 +70,7 @@
 #include "hc_mix.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
+#include "disk/disk_ext.h"
 
 #include "attention.cuh"
 
@@ -117,6 +118,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+    #include "disk/disk_bc.h"
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");

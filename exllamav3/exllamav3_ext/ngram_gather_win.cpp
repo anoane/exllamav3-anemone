@@ -16,6 +16,7 @@
 //     outstanding NVMe commands.
 
 #include "ngram.cuh"
+#include "disk/disk_engine.h"
 #include <pybind11/pybind11.h>
 #include <windows.h>
 #include <algorithm>
@@ -301,6 +302,9 @@ void ngram_gather_cpu
     TORCH_CHECK(out.size(0) >= U && out.size(1) * out.element_size() == row_bytes,
                 "ngram_gather_cpu: out shape");
     if (!U) return;
+    // This path is already unbuffered (EXL3_DISK_BACKEND=odirect); pread and io_uring are refused
+    static const std::string refusal = exl3_disk::windows_backend_refusal();
+    TORCH_CHECK(refusal.empty(), "ngram_gather_cpu: ", refusal);
     const int64_t* up = (const int64_t*) uids.data_ptr();
     uint8_t* op = (uint8_t*) out.data_ptr();
 
