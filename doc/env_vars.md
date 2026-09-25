@@ -70,7 +70,8 @@ MoE routing across ranks instead of broadcasting them). Precision matches the fp
 faster than the cuBLAS path it replaces. Set to `0` to fall back to the cuBLAS GEMM path
 (device-dependent kernel choice, not rank-consistent). Decode-sized mixes use the fused `gr_mix`
 kernel either way. The same int8 scheme covers the MoE router projection for batched rows
-(`routing_gemm.cu`), which has no switch.
+(`routing_gemm.cu`), which has no switch of its own (`EXL3_STABLE_ARITHMETIC` extends it to single
+rows and fixes its split-K independently of the row count).
 
 ### `EXL3_BC_GDN` (default: `1`)
 
@@ -1064,6 +1065,16 @@ With `1` each operation below takes one arithmetic path at every row count, the 
   instances are unchanged by them. They are compiled by default; a build with
   `EXLLAMA_NO_WHOLE_K_MOE` set leaves them out (see that entry for the cost), and the profile then
   refuses MoE layers at load (below).
+- The MoE router projection (`routing.cu`, `routing_gemm.cu`, wherever the router's int8 copy of
+  the gate exists) takes the same arithmetic at every row count. By default a single row takes the
+  FMA GEMV over the FP16 weights, while two or more rows take the int8 projection of the 14-bit
+  quantized gate, whose split-K slice count follows the number of 128-row tiles; the int32
+  products are exact, but the FP32 partial sums round where the slices end. Under the profile a
+  single row takes the int8 projection too, and the slice count depends only on the expert count
+  and K (that of a one-tile call, at most 8). A one-ulp difference in a router logit can change a
+  routing weight or which experts a token selects. Where the int8 projection does not fit (K not
+  a multiple of 16, other dtypes, strided operands) a single row takes the cuBLAS GEMM as larger
+  calls do, in fixed 128-row tiles, instead of the GEMV; that GEMM refuses a strided input.
 - Experts held in system RAM must be computed on the GPU: offloaded layers must register in
   stream mode (`-mcm stream_only` / `EXL3_MOE_CPU_MODE=stream_only`, or `experts=stream` in a
   placement). The CPU worker's arithmetic depends on the host and on how rows split between CPU and
@@ -1109,7 +1120,10 @@ slabs inside the extension), DeepSeek-V4's native attention block and hyper-conn
 tensor parallelism, and the CPU. Results also still differ between GPU types. The profile has
 only been validated end to end on DeepSeek-V4.1-Flash.
 
-Memory: the fixed-row GEMM tiles (two tiles per GEMM call), no reconstruct-tier slabs. Decoding
+Memory: the fixed-row GEMM tiles (two tiles per GEMM call), no reconstruct-tier slabs, and the
+router's FP32 split-K partials of large calls, up to `8 x rows x experts x 4` bytes (64 MiB for a
+4096-row chunk and 512 experts) where the default needs two or fewer slices at that size; decode
+reuses the router's static workspace, which is already sized for the maximum slice count. Decoding
 through the reconstruct path allocates each linear's dequantized weights per call (`in x out`
 FP16, in slices of at most 32768 columns), the same transient every long prefill already
 allocates and the autosplit already measures.
@@ -1127,20 +1141,28 @@ measured, and not an end-to-end figure): in decode (groups of 8 blocks, 256-colu
 gate/up (18) and none on down (40); launches with few active experts run wider groups, up to 32
 blocks, where the bound reaches about 1.8x on gate/up and 1.6x on down. A traced 4096-token
 DeepSeek-V4.1-Flash prefill took 4.20 s against 3.96 s, one trial; models with small expert
-intermediate sizes lose more; sm_86 is compiled but was never run. On DeepSeek-V4.1-Flash on two
-GPUs with the experts of 11 layers in system RAM, a 64K-token scoring pass ran at 796 tok/s with the
-complete profile (experts streamed) against 1040 tok/s with the default arithmetic (experts computed
-by the CPU), so the two runs differ in more than this setting; decode speed was not measured. Use it
-for validation and reproducibility work, not for serving.
+intermediate sizes lose more; sm_86 is compiled but was never run. The router's int8 projection with
+the slice count of a one-tile call took 0.52 -> 0.64 ms on an sm_80 GPU and 0.137 -> 0.145 ms on an
+sm_120 GPU for 4096 rows of a 5120 x 384 router (router only, ten warm launches, not an end-to-end
+figure), and a decoded token's router runs three launches (activation quantization, int8 GEMM, slice
+reduction) instead of one GEMV. On DeepSeek-V4.1-Flash on two GPUs with the experts of 11 layers in
+system RAM, a 64K-token scoring pass ran at 796 tok/s with the complete profile (experts streamed)
+against 1040 tok/s with the default arithmetic (experts computed by the CPU), so the two runs differ
+in more than this setting; decode speed was not measured. Use it for validation and reproducibility
+work, not for serving.
 
 Determinism: within the operations above, a row's result no longer depends on the row count of
 the call, on the chunk boundaries or on decode versus prefill (for a given GPU type, model and
 placement). For the fused MoE kernel alone: two real DeepSeek-V4.1-Flash experts at 17 to 256
 rows, all row tiles and both active-count hints on two GPU types differed in 40 of 48 launch
-geometry comparisons with the default partition, and in none with whole columns. Combined with
-`EXL3_MOE_FUSED_DET` (on by default), identical calls are also bitwise repeatable. Whether a
-whole model becomes chunk-size invariant depends on every operation it uses being covered, see
-above.
+geometry comparisons with the default partition, and in none with whole columns. For the
+router: with the default slice count a 4096- and a 2048-token chunk of DeepSeek-V4.1-Flash
+(5120 x 384 router, two and four slices) first diverged at one routing weight of one row in
+layer 32, by 0.000244, which then propagated through the following layers; with the profile the
+router logits, selected experts and weights of real layer inputs agreed at every tested row count,
+one included, on two GPU types. Combined with `EXL3_MOE_FUSED_DET` (on by default), identical
+calls are also bitwise repeatable. Whether a whole model becomes chunk-size invariant depends on
+every operation it uses being covered, see above.
 
 ```sh
 EXL3_STABLE_ARITHMETIC=1 python eval/ppl.py -m /path/to/model

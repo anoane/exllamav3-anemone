@@ -7,6 +7,7 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#include "stable_arithmetic.h"
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 32
@@ -256,16 +257,22 @@ void routing_gemv
     // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any sm_80+
     // architecture routing on identical streams select identical experts (the int8 kernels
     // need cp.async and mma.m16n8k32, both sm_80+). Pre-Ampere devices fall back to cuBLAS,
-    // which is device-dependent — uniform per-arch fleets still agree with each other
+    // which is device-dependent — uniform per-arch fleets still agree with each other.
+    // cuBLAS also remains the fallback for shapes neither covers. Under EXL3_STABLE_ARITHMETIC
+    // single rows take the int8 projection too: the GEMV reads the fp16 weights, the int8 path
+    // the 14-bit quantized gate with its own reduction, so switching at one row makes decode
+    // differ from prefill. Where the int8 path does not fit, single rows then take cuBLAS as the
+    // other row counts do (in fixed 128-row tiles under the profile), not the GEMV
     int k = hidden.size(-1);
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
 
-    if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
+    if ((!bsz1 || stable_arithmetic()) && gate_i8.has_value() && gate_sb.has_value() &&
+        routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
-    else if (bsz1 && gate_t.has_value() && !(k & 1))
+    else if (bsz1 && !stable_arithmetic() && gate_t.has_value() && !(k & 1))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (

@@ -6,6 +6,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "det_gemm.cuh"
+#include "stable_arithmetic.h"
 
 /*
 
@@ -21,7 +22,8 @@ Two launches: quant_a_kernel quantizes the activations per (row, 128-wide K chun
 runs a 128 x 64 block tile with 16 warps (4 x 4, 32 x 16 warp tiles, ~120 registers so all 16
 warps fit an SM), a 2-stage cp.async ring of 128-wide chunks (97 KB), exact int32 sums per chunk
 flushed to fp32 with the chunk scale, and a deterministic split-K (slice count from the shape
-only) whose fp32 partials are summed in slice order by a third launch. The weights come
+only; from the weight dimensions only under EXL3_STABLE_ARITHMETIC, see rg_slices) whose fp32
+partials are summed in slice order by a third launch. The weights come
 pre-quantized per row over all of K ((2, E, K) int8 hi/lo + (E) fp32 scales, built lazily on
 the Python side). Rows >= R, columns >= E and K past the end are zero-filled; K % 16 == 0.
 
@@ -230,10 +232,15 @@ void routing_gemm_reduce_kernel(const float* __restrict__ part, half* __restrict
     c[i] = __float2half_rn(v);
 }
 
-// Split-K slices: a function of the shape only
+// Split-K slices: a function of the shape only. The int32 products within a 128-wide K chunk are
+// exact, but the fp32 partial sums of the slices are rounded where the slices end, so a row's
+// logits change with the slice count, and by default that follows the row count (more row tiles,
+// fewer slices). A one-ulp logit difference can change a routing weight or selection. Under
+// EXL3_STABLE_ARITHMETIC the row count is left out: every call gets the slices of a one-row-tile
+// call (at most 8), costing up to 8 x R x E x 4 bytes of fp32 partials on large calls
 static int rg_slices(int R, int E, int KC)
 {
-    const int tiles = CEIL_DIVIDE(E, RG_BN) * CEIL_DIVIDE(R, RG_BM);
+    const int tiles = CEIL_DIVIDE(E, RG_BN) * (stable_arithmetic() ? 1 : CEIL_DIVIDE(R, RG_BM));
     int S = 1;
     while (tiles * S < 256 && S < 8 && S * 2 <= KC) S *= 2;
     return S;
@@ -277,7 +284,7 @@ void routing_gemm_det_(const at::Tensor& hidden, const at::Tensor& gate_i8, cons
         if (ws.K != K || ws.E != E || !ws.ahi.defined() || ws.ahi.device() != hidden.device())
         {
             const int KCs = CEIL_DIVIDE(K, RG_KCH);
-            const int Smax = rg_slices(1, E, KCs);                 // the smallest R gives the most slices
+            const int Smax = rg_slices(1, E, KCs);                 // the smallest R gives the most slices (any R, stable)
             auto opt = hidden.options();
             ws.ahi = at::empty({RG_STATIC_ROWS, K}, opt.dtype(at::kChar));
             ws.alo = at::empty({RG_STATIC_ROWS, K}, opt.dtype(at::kChar));
