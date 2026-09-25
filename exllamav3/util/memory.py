@@ -579,7 +579,8 @@ def format_vram_report(reports: list[VRAMDeviceReport], color: bool = True, unit
 
 
 # Host (system) memory guard for large CPU allocations. EXL3_HOST_MEM_RESERVE_MB (default 2048) is
-# kept free on top of the request; 0 disables the check.
+# kept free on top of the request; 0 disables the check. The load-time budgets and their ledger
+# live in host_budget.py
 def host_memory_available() -> int | None:
     """Bytes of host memory the kernel considers available, None when unknown"""
     try:
@@ -598,15 +599,17 @@ def host_memory_available() -> int | None:
 
 def check_host_memory(nbytes: int, what: str):
     """Raise before allocating `nbytes` of host memory when it would leave the system with less
-    than the configured reserve"""
-    import os
-    reserve_mb = int(os.environ.get("EXL3_HOST_MEM_RESERVE_MB", 2048))
-    if reserve_mb <= 0:
+    than the configured reserve. Available: MemAvailable, or less when the process's memory cgroup
+    allows less (host_budget.host_memory)"""
+    from .host_budget import host_memory, reserve_bytes
+    reserve = reserve_bytes()
+    if reserve <= 0:
         return
-    avail = host_memory_available()
+    avail = host_memory().available
     if avail is None:
         return
-    if nbytes + (reserve_mb << 20) > avail:
+    reserve_mb = reserve >> 20
+    if nbytes + reserve > avail:
         raise RuntimeError(
             f"{what} needs {nbytes >> 20} MiB of host memory, but only {avail >> 20} MiB is available "
             f"and EXL3_HOST_MEM_RESERVE_MB = {reserve_mb} MiB is kept free. Lower the amount of data held "
