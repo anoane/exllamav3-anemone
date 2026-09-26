@@ -20,10 +20,14 @@ needs DSV41_DEEPSEEK_REF and is skipped without it):
      stand-in wkv; the forward's own staging (hash, dedup, C++ gather) of 700 real tokens
      gives the Python reader's bytes for the reference hash ids, and the dequant is exact
      (fp16 rows == fp32 rows); the measuring forward stages one row per n-gram.
-  4. Every copy of q_weight / k_weight the checkpoint carries (fp32 converted, bf16
-     original) equals what load_gate loaded, whatever the file order.
+  4. load_gate reads the bf16 copy of q_weight / k_weight exactly, whichever copy (fp32
+     converted, bf16 original) the collection kept, and its product equals DeepSeek's
+     q_weight.float() * k_weight.float() in every element; the fp32 copies are reported
+     against it.
   5. The shared prefetch worker stops with the last engram module (no checkpoint needed;
-     also a pytest test)."""
+     also a pytest test).
+  6. The same read on synthetic shards, with values that fp16 staging would change (no
+     checkpoint needed; also a pytest test)."""
 import os, sys, types
 import numpy as np
 import torch
@@ -199,37 +203,175 @@ def main(checkpoint_dir):
     print("  OK  engram reference stages certify DeepSeek's function")
 
 
+def _read_copy(stc, key, filename):
+    """The copy of `key` in `filename`, exactly as stored (no loader staging)."""
+    from exllamav3.loader.safetensors import DiskTensorHandle, convert_dtype
+    h = stc.file_headers[filename]
+    meta = h[key]
+    d = DiskTensorHandle(key, filename, h["_header_offset"] + meta["data_offsets"][0], meta["shape"],
+                         convert_dtype(meta["dtype"])[0])
+    try:
+        return d.read_range(0, d.num_rows)
+    finally:
+        d.close()
+
+
+def _bits(t):
+    return t.float().contiguous().view(torch.int32)
+
+
+def _gate_weight_any_order(eg, name):
+    """
+    _gate_weight with the collection pointed at each copy of the tensor in turn (the copy its
+    directory scan would keep, in every possible order): all of them must give the same bits.
+    Returns (that tensor, copies sorted by path).
+    """
+    key = f"{eg.key}.{name}"
+    stc = eg.config.stc.find_stc(key)
+    copies = sorted(f for f, h in stc.file_headers.items() if isinstance(h.get(key), dict))
+    kept = stc.tensor_file_map[key]
+    got = []
+    try:
+        for f in copies:
+            stc.tensor_file_map[key] = f
+            got.append(eg._gate_weight(name, torch.device("cpu")))
+    finally:
+        stc.tensor_file_map[key] = kept
+    for f, g in zip(copies, got):
+        assert g.dtype == torch.float32 and torch.equal(_bits(g), _bits(got[0])), \
+            f"{key}: the result depends on which copy the collection kept ({os.path.basename(f)})"
+    return got[0], copies
+
+
 def check_gate_copies(cfg, egs):
     """
     A converted checkpoint carries q_weight / k_weight twice under the same name (fp32
-    converted, bf16 original) and the collection keeps whichever file its scan lists last;
-    load_gate reads the bf16 copy when there is one. Every copy, read through the loader's
-    staging, must equal what load_gate loaded, so the result does not depend on the file
-    order (on V4.1-Flash the fp32 copy is exactly the staged bf16 one).
+    converted, bf16 original) and the collection keeps whichever file its scan lists last.
+    load_gate must read the bf16 copy exactly whichever that is, and its product must equal
+    DeepSeek's q_weight.float() * k_weight.float() in every element. The fp32 copies of the
+    V4.1-Flash conversion are the bf16 values after the loader's fp16 staging; each fp32 copy
+    must be one of the two, and the elements and products the staging changes are reported.
     """
-    from exllamav3.loader.safetensors import DiskTensorHandle
-    from exllamav3.loader.safetensors import convert_dtype
-    stc = cfg.stc
     report = []
     for eg in egs:
         eg.load_gate(torch.device("cpu"))
-        for name, got in (("q_weight", eg.q_weight.data), ("k_weight", eg.k_weight.data)):
+        exact = {}
+        for name in ("q_weight", "k_weight"):
             key = f"{eg.key}.{name}"
-            copies = sorted(f for f, h in stc.file_headers.items() if isinstance(h.get(key), dict))
+            stc = cfg.stc.find_stc(key)
+            got, copies = _gate_weight_any_order(eg, name)
+            assert torch.equal(_bits(got), _bits(getattr(eg, name).data)), f"{key}: load_gate differs"
+            vals = {f: _read_copy(stc, key, f) for f in copies}
+            bf16 = [f for f in copies if vals[f].dtype == torch.bfloat16]
+            assert bf16, f"{key}: no bf16 copy (DeepSeek's weights as released) in the checkpoint"
+            for f in bf16:
+                assert torch.equal(_bits(vals[f]), _bits(got)), f"{key}: the bf16 copy in {os.path.basename(f)} differs"
+            staged = vals[bf16[0]].half().float()
+            notes = []
             for f in copies:
-                h = stc.file_headers[f]
-                meta = h[key]
-                dt = convert_dtype(meta["dtype"])[0]
-                d = DiskTensorHandle(key, f, h["_header_offset"] + meta["data_offsets"][0], meta["shape"], dt)
-                try:
-                    t = d.read_range(0, d.num_rows)
-                finally:
-                    d.close()
-                if t.dtype == torch.bfloat16:
-                    t = t.half()
-                assert torch.equal(t.float(), got), f"{key}: the copy in {os.path.basename(f)} differs"
-            report.append(f"{key.split('.')[1]}.{name} x{len(copies)}")
-    print(f"  OK  engram gate weights: every copy equals what load_gate loaded ({', '.join(report)})")
+                if f in bf16:
+                    continue
+                v = vals[f]
+                n = int((_bits(v) != _bits(got)).sum())
+                assert n == 0 or torch.equal(_bits(v), _bits(staged)), \
+                    f"{key}: the {v.dtype} copy in {os.path.basename(f)} is neither the bf16 values " \
+                    f"nor their fp16 staging"
+                notes.append(f"{os.path.basename(f)} {'exact' if n == 0 else f'staged, {n} elements differ'}")
+            exact[name] = vals[bf16[0]]
+            report.append(f"{key.split('.')[1]}.{name} x{len(copies)}" + (f" ({'; '.join(notes)})" if notes else ""))
+        want = exact["q_weight"].float() * exact["k_weight"].float()      # DeepSeek's Engram.forward
+        assert torch.equal(_bits(eg.qk), _bits(want)), \
+            f"layer {eg.backbone_idx}: {int((_bits(eg.qk) != _bits(want)).sum())} products differ from DeepSeek's"
+        staged = (exact["q_weight"].half().float().to(torch.bfloat16).float()
+                  * exact["k_weight"].half().float().to(torch.bfloat16).float())
+        d = (staged - want).abs()
+        report.append(f"layer {eg.backbone_idx}: fp16 staging would change {int((d > 0).sum())} of "
+                      f"{want.numel()} products, max {float(d.max()):.2e}")
+    print(f"  OK  engram gate weights read exactly from the bf16 copy whichever copy the collection "
+          f"kept, product == DeepSeek's in every element ({', '.join(report)})")
+
+
+def _write_safetensors(path, tensors: dict):
+    """A minimal safetensors file holding `tensors` ({name: bf16 / fp16 / fp32 tensor})."""
+    import json, struct
+    names = {torch.bfloat16: "BF16", torch.float16: "F16", torch.float32: "F32"}
+    header, blobs, off = {}, [], 0
+    for name, t in tensors.items():
+        b = t.contiguous().view(torch.uint8).numpy().tobytes()
+        header[name] = {"dtype": names[t.dtype], "shape": list(t.shape), "data_offsets": [off, off + len(b)]}
+        blobs.append(b)
+        off += len(b)
+    h = json.dumps(header).encode()
+    h += b" " * (-len(h) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(h)) + h + b"".join(blobs))
+
+
+def test_gate_weight_exact_whatever_the_file_order(tmp_path):
+    """
+    Synthetic shards laid out as a converted checkpoint (no checkpoint needed): the fp32 copy of
+    q_weight / k_weight is the fp16-staged bf16 one, as in the V4.1-Flash conversion, and the
+    values include some that the staging changes (below 2^-17) or flushes to zero (below 2^-25).
+    load_gate reads the bf16 values exactly whichever copy the collection kept, and whichever
+    file sorts first; without a bf16 copy it reads the first copy by path, exactly; a missing
+    tensor is the loader's error.
+    """
+    import types
+    from exllamav3.loader.safetensors import SafetensorsCollection
+    from exllamav3.modules.dsv41_engram import DSV41Engram
+    H, D = 2, 8
+    q = torch.tensor([[1.0, -0.5, 3e-6, -1e-6, 1e-9, 7e-5, 1.5 * 2.0 ** -20, -2.0 ** -26],
+                      [0.25, 5e-6, -4e-6, 2e-7, 1.0 / 3, -1e-8, 6.1e-5, 12.0]]).to(torch.bfloat16)
+    k = torch.tensor([[-3e-6, 2.0, 1e-7, 0.75, -6e-6, 1e-3, -2e-5, 4.5],
+                      [1e-6, -1e-6, 0.125, 9e-6, -7e-7, 3.0, 1e-10, -0.01]]).to(torch.bfloat16)
+    assert not torch.equal(q.half().float(), q.float()) and not torch.equal(k.half().float(), k.float())
+    want_qk = q.float() * k.float()                     # DeepSeek's Engram.forward
+
+    def engram(directory):
+        stc = SafetensorsCollection(str(directory))
+        eg = DSV41Engram.__new__(DSV41Engram)
+        eg.key, eg.hc_mult, eg.hidden_size = "layers.1.engram", H, D
+        eg.config = types.SimpleNamespace(stc = stc)
+        return eg
+
+    staged = {"layers.1.engram.q_weight": q.half().float(), "layers.1.engram.k_weight": k.half().float()}
+    exact = {"layers.1.engram.q_weight": q, "layers.1.engram.k_weight": k}
+    # both sort orders of the bf16 and the fp32 file
+    for i, (a, b) in enumerate(((staged, exact), (exact, staged))):
+        d = tmp_path / f"order{i}"
+        d.mkdir()
+        _write_safetensors(d / "model-00001.safetensors", a)
+        _write_safetensors(d / "model-00002.safetensors", b)
+        eg = engram(d)
+        for name, t in (("q_weight", q), ("k_weight", k)):
+            got, copies = _gate_weight_any_order(eg, name)
+            assert len(copies) == 2 and torch.equal(_bits(got), _bits(t)), f"order {i}: {name} is not the bf16 copy"
+        eg.load_gate(torch.device("cpu"))
+        assert torch.equal(_bits(eg.qk), _bits(want_qk)), f"order {i}: the product differs from DeepSeek's"
+
+    # no bf16 copy: the first fp32 copy by path, exactly (a second one would not be read)
+    d = tmp_path / "fp32only"
+    d.mkdir()
+    other = {n: torch.full_like(t, 0.5) for n, t in staged.items()}
+    _write_safetensors(d / "model-00001.safetensors", staged)
+    _write_safetensors(d / "model-00002.safetensors", other)
+    eg = engram(d)
+    got, _ = _gate_weight_any_order(eg, "q_weight")
+    assert torch.equal(_bits(got), _bits(q.half().float())), "without a bf16 copy: not the first fp32 copy"
+
+    # a missing tensor: the loader's own error
+    d = tmp_path / "missing"
+    d.mkdir()
+    _write_safetensors(d / "model-00001.safetensors", {"layers.1.engram.q_weight": q})
+    eg = engram(d)
+    try:
+        eg._gate_weight("k_weight", torch.device("cpu"))
+    except ValueError as e:
+        assert "Required tensor layers.1.engram.k_weight not found" in str(e), e
+    else:
+        raise AssertionError("a missing k_weight did not raise")
+    print("  OK  engram gate weights: bf16 values read exactly whatever the copy kept and the file "
+          "order, product == DeepSeek's; fp32-only and missing copies handled")
 
 
 def test_engram_worker_lifetime():
@@ -256,7 +398,10 @@ def test_engram_worker_lifetime():
 
 
 if __name__ == "__main__":
+    import pathlib, tempfile
     test_engram_worker_lifetime()
+    with tempfile.TemporaryDirectory() as tmp:
+        test_gate_weight_exact_whatever_the_file_order(pathlib.Path(tmp))
     d = sys.argv[1] if len(sys.argv) > 1 else model_dir()
     if not d:
         skip("engram reference stages", "no checkpoint (pass a directory or set DSV41_MODEL_DIR)")

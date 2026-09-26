@@ -51,11 +51,16 @@ tensors twice:
     bf16 in the original ones. The safetensors collection keeps whichever file its
     directory scan lists last, which differs between layers and machines, and says
     so with one " !! Overriding ..." line per tensor (four on V4.1-Flash, all
-    expected). load_gate therefore picks the copy itself: the bf16 one when the
-    checkpoint carries one (DeepSeek's weights as released), else the only one.
-    On V4.1-Flash the fp32 copy is exactly the bf16 one after the loader's fp16
-    staging, so the choice changes no bits there; it makes the result independent
-    of the file order.
+    expected). load_gate therefore picks the copy itself, from the file headers and
+    never from the scan order: the bf16 copy of the original shards when the
+    checkpoint carries one (DeepSeek's weights as released; of several bf16 copies,
+    the first by file path), else the first copy by file path. It reads that copy's
+    exact values into fp32, as the reference's .float() does, and not through the
+    loader's bf16 -> fp16 staging. The fp32 copies in the V4.1-Flash conversion equal
+    the bf16 values after that staging, not the bf16 values: they differ in some of
+    the elements below fp16's normal range. They are not read while a bf16 copy
+    exists; a conversion saves what load_gate loaded, so one made with the exact read
+    saves the exact values.
 
 GENERATION. Each position hashes the 3 compressed ids before it, so a chunk
 past position 0 needs ids from an earlier forward. They come from a per-slot
@@ -89,7 +94,7 @@ from .dsv41_ablation import ablated
 from .dsv41_engram_math import stable_engram_gate
 from .linear import Linear
 from ..ext import exllamav3_ext as ext
-from ..loader.safetensors import DiskTensorHandle
+from ..loader.safetensors import DiskTensorHandle, convert_dtype
 from ..model.math_policy import STABLE_ARITHMETIC
 from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
@@ -240,29 +245,33 @@ class DSV41Engram(Module):
 
     def _gate_weight(self, name: str, device: torch.device) -> torch.Tensor:
         """
-        q_weight or k_weight as fp32 on `device`, from the copy the module docstring's
-        DUPLICATE WEIGHTS rule names: the bf16 one when the checkpoint carries one, else the
-        collection's. A bf16 copy goes through the loader's usual staging (bf16 -> fp16, as
-        get_tensor does without allow_bf16), wherever the collection found it.
+        q_weight or k_weight as fp32 on `device`: the exact values of the copy the module
+        docstring's DUPLICATE WEIGHTS rule names (the bf16 one when the checkpoint carries one,
+        else the first by file path), read from that copy's own file whichever copy the
+        collection kept. bf16, fp16 and fp32 all convert to fp32 exactly; nothing goes through
+        the loader's bf16 -> fp16 staging.
         """
         key = f"{self.key}.{name}"
         # the collection that serves this key (a variant collection, --override, holds none of
         # its own file headers)
         stc = self.config.stc.find_stc(key)
-        bf16 = sorted(f for f, h in stc.file_headers.items()
-                      if isinstance(h.get(key), dict) and h[key].get("dtype") == "BF16")
-        winner = stc.tensor_file_map.get(key)
-        if not bf16 or winner in bf16:
-            return stc.get_tensor(key, device, no_defer = True).float()
-        header = stc.file_headers[bf16[0]]
+        copies = sorted(f for f, h in stc.file_headers.items() if isinstance(h.get(key), dict))
+        new = getattr(stc, "new_tensors", None)
+        if not copies or (new and key in new):
+            # a tensor the conversion has just produced for this module comes first, as in
+            # get_tensor; no copy at all ends in get_tensor's missing-tensor error
+            return stc.get_tensor(key, device, allow_bf16 = True, no_defer = True).float()
+        bf16 = [f for f in copies if stc.file_headers[f][key].get("dtype") == "BF16"]
+        filename = (bf16 or copies)[0]
+        header = stc.file_headers[filename]
         meta = header[key]
-        handle = DiskTensorHandle(key, bf16[0], header["_header_offset"] + meta["data_offsets"][0],
-                                  meta["shape"], torch.bfloat16)
+        handle = DiskTensorHandle(key, filename, header["_header_offset"] + meta["data_offsets"][0],
+                                  meta["shape"], convert_dtype(meta["dtype"])[0])
         try:
             t = handle.read_range(0, handle.num_rows)
         finally:
             handle.close()
-        return t.half().float().to(device)
+        return t.float().to(device)
 
     def load_gate(self, device: torch.device):
         """q_weight / k_weight, and their product as the forward uses it."""
@@ -272,11 +281,12 @@ class DSV41Engram(Module):
                 self.k_weight.shape != self.q_weight.shape:
             raise ValueError(f"{self.key}: q_weight {tuple(self.q_weight.shape)} and k_weight "
                              f"{tuple(self.k_weight.shape)}, expected {(self.hc_mult, self.hidden_size)}")
-        # The reference's Parameters are bf16 and only their product is used. The weights
-        # here come through fp16 staging, so elements in fp16's subnormal range lose bits
-        # against their bf16 values: on V4.1-Flash 103 (layer 1) and 71 (layer 14) of the
-        # 20,480 products differ from the reference's, by at most 4.6e-13. The bf16 rounding
-        # below matches the reference for every other element
+        # The reference's Parameters are bf16 and only their fp32 product is used
+        # (q_weight.float() * k_weight.float()). Read exactly, the weights are those bf16
+        # values, so the product below equals the reference's in every element; the loader's
+        # fp16 staging would change 103 (layer 1) and 71 (layer 14) of V4.1-Flash's 20,480
+        # products, by at most 4.6e-13. The bf16 rounding changes nothing for bf16 values; it
+        # brings a checkpoint that holds only fp32 copies to the reference's precision
         self.qk = (self.q_weight.data.to(torch.bfloat16).float()
                    * self.k_weight.data.to(torch.bfloat16).float()).contiguous()
 
