@@ -77,8 +77,8 @@ def add_args(
     parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else cpu_count/2)", default = None)
     parser.add_argument("-mcm", "--moe_cpu_mode", type = str, choices = list(CPU_MODES), help = "Experimental: how the routed experts that --moe_cpu_offload / --moe_cpu_split / --draft_moe_cpu_layers keep in system RAM are computed: compute (CPU worker, hot experts of a prefill chunk streamed to the GPU) or stream_only (every active expert streamed to its layer's GPU and computed there, decode included; no CPU expert arithmetic) (default: EXL3_MOE_CPU_MODE env, else compute)", default = None)
-    parser.add_argument("-placement", "--placement", type = str, help = "Experimental: the device of every decoder layer and where each MoE layer's routed experts live, one rule per layer range, e.g. \"0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1\" (experts=vram|stream|cpu|split cpu=K, hot=K on stream / cpu; * = remaining layers; embed / head = modules before / after them; a ram rule sets RAM budgets, e.g. \"; ram experts=56GiB ngram=12GiB\"; also a JSON object or @file; see doc/placement.md and doc/expert_tiers.md). Layer-split mode only; replaces --moe_cpu_offload / --moe_cpu_split / --moe_cpu_mode; --gpu_split still caps memory per device (default: EXL3_PLACEMENT env; --placement \"\" means none and clears the variable)", default = None)
-    parser.add_argument("-ngr", "--ngram_ram", nargs = "?", const = "all", type = size_flag("ngram_ram", True), metavar = "SIZE", help = "System RAM for n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next): bare -ngr (or all) holds every table whole instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads); a size (e.g. 12GiB) holds the tables that fit, smallest first, and streams the rest; 0 streams every row (default: EXL3_NGRAM_RAM env, else 0; see doc/expert_tiers.md)", default = None)
+    parser.add_argument("-placement", "--placement", type = str, help = "Experimental: the device of every decoder layer and where each MoE layer's routed experts live, one rule per layer range, e.g. \"0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1\" (experts=vram|cache|stream|cpu|split cpu=K, hot=K on cache / stream / cpu, prefetch= and profile= on cache; * = remaining layers; embed / head = modules before / after them; storage rules: cuda:<n> for a GPU's expert cache, ram for RAM budgets and the RAM tier, disk for where experts and n-gram rows are read, e.g. \"; ram experts=56GiB ngram=12GiB\"; also a JSON object or @file; see doc/placement.md and doc/expert_tiers.md). Layer-split mode only; replaces --moe_cpu_offload / --moe_cpu_split / --moe_cpu_mode; --gpu_split still caps memory per device (default: EXL3_PLACEMENT env; --placement \"\" means none and clears the variable)", default = None)
+    parser.add_argument("-ngr", "--ngram_ram", nargs = "?", const = "all", type = size_flag("ngram_ram", True), metavar = "SIZE", help = "System RAM for n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next) and DeepSeek-V4.1's engram tables: bare -ngr (or all) holds every table whole instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads); a size (e.g. 12GiB) holds the tables that fit, smallest first, and gives the rest to a RAM cache of the rows of the tables that stream; 0 streams every row (default: EXL3_NGRAM_RAM env, else 0; see doc/expert_tiers.md)", default = None)
     parser.add_argument("-fp32_logits", "--fp32_logits", action = "store_true", help = "Output logits in FP32 instead of FP16 (twice the output buffer; default: EXL3_FP32_LOGITS env, else off)")
     parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
     parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
@@ -252,14 +252,12 @@ def init(
         assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
         assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
     der = getattr(args, "draft_expert_ram", None)
-    if der is not None:
-        assert draft_model_dir, "--draft_expert_ram requires a draft model (or --mtp)"
+    assert der is None or draft_model_dir, "--draft_expert_ram requires a draft model (or --mtp)"
     if use_mtp:
         draft_config = config
-        # Shared config: the MTP head is a separate component with its own budget and worker
+        # Shared config: the MTP head is a separate component with its own budget, worker and RAM cap
         config.infer_params.draft_moe_cpu_offload = dmcl
-        if der is not None:
-            config.infer_params.draft_expert_ram = der
+        config.infer_params.draft_expert_ram = der
         if dmclt is not None:
             config.infer_params.draft_moe_cpu_threads = dmclt
     elif draft_model_dir:

@@ -43,6 +43,9 @@ GpuConfig gpu_config_of(const py::dict& d)
     g.affinity = value<std::vector<int>>(d, "affinity", {});
     g.rec_ring_bytes = value<int64_t>(d, "rec_ring_bytes", g.rec_ring_bytes);
     g.trace = value<int64_t>(d, "trace", 0);
+    g.trace_path = value<std::string>(d, "trace_path", "");
+    g.halves = value<int>(d, "halves", 1);
+    g.prefetch_layer = value<std::vector<int>>(d, "prefetch_layer", {});
     return g;
 }
 
@@ -139,6 +142,50 @@ void TierGpuHandle::lookup(int64_t lc, const at::Tensor& ids, int64_t mode, int6
                  stream);
 }
 
+void TierGpuHandle::layer_begin()
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_).stream();
+    py::gil_scoped_release nogil;
+    gpu_->layer_begin(stream);
+}
+
+void TierGpuHandle::layer_plan(int64_t lc, int64_t half)
+{
+    py::gil_scoped_release nogil;
+    gpu_->layer_plan((int) lc, (int) half);
+}
+
+void TierGpuHandle::layer_run(int64_t lc, const at::Tensor& ids, int64_t seq, int64_t tokens)
+{
+    TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_cuda() && ids.is_contiguous(),
+                "expert tier: selected experts must be a contiguous int64 CUDA tensor");
+    TORCH_CHECK(ids.get_device() == device_, "expert tier: selected experts on the wrong device");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_).stream();
+    gpu_->layer_run((int) lc, ids.data_ptr<int64_t>(), (int) ids.numel(), (uint32_t) seq, (uint64_t) tokens, stream);
+}
+
+void TierGpuHandle::layer_after(int64_t lc)
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_).stream();
+    gpu_->layer_after((int) lc, stream);
+}
+
+void TierGpuHandle::predict(int64_t lc, const at::Tensor& ids, int64_t seq, int64_t tokens)
+{
+    TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_cuda() && ids.is_contiguous(),
+                "expert tier: predicted experts must be a contiguous int64 CUDA tensor");
+    TORCH_CHECK(ids.get_device() == device_, "expert tier: predicted experts on the wrong device");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_).stream();
+    gpu_->predict((int) lc, ids.data_ptr<int64_t>(), (int) ids.numel(), (uint32_t) seq, (uint64_t) tokens, stream);
+}
+
+std::vector<int64_t> TierGpuHandle::layer_addrs(int64_t lc, int64_t e)
+{
+    std::vector<int64_t> out;
+    for (int q = 0; q < gpu_->projections(); ++q) out.push_back(gpu_->layer_addr((int) lc, (int) e, q));
+    return out;
+}
+
 int64_t TierGpuHandle::step(bool wait)
 {
     py::gil_scoped_release nogil;
@@ -174,15 +221,42 @@ py::list TierGpuHandle::records()
     return out;
 }
 
-py::dict TierGpuHandle::state() { return core_state(gpu_->core()); }
-py::dict TierGpuHandle::counters() { return core_counters(gpu_->core()); }
+// The host side is read under the runtime's work lock (the tier thread changes it while it handles
+// a record), taken with the GIL released: the thread may be waiting for a copy that only the GPU
+// completes, and it never needs the GIL
+namespace
+{
+struct WorkLock
+{
+    std::unique_lock<std::mutex> lk;
+    explicit WorkLock(TierGpu& g)
+    {
+        py::gil_scoped_release nogil;
+        lk = std::unique_lock<std::mutex>(g.work_mu());
+    }
+};
+}  // namespace
+
+py::dict TierGpuHandle::state()
+{
+    WorkLock wl(*gpu_);
+    return core_state(gpu_->core());
+}
+
+py::dict TierGpuHandle::counters()
+{
+    WorkLock wl(*gpu_);
+    return core_counters(gpu_->core());
+}
 
 py::dict TierGpuHandle::stats()
 {
+    WorkLock wl(*gpu_);
     py::dict d;
     const GpuStats& s = gpu_->stats;
     d["records"] = s.records;
     d["host_records"] = s.host_records;
+    d["predictions"] = s.predictions;
     d["returns"] = s.returns;
     d["max_lag"] = s.max_lag;
     d["idle_sleeps"] = s.idle_sleeps;
@@ -200,6 +274,16 @@ py::dict TierGpuHandle::stats()
     d["plan_commands"] = pl->commands;
     d["plan_full_waits"] = pl->full_waits;
     d["plan_deps_done"] = pl->dep_dropped;
+    // layer mode (the copy engines of prefill calls)
+    d["layer_plans"] = gpu_->layer_plans;
+    d["layer_calls"] = gpu_->layer_calls;
+    d["layer_catch_ups"] = gpu_->layer_catch_ups;
+    if (const LayerCopier* lc = gpu_->layer_copier())
+    {
+        d["layer_h2d_bytes"] = lc->h2d_bytes;
+        d["layer_h2d_copies"] = lc->h2d_copies;
+        d["layer_batches"] = lc->batches;
+    }
     // the copy engines of the load (cold fill) and the page-locked memory
     if (CudaCopier* c = gpu_->copier())
     {
@@ -223,6 +307,15 @@ py::dict TierGpuHandle::stats()
         d["arena_ns"] = hs.arena_ns;
         d["compacted"] = hs.compacted;
         d["compact_ns"] = hs.compact_ns;
+        d["presubmitted"] = hs.presubmitted;
+        d["predicted_reads"] = hs.predicted_reads;
+        d["slab_to_vram"] = hs.slab_to_vram;
+        d["slab_reused"] = hs.slab_reused;
+        d["prefetch_issued"] = hs.prefetch_issued;
+        d["prefetch_used"] = hs.prefetch_used;
+        d["prefetch_starved"] = hs.prefetch_starved;
+        d["prefetch_dropped"] = hs.prefetch_dropped;
+        d["staged"] = hs.staged;
         d["ram_chunks"] = (int64_t) h->arena().base.size();
     }
     return d;

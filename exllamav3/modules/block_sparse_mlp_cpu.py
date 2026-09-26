@@ -97,6 +97,16 @@ def run_pending_swap_sweeps(infer_params):
 
 class BlockSparseMLP_CPU:
 
+    def placement_layer_index(self) -> int:
+        """The decoder layer of this module, as the placement's rules number them"""
+        layer_idx = self.layer_idx
+        if layer_idx is None:
+            m = _LAYER_KEY.search(self.key or "")
+            if m is None:
+                raise ValueError(f"placement: cannot tell which decoder layer {self.key} belongs to")
+            layer_idx = int(m.group(1))
+        return layer_idx
+
     def placement_plan(self):
         """(storage, mode, split_k) of this layer under an explicit placement (model/placement.py),
         or None without one; only the text component is placed"""
@@ -104,13 +114,7 @@ class BlockSparseMLP_CPU:
         placement = parse_placement(getattr(ip, "placement", None))
         if placement is None or getattr(ip, "moe_cpu_component", "text") != "text":
             return None
-        layer_idx = self.layer_idx
-        if layer_idx is None:
-            m = _LAYER_KEY.search(self.key or "")
-            if m is None:
-                raise ValueError(f"placement: cannot tell which decoder layer {self.key} belongs to")
-            layer_idx = int(m.group(1))
-        return expert_plan(placement, layer_idx, self.num_experts)
+        return expert_plan(placement, self.placement_layer_index(), self.num_experts)
 
     def cpu_expert_mode(self) -> str:
         """Execution mode of this layer's RAM-held experts (model/moe_expert_policy.py): the
@@ -136,6 +140,7 @@ class BlockSparseMLP_CPU:
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
+        self._split_full = None       # split: every expert's Linears in router-index order
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -258,6 +263,7 @@ class BlockSparseMLP_CPU:
             (self.gates, self.ups, self.downs, self.modules,
              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved
             self._split_saved = None
+            self._split_full = None
             self.cpu_split_first = None
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
@@ -575,6 +581,21 @@ class BlockSparseMLP_CPU:
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
             and not self.tid2eid_key
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+        # profile= (model/moe_profile.py): the layer's experts hot to cold from an expert profile, so
+        # the hottest E - k start resident; the dynamic sweeps keep moving them by live traffic
+        rank = self._profile_ranking()
+        if rank is not None:
+            if stats_path:
+                print(f" !! {self.key}: profile= takes precedence over EXL3_MOE_CPU_SPLIT_STATS")
+                stats_path = None
+            if self.tid2eid_key:
+                print(f" !! {self.key}: tid2eid remap present, profile= leaves the placement unpermuted")
+            else:
+                self._split_perm = rank
+                if self.gated:
+                    self.gates = [self.gates[e] for e in rank]
+                self.ups = [self.ups[e] for e in rank]
+                self.downs = [self.downs[e] for e in rank]
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled
             print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
@@ -650,6 +671,9 @@ class BlockSparseMLP_CPU:
             mode = mode,
         )
 
+        # Every expert in router-index order (permuted when a profile or stats file permuted them):
+        # what a swap sweep reads by router index
+        self._split_full = (self.gates, self.ups, self.downs)
         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never
         # loaded); unload() restores them so a reload can redo the split cleanly
         tail = set((self.gates[first:] if self.gated else []) + self.ups[first:] + self.downs[first:])
@@ -810,5 +834,29 @@ class BlockSparseMLP_CPU:
         return True
 
     def _split_saved_lists_ref(self):
-        g, u, d = self._split_saved[0], self._split_saved[1], self._split_saved[2]
-        return g, u, d
+        """The full expert lists in router-index order (the permuted order when the split was seeded
+        from a profile or a stats file, since the router was permuted to match)"""
+        return self._split_full
+
+    def _profile_ranking(self):
+        """This layer's experts hot to cold from the profile= of its placement rule, or None"""
+        ip = self.config.infer_params
+        placement = parse_placement(getattr(ip, "placement", None))
+        if placement is None or getattr(ip, "moe_cpu_component", "text") != "text":
+            return None
+        spec = placement.experts_for_layer(self.placement_layer_index()).profile
+        if spec is None:
+            return None
+        from ..model import moe_profile
+        cache = getattr(self.config, "moe_profiles", None)
+        if cache is None:
+            cache = self.config.moe_profiles = {}
+        prof = cache.get(spec)
+        if prof is None:
+            keys = getattr(self.config, "moe_layer_keys", None) or [self.key]
+            prof = cache[spec] = moe_profile.Profile(spec, keys, self.num_experts, getattr(self.config, "directory", None),
+                                                     moe_profile.model_fingerprint(self.config, self.num_experts))
+        rank = prof.ranking(self.key)
+        if rank is None:
+            print(f" !! {self.key}: profile {spec} has no row for this layer; its experts stay in checkpoint order")
+        return rank

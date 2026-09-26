@@ -107,6 +107,8 @@ class NGramEmbedding(Module):
         # rows_per_shard rows
         self.tables = None
         self.handles = None
+        self.io_direct = -1         # the placement's disk io= (-1 the engine's choice, 0 buffered, 1 O_DIRECT)
+        self.row_cache = None       # RowCache of a streamed table (--ngram_ram left after whole tables)
         self.rows_per_shard = None
         self.num_rows = 0
         self.head_bias = None
@@ -219,6 +221,27 @@ class NGramEmbedding(Module):
         if stream_from_disk:
             self.mode = "trellis_disk" if quantized else "fp16_disk"
             self.handles = [stc.get_tensor_handle(k) for k in keys]
+            # The placement's disk rule (model/disk_source.py): the rows from a checked copy of the
+            # table's shards (disk ngram=<dir>), and the page-cache mode of the reads (disk io=)
+            from ..model.placement import parse as parse_placement
+            from ..model.disk_source import source_dir, copy_path, io_direct, check_route
+            placement = parse_placement(getattr(self.config.infer_params, "placement", None))
+            copy_dir = source_dir(placement, "ngram")
+            if copy_dir:
+                self.handles = [DiskTensorHandle(h.key, copy_path(h.filename, copy_dir, "ngram"), h.abs_offset,
+                                                 h.shape, h.dtype) for h in self.handles]
+            self.io_direct = io_direct(placement)
+            if self.io_direct >= 0:
+                check_route(placement, ext.disk_ngram_route(), f"the n-gram rows of {self.key}")
+            # The part of the n-gram budget no whole table took: a cache of this table's rows
+            from ..model.ram_budget import ngram_row_cache_bytes, register_row_cache
+            cache_bytes = ngram_row_cache_bytes(self.config, self.key)
+            if cache_bytes:
+                from ..util.memory import check_host_memory
+                from .ngram_row_cache import RowCache
+                check_host_memory(cache_bytes, f"the row cache of n-gram table {self.key} (--ngram_ram)")
+                self.row_cache = RowCache(self.key, [self.handles[0].row_bytes], cache_bytes)
+                register_row_cache(self.config, self.key, self.row_cache)
             if not quantized:
                 self._row_dtype = self.handles[0].dtype
             # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
@@ -262,6 +285,22 @@ class NGramEmbedding(Module):
             if not quantized:
                 self._row_dtype = self.tables[0].dtype
 
+    def ngram_tables(self) -> list:
+        """[(name, bytes, row bytes, read by every gathered row)] of the table, from the headers (the
+        n-gram budget, model/ram_budget.py): one table, named by the module"""
+        stc = self.config.stc
+        for suffix in ("trellis", "weight"):
+            keys = []
+            while stc.has_tensor(f"{self.key}.shard_{len(keys)}.{suffix}"):
+                keys.append(f"{self.key}.shard_{len(keys)}.{suffix}")
+            if not keys and stc.has_tensor(f"{self.key}.{suffix}"):
+                keys = [f"{self.key}.{suffix}"]
+            if keys:
+                rows = stc.get_tensor_meta(keys[0])[keys[0]]["shape"][0]
+                return [("", sum(stc.get_tensor_size(k) for k in keys), stc.get_tensor_size(keys[0]) // max(1, rows),
+                         False)]
+        return []
+
     def table_nbytes(self) -> int:
         """Bytes of the whole table (every shard) as the checkpoint stores it, from the headers: what
         holding it in RAM takes (the n-gram budget, model/ram_budget.py)"""
@@ -283,6 +322,7 @@ class NGramEmbedding(Module):
         self.mode = None
         self.tables = None
         self.handles = None
+        self.row_cache = None
         self._pins = []
         self._row_dtype = None
         self.head_bias = None
@@ -532,7 +572,23 @@ class NGramEmbedding(Module):
 
     def _gather_rows(self, uids: torch.Tensor, out: torch.Tensor):
         """Gather the (sorted) unique rows into the pinned staging buffer, routing shard
-        segments (contiguous in the sorted list) to their tensor/handle."""
+        segments (contiguous in the sorted list) to their tensor/handle. A streamed table with a
+        row cache reads only what the cache misses, and caches it"""
+        cache = self.row_cache
+        if cache is None or self.tables is not None:
+            self._gather_stores(uids, out)
+            return
+        n = uids.numel()
+        mpos, mslots = cache.lookup(uids, [out[:n].view(torch.uint8).view(n, -1)])
+        if not mpos.numel():
+            return
+        miss = uids.index_select(0, mpos)
+        scratch = torch.empty((miss.numel(), *out.shape[1:]), dtype = out.dtype)
+        self._gather_stores(miss, scratch)
+        out[:n].index_copy_(0, mpos, scratch)
+        cache.insert(miss, mslots, [scratch.view(torch.uint8).view(miss.numel(), -1)])
+
+    def _gather_stores(self, uids: torch.Tensor, out: torch.Tensor):
         stores = self.tables if self.tables is not None else self.handles
         if len(stores) > 1:
             # One searchsorted for every shard boundary (a per-shard call costs ~2.5 us each)
@@ -549,6 +605,14 @@ class NGramEmbedding(Module):
                 if self.tables is not None:
                     torch.index_select(store, 0, seg - base if base else seg,
                                        out = out[i0 : i1])
+                elif self.io_direct >= 0:
+                    # disk io=: this thread's reads in the placement's page-cache mode
+                    prev = ext.disk_set_thread_direct(self.io_direct)
+                    try:
+                        ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
+                                             store.row_bytes, seg.contiguous(), base, out[i0 : i1])
+                    finally:
+                        ext.disk_set_thread_direct(prev)
                 else:
                     ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
                                          store.row_bytes, seg.contiguous(), base, out[i0 : i1])

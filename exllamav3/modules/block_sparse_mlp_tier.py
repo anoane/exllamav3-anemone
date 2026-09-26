@@ -6,19 +6,23 @@ The layer is a resident layer in every other respect. Its expert Linears leave t
 the load (as the CPU split's tail experts do) and get their EXL3 inner here: suh, svh, mcg / mul1
 and bias resident, the trellis a view of the GPU's zeroed sentinel slot, so load_local builds its
 MultiLinear pointer tables, bound classes and fused buffers exactly as for a resident layer. Every
-MoE call then runs the expert cache's lookup right after routing, which points the tables at the
-slots holding the call's experts and holds the stream until they are there. The quantized fast
-paths read those tables on the device (the fused decode kernels, the fused MoE kernel, the batched
-reconstruct tier); the per-expert dequant path gets the trellis views explicitly
-(run_single_expert_dq_views). A path that would read a per-expert trellis tensor itself (the graph
-and torch paths) is never reached: only layers the fused kernel covers can be cached, and the
-forward raises should one be reached anyway.
+MoE call then runs the expert cache right after routing (tier_resolve), which points the tables at
+the slots holding the call's experts and holds the stream until they are there, and tells it when
+the layer's compute is enqueued (tier_after_compute: a layer-mode prefill plans the next cache
+layer then). The quantized fast paths read those tables on the device (the fused decode kernels,
+the fused MoE kernel, the batched reconstruct tier); the per-expert dequant path gets the trellis
+views explicitly (run_single_expert_dq_views). A path that would read a per-expert trellis tensor
+itself (the graph and torch paths) is never reached: only layers the fused kernel covers can be
+cached, and the forward raises should one be reached anyway. With prefetch=router a decode call
+also applies a later cache layer's router to its own router input (tier_predict), so the disk
+reads what that layer will probably miss ahead of it.
 """
 
 from __future__ import annotations
 import torch
 
 from .quant.exl3 import LinearEXL3
+from ..ext import exllamav3_ext as ext
 
 
 class BlockSparseMLP_Tier:
@@ -27,6 +31,7 @@ class BlockSparseMLP_Tier:
         self.tier = None                # TierDevice of this layer's GPU (experts=cache), else None
         self.tier_layer = None
         self._tier_modules = None
+        self._tier_pred_bufs = {}       # rows -> private routing outputs of tier_predict_ids
 
     def _tier_plan(self):
         plan = self.placement_plan() if hasattr(self, "placement_plan") else None
@@ -56,7 +61,7 @@ class BlockSparseMLP_Tier:
         )
         if not ok:
             raise RuntimeError(ineligible(self.key))
-        td, layer = tiers.register(self, device, plan[2])
+        td, layer = tiers.register(self, device, plan[2], self.placement_layer_index())
         self.tier, self.tier_layer = td, layer
         try:
             lin = self._tier_linears()
@@ -121,6 +126,46 @@ class BlockSparseMLP_Tier:
             return                      # the load's measuring forward runs on the sentinel
         self.tier.resolve(self.tier_layer, selected_experts, bsz)
 
+    def tier_after_compute(self, params: dict):
+        """The layer's routed compute is enqueued (layer mode: plan the next cache layer)"""
+        if params.get("autosplit_measure") or self.tier.handle is None:
+            return
+        self.tier.after_compute(self.tier_layer)
+
+    def tier_predict(self, z, bsz: int, params: dict):
+        """prefetch=router: a decode call predicts a later cache layer's experts from this router input"""
+        if params.get("autosplit_measure") or self.tier.handle is None or self.tier_layer.predict_to is None:
+            return
+        self.tier.predict(self.tier_layer, z, bsz)
+
+    def tier_predict_ids(self, z) -> torch.Tensor:
+        """The experts this layer's router picks for router input z (another layer's), [rows, top-k]
+        int64 on this layer's device, in private buffers (the routing workspaces are shared by every
+        layer of the device). DeepSeek's sqrt-softplus router runs its own selection kernel (the same
+        picks this layer would make for z); other routers select on the gate logits plus the
+        selection bias, which predicts but need not equal their picks"""
+        from .block_sparse_mlp_routing import routing_sqrtsp, _gate_t, _esb_h, ROUTING_ACT_SQRTSP
+        cfg = self.routing_cfg
+        rows = z.shape[0]
+        if self.routing_fn is routing_sqrtsp:
+            bufs = self._tier_pred_bufs.get(rows)
+            if bufs is None:
+                E, K = cfg.num_experts, cfg.num_experts_per_tok
+                bufs = self._tier_pred_bufs[rows] = (
+                    torch.empty((rows, E), dtype = torch.half, device = self.device),
+                    torch.empty((rows, K), dtype = torch.long, device = self.device),
+                    torch.empty((rows, K), dtype = torch.half, device = self.device),
+                )
+            logits, sel, w = bufs
+            _gate_t(cfg)
+            ext.routing_ds3_nogroup(z, cfg.gate_tensor, logits, _esb_h(cfg), sel, w, cfg.routed_scaling_factor,
+                                    cfg.gate_tensor_t, ROUTING_ACT_SQRTSP, cfg.gate_i8, cfg.gate_sb)
+            return sel
+        scores = torch.matmul(z.to(cfg.gate_tensor.dtype), cfg.gate_tensor).float()
+        if cfg.e_score_correction_bias is not None:
+            scores = scores.sigmoid() + cfg.e_score_correction_bias.float()
+        return scores.topk(cfg.num_experts_per_tok, dim = -1).indices
+
     def tier_trellis_views(self, expert_idx: int) -> list:
         """(gate or None, up, down) trellis views of an expert, for run_single_expert_dq_views"""
         v = self.tier.trellis_views(self.tier_layer, expert_idx)
@@ -141,3 +186,4 @@ class BlockSparseMLP_Tier:
             self.tier.tiers.unregister(self)
         self.tier = None
         self.tier_layer = None
+        self._tier_pred_bufs = {}

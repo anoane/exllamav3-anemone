@@ -9,8 +9,11 @@ the routed experts it keeps in system RAM and its n-gram tables, against
 
 checked, item by item, against the host memory the process may still take (util/host_budget.py)
 before anything is allocated. Model.load_gen calls plan_component() once per load; the CPU
-worker's registration (charge_expert_ram) and the n-gram module's load (ngram_in_ram) consult its
-result. Torch-free: the plan reads checkpoint headers, never tensor data.
+worker's registration (charge_expert_ram) and the n-gram modules' load (ngram_in_ram,
+ngram_row_cache_bytes) consult its result. The n-gram budget holds whole tables first (smallest
+first) and gives the rest to row caches of the tables that stream (their most recent rows in RAM);
+DeepSeek-V4.1's engram tables take part like any other. Torch-free: the plan reads checkpoint
+headers, never tensor data.
 """
 
 from __future__ import annotations
@@ -162,7 +165,7 @@ def is_ngram(m) -> bool:
 
 
 def is_engram(m) -> bool:
-    """A DeepSeek-V4.1 engram layer: its tables are always read from disk"""
+    """A DeepSeek-V4.1 engram layer (two tables: fp8 rows and their e8m0 scales, read together)"""
     return type(m).__name__ == "DSV41Engram"
 
 
@@ -333,6 +336,26 @@ class NgramTable:
     key: str
     nbytes: int
     every_row: bool = False     # read by every gathered row (fills first)
+    module: str = ""            # the module that reads it (row caches are per module)
+    row_bytes: int = 0
+
+
+ROW_CACHE_MIN = 64 << 20        # a module's row cache below this is not made (too few rows to help)
+
+
+def row_cache_split(tables: list[NgramTable], held: list[NgramTable], left: int) -> dict:
+    """The row caches of what streams: the budget left after the whole tables, split evenly over the
+    modules with a table that is not held (each cache covers that module's streamed tables); none
+    below ROW_CACHE_MIN"""
+    held_keys = {t.key for t in held}
+    mods = []
+    for t in tables:
+        if t.key not in held_keys and t.module and t.module not in mods:
+            mods.append(t.module)
+    if not mods or left <= 0:
+        return {}
+    per = left // len(mods)
+    return {m: per for m in mods} if per >= ROW_CACHE_MIN else {}
 
 
 def ngram_fill(tables: list[NgramTable], budget: int) -> list[NgramTable]:
@@ -365,18 +388,29 @@ class ComponentBudget:
     ngram_budget: Size = ZERO           # resolved: the request, else the cap, else 0
     ngram_tables: list = field(default_factory = list)      # NgramTable
     ngram_held: list = field(default_factory = list)        # NgramTable held whole in RAM
-    ngram_bytes: int = 0
-    engram_keys: list = field(default_factory = list)       # DeepSeek-V4.1 engram layers (disk)
+    ngram_caches: dict = field(default_factory = dict)      # module key -> row cache bytes
+    ngram_bytes: int = 0                                    # whole tables and row caches
     memory: HostMemory | None = None
     reserve: int = 0
     tier_layers: object = None          # expert_tier_config.TierLayers of the experts=cache layers
     tier_config: object = None          # expert_tier_config.TierConfig
     tier: object = None                 # expert_tier_config.TierSizing (stage 1)
 
+    def ngram_resident_bytes(self) -> int:
+        """What of ngram_bytes a load has made resident by the end of its layer split: the whole tables
+        (read in) and the row caches' tags (filled when a cache is made). A row cache's rows are faulted
+        in as rows arrive, so the end-of-load host check must not take them as already held"""
+        held_keys = {t.key for t in self.ngram_held}
+        tags = 0
+        for m, nb in self.ngram_caches.items():
+            per = sum(t.row_bytes for t in self.ngram_tables if t.module == m and t.key not in held_keys) + 8
+            tags += (nb // per) * 8
+        return sum(t.nbytes for t in self.ngram_held) + tags
+
     def worth_reporting(self) -> bool:
         """Anything held in RAM, a budget set, or an expert tier: the load prints summary()"""
-        return bool(self.layers or self.ngram_held or self.expert_cap is not None or self.tier is not None or
-                    (self.ngram_tables or self.engram_keys) and self.ngram_budget != ZERO)
+        return bool(self.layers or self.ngram_held or self.ngram_caches or self.expert_cap is not None or
+                    self.tier is not None or self.ngram_tables and self.ngram_budget != ZERO)
 
     def summary(self) -> str:
         parts = []
@@ -385,14 +419,15 @@ class ComponentBudget:
                          (f" ({self.label}: {len(self.layers)} layers)" if self.layers else "") +
                          (f", cap {self.expert_cap}" if self.expert_cap is not None else ""))
         if self.ngram_tables:
-            if self.ngram_held:
-                parts.append(f"n-gram tables {human(self.ngram_bytes)} in RAM "
-                             f"({len(self.ngram_held)} of {len(self.ngram_tables)} whole)")
+            if self.ngram_held or self.ngram_caches:
+                whole = sum(t.nbytes for t in self.ngram_held)
+                cached = sum(self.ngram_caches.values())
+                parts.append(f"n-gram tables {human(self.ngram_bytes)} in RAM ({len(self.ngram_held)} of "
+                             f"{len(self.ngram_tables)} whole, {human(whole)}" +
+                             (f"; row caches {human(cached)} for {len(self.ngram_caches)} modules" if cached else "") +
+                             ")")
             else:
                 parts.append("n-gram tables 0 (every row streams from disk)")
-        if self.engram_keys and self.ngram_budget != ZERO:
-            parts.append(f"engram tables stream from disk (ngram={self.ngram_budget} holds no DeepSeek-V4.1 "
-                         f"engram table)")
         mem = self.memory
         tail = f"; {human(mem.available)} available" if mem is not None and mem.available is not None else ""
         if tail and mem.cgroup_limits:
@@ -442,10 +477,9 @@ def plan_component(model, placement, memory: HostMemory | None = None) -> Compon
 
     # N-gram tables: the request, capped by --ngram_ram; else --ngram_ram; else 0
     for m in walk(model.modules):
-        if is_ngram(m):
-            b.ngram_tables.append(NgramTable(m.key, int(m.table_nbytes())))
-        elif is_engram(m):
-            b.engram_keys.append(m.key)
+        if is_ngram(m) or is_engram(m):
+            for name, nbytes, rb, every in m.ngram_tables():
+                b.ngram_tables.append(NgramTable(f"{m.key}.{name}" if name else m.key, int(nbytes), every, m.key, rb))
     ng_cap = as_ngram_ram(getattr(ip, "ngram_ram", None)) if component == "text" else None
     ng_req = ram.ngram if ram is not None else None
     tables = sum(t.nbytes for t in b.ngram_tables)
@@ -454,24 +488,30 @@ def plan_component(model, placement, memory: HostMemory | None = None) -> Compon
         if asks > ng_cap.nbytes:
             raise ValueError(f"placement asks ram ngram={ng_req} but --ngram_ram caps this component at {ng_cap}")
     b.ngram_budget = ng_req if ng_req is not None else (ng_cap if ng_cap is not None else ZERO)
-    if b.engram_keys and getattr(placement, "disk", None) is not None and placement.disk.ngram == "off":
-        raise ValueError(f"placement: 'disk ngram=off' would never read n-gram rows from disk, but the "
-                         f"DeepSeek-V4.1 engram tables of {b.engram_keys[0]} are always read from disk; "
-                         f"remove disk ngram=off")
 
     # One check of everything against the host
     b.memory = memory if memory is not None else host_memory()
     b.reserve = reserve_bytes()
     if b.ngram_budget.is_all:
         b.ngram_held = list(b.ngram_tables)
+        room = sum(t.nbytes for t in b.ngram_tables)
     elif b.ngram_budget.is_auto:
         pc = ram.pagecache if ram is not None else AUTO
         pagecache = pagecache_auto(b.memory.mem_total) if pc.is_auto else pc.nbytes
-        room = max(0, (b.memory.available or 0) - b.reserve - pagecache - static)
+        # the RAM the expert tier asks, when it is a size (ram experts=<size>, else the -er cap); with
+        # experts=all it is known at the end of the load only, and refit_row_caches shrinks the row
+        # caches then (they hold no rows yet)
+        tier_req = req if req is not None else cap
+        tier_ram = max(0, tier_req.nbytes - static) if b.tier_layers is not None and tier_req is not None and \
+            tier_req.is_bytes else 0
+        room = max(0, (b.memory.available or 0) - b.reserve - pagecache - static - tier_ram)
         b.ngram_held = ngram_fill(b.ngram_tables, room)
     else:
-        b.ngram_held = ngram_fill(b.ngram_tables, b.ngram_budget.nbytes)
-    b.ngram_bytes = sum(t.nbytes for t in b.ngram_held)
+        room = b.ngram_budget.nbytes
+        b.ngram_held = ngram_fill(b.ngram_tables, room)
+    whole = sum(t.nbytes for t in b.ngram_held)
+    b.ngram_caches = row_cache_split(b.ngram_tables, b.ngram_held, room - whole)
+    b.ngram_bytes = whole + sum(b.ngram_caches.values())
     if b.tier_layers is not None:
         # The expert tier: its settings, and every check that needs no VRAM figure (explicit
         # sizes, the tier's own refusals, the host check of what is known); the pools are sized
@@ -492,7 +532,58 @@ def plan_component(model, placement, memory: HostMemory | None = None) -> Compon
     plan = dict(getattr(ip, "ngram_ram_plan", None) or {})
     plan.update({t.key: t.key in held for t in b.ngram_tables})
     ip.ngram_ram_plan = plan
+    caches = dict(getattr(ip, "ngram_row_cache_plan", None) or {})
+    caches.update({t.module: b.ngram_caches.get(t.module, 0) for t in b.ngram_tables if t.module})
+    ip.ngram_row_cache_plan = caches
     return b
+
+
+def register_row_cache(config, module_key: str, cache):
+    """An n-gram module's row cache, for refit_row_caches (weakly held: an unloaded module's cache is
+    not kept alive by the config)"""
+    import weakref
+    ip = config.infer_params
+    reg = getattr(ip, "ngram_row_caches", None)
+    if reg is None:
+        reg = weakref.WeakValueDictionary()
+        ip.ngram_row_caches = reg
+    reg[module_key] = cache
+
+
+def refit_row_caches(b: ComponentBudget, config, room: int) -> bool:
+    """
+    The end of a load with ram ngram=auto next to an expert tier whose RAM is sized only then
+    (experts=all): the row caches were sized at the start of the load without the tier's RAM. `room`
+    is what the host has left for them once the tier, the static arenas, the whole tables, the slabs,
+    the reserve and the page cache kept free are counted: shrink them to it (never grow them) and
+    resize the modules' caches, which hold no rows yet. Updates the budget and the plan; returns
+    whether anything changed
+    """
+    if not b.ngram_budget.is_auto or not b.ngram_caches:
+        return False
+    fit = row_cache_split(b.ngram_tables, b.ngram_held, max(0, room))
+    new = {m: min(nb, fit.get(m, 0)) for m, nb in b.ngram_caches.items()}
+    new = {m: (nb if nb >= ROW_CACHE_MIN else 0) for m, nb in new.items()}
+    if new == b.ngram_caches:
+        return False
+    live = getattr(config.infer_params, "ngram_row_caches", None) or {}
+    for m, nb in new.items():
+        c = live.get(m)
+        if c is not None:
+            c.resize(nb)
+    b.ngram_caches = {m: nb for m, nb in new.items() if nb}
+    b.ngram_bytes = sum(t.nbytes for t in b.ngram_held) + sum(b.ngram_caches.values())
+    plan = dict(getattr(config.infer_params, "ngram_row_cache_plan", None) or {})
+    plan.update(new)
+    config.infer_params.ngram_row_cache_plan = plan
+    return True
+
+
+def ngram_row_cache_bytes(config, module_key: str) -> int:
+    """The row cache of a module whose tables (some of them) stream: the load's plan, else 0"""
+    ip = getattr(config, "infer_params", None)
+    plan = (getattr(ip, "ngram_row_cache_plan", None) or {}) if ip is not None else {}
+    return int(plan.get(module_key, 0))
 
 
 def ngram_in_ram(config, key: str, nbytes: int) -> bool:

@@ -3,15 +3,14 @@ CPU-only tests of the placement's storage rules and new layer words (exllamav3/m
 placement_storage.py; doc/placement.md, doc/expert_tiers.md): every worked example parses and
 prints its canonical form, which parses back equal, as do its dict and JSON forms and a file
 holding it; every documented parse-time refusal is the one raised; the older spellings keep their
-meaning; hot= maps onto the split machinery; and the words this build cannot run yet are refused
-after every other check, with their own message.
+meaning; hot= maps onto the split machinery; every word of the grammar parses (each one runs: its
+runtime has its own tests, e.g. tests/test_disk_source_.py, tests/test_moe_profile_.py and the GPU
+tests under tests/expert_tier).
 
     python tests/test_placement_tiers_.py
 
 placement.py is torch-free and loaded by path (it loads placement_storage.py and
-util/host_budget.py the same way). Words pending in placement_storage.PENDING are exercised with
-the gate lifted (patch.dict(PENDING, clear = True)), as the commit that makes them runnable will
-do for good.
+util/host_budget.py the same way).
 """
 import importlib.util
 import json
@@ -20,7 +19,6 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("_placement_tiers_subject", ROOT / "exllamav3/model/placement.py")
@@ -30,12 +28,7 @@ spec.loader.exec_module(P)
 PS = P.storage
 
 
-def lifted():
-    """Parse as if every pending word were runnable"""
-    return patch.dict(PS.PENDING, {}, clear = True)
-
-
-# (id, meaning, as written, canonical, runnable in this build)
+# (id, meaning, as written, canonical, runnable in this build: every one)
 EXAMPLES = [
     ("T1", "one GPU, every expert in VRAM", "*=cuda:0", "*=cuda:0", True),
     ("T2", "one GPU, experts of the last ten of 60 layers on the CPU worker",
@@ -61,15 +54,15 @@ EXAMPLES = [
      "0-2,39=cuda:1; 3-29=cuda:1 experts=cache hot=10% profile=code:3,wiki:1; "
      "30-38=cuda:1 experts=cache prefetch=layer:2+router; ram experts=64GiB",
      "0-2,39=cuda:1; 3-29=cuda:1 experts=cache hot=10% profile=code:3,wiki:1; "
-     "30-38=cuda:1 experts=cache prefetch=layer:2+router; ram experts=64GiB", False),
+     "30-38=cuda:1 experts=cache prefetch=layer:2+router; ram experts=64GiB", True),
     ("T10", "big-RAM host: inclusive RAM, whole n-gram tables",
      "*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive",
      "*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive", True),
     ("T11", "every policy knob",
      "*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; "
-     "ram experts=64GiB pagecache=16GiB policy=exclusive demote=heat evict=lru; disk io=direct",
+     "ram experts=64GiB pagecache=16GiB policy=lazy-exclusive demote=swap evict=lru; disk io=direct",
      "*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; "
-     "ram experts=64GiB pagecache=16GiB policy=exclusive demote=heat evict=lru; disk io=direct", False),
+     "ram experts=64GiB pagecache=16GiB policy=lazy-exclusive demote=swap evict=lru; disk io=direct", True),
     ("T12", "no D2H at all", "*=cuda:0 experts=cache; ram experts=48GiB demote=off",
      "*=cuda:0 experts=cache; ram experts=48GiB demote=off", True),
     ("T13", "CPU-computed layers on one GPU, cached layers on the other",
@@ -77,12 +70,12 @@ EXAMPLES = [
      "0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB", True),
     ("T14", "experts and engram tables read from other drives",
      '*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"',
-     '*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"', False),
+     '*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"', True),
     ("T15", "multi-line value with comments; written-out defaults vanish", """
      0-11  = cuda:0                                  # CMP: resident
      12-39 = cuda:1 experts=cache                    # PRO: cached
      cuda:1 cache=auto spare=8 evict=lru admit=adaptive
-     ram experts=52GiB pagecache=auto policy=lazy-exclusive demote=swap evict=lfu
+     ram experts=52GiB pagecache=auto policy=exclusive demote=heat evict=lfu
      disk experts=model ngram=model io=auto
      """, "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB", True),
     ("T16", "GPU streaming with a resident slice (-mcs k -mcm stream_only)",
@@ -108,7 +101,7 @@ EXAMPLES = [
      "*=cuda:0 experts=cpu; ram experts=all ngram=auto", True),
 ]
 
-# (as written, full message) for parse-time refusals, with the gate lifted
+# (as written, full message) for parse-time refusals
 PARSE_ERRORS = [
     ("rams experts=48GiB", "placement rule 1 'rams experts=48GiB': unknown rule 'rams' (did you mean 'ram'?) (a rule starts with layers (7, 0-11, 0-3,8-11), '*', 'embed', 'head', 'cuda:<n>', 'ram' or 'disk')"),
     ("*=cuda:0 experts=cache; cuda:0=75GiB", "placement rule 2 'cuda:0=75GiB': cuda:0 takes attributes, not '=<value>': write e.g. 'cuda:0 cache=75GiB'"),
@@ -126,7 +119,10 @@ PARSE_ERRORS = [
     ("*=cuda:0 experts=hybrid", "placement rule 1 '*=cuda:0 experts=hybrid': experts=hybrid needs hot=<routed experts per layer kept in VRAM> (the same as experts=cpu hot=<k>)"),
     ("*=cuda:0 experts=cpu cpu=96", "placement rule 1 '*=cuda:0 experts=cpu cpu=96': cpu= only applies to experts=split (write experts=cpu hot=<k> to keep k routed experts per layer in VRAM)"),
     ("*=cuda:0 experts=cache hot=100%", "placement rule 1 '*=cuda:0 experts=cache hot=100%': hot=100%: a share must lie between 0% and 100%, exclusive"),
-    ("*=cuda:0 experts=cpu prefetch=layer", "placement rule 1 '*=cuda:0 experts=cpu prefetch=layer': prefetch= applies to experts=cache and stream (experts=cpu computes on the CPU worker)"),
+    ("*=cuda:0 experts=cpu prefetch=layer", "placement rule 1 '*=cuda:0 experts=cpu prefetch=layer': prefetch= applies to experts=cache (experts=cpu computes on the CPU worker)"),
+    ("*=cuda:0 prefetch=layer", "placement rule 1 '*=cuda:0 prefetch=layer': prefetch= applies to experts=cache (experts=vram keeps every routed expert in VRAM)"),
+    ("*=cuda:0 experts=stream prefetch=router", "placement rule 1 '*=cuda:0 experts=stream prefetch=router': prefetch= applies to experts=cache (experts=stream holds every routed expert in RAM and streams each call's experts, with nothing to read ahead from the disk)"),
+    ("*=cuda:0 experts=stream profile=chat", "placement rule 1 '*=cuda:0 experts=stream profile=chat': profile= chooses which routed experts stay in VRAM, and experts=stream without hot= keeps none there; add hot=<k> (or use experts=cache)"),
     ("*=cuda:0 experts=cache prefetch=layer+layer:2", "placement rule 1 '*=cuda:0 experts=cache prefetch=layer+layer:2': prefetch lists layer twice"),
     ("*=cuda:0 experts=cache prefetch=next", "placement rule 1 '*=cuda:0 experts=cache prefetch=next': prefetch=next must be off, auto, or methods joined by '+' (layer[:<depth>], router[:<depth>])"),
     ("*=cuda:0 profile=code", "placement rule 1 '*=cuda:0 profile=code': profile= chooses hot or cached experts; experts=vram has none to choose"),
@@ -139,8 +135,8 @@ PARSE_ERRORS = [
     ("*=cuda:0 experts=cpu; ram experts=64GiB policy=exclusive", "placement: ram policy= governs the RAM tier of experts=cache layers, and there are none"),
     ("*=cuda:0 experts=cache; ram experts=0 policy=inclusive", "placement rule 2 'ram experts=0 policy=inclusive': policy= governs the RAM tier, which experts=0 disables"),
     ("*=cuda:0 experts=cache; ram experts=auto ngram=auto", "placement rule 2 'ram experts=auto ngram=auto': experts=auto and ngram=auto: at most one RAM budget can be auto"),
-    ("*=cuda:0 experts=cache; ram experts=48GiB policy=lazy", "placement rule 2 'ram experts=48GiB policy=lazy': policy=lazy must be one of lazy-exclusive, exclusive, inclusive"),
-    ("*=cuda:0 experts=cache; ram experts=48GiB demote=never", "placement rule 2 'ram experts=48GiB demote=never': demote=never must be one of swap, heat, all, off"),
+    ("*=cuda:0 experts=cache; ram experts=48GiB policy=lazy", "placement rule 2 'ram experts=48GiB policy=lazy': policy=lazy must be one of exclusive, lazy-exclusive, inclusive"),
+    ("*=cuda:0 experts=cache; ram experts=48GiB demote=never", "placement rule 2 'ram experts=48GiB demote=never': demote=never must be one of heat, swap, all, off"),
     ("*=cuda:0 experts=cache; ram experts=48GiB policy=inclusive demote=swap", "placement rule 2 'ram experts=48GiB policy=inclusive demote=swap': demote= has no effect with policy=inclusive (every VRAM-cached expert keeps its RAM copy, so a victim is simply dropped); remove it"),
     ("*=cuda:0 experts=cache; ram experts=auto pagecache=all", "placement rule 2 'ram experts=auto pagecache=all': pagecache=all: all is not allowed here (use auto or a size)"),
     ("*=cuda:0 experts=cpu; disk experts=/nvme1/v41", "placement: 'disk experts=/nvme1/v41' applies to experts=cache layers (stream and cpu layers keep every expert in RAM), and there are none"),
@@ -171,7 +167,7 @@ class ExampleTests(unittest.TestCase):
 
     def test_canonical_and_round_trips(self):
         for eid, _, text, canon, _ in EXAMPLES:
-            with self.subTest(eid), lifted():
+            with self.subTest(eid):
                 p = P.parse(text)
                 self.assertEqual(str(p), canon)
                 self.assertEqual(P.parse(str(p)), p)
@@ -183,40 +179,35 @@ class ExampleTests(unittest.TestCase):
     def test_runnable_in_this_build(self):
         for eid, _, text, canon, runnable in EXAMPLES:
             with self.subTest(eid):
-                if runnable:
-                    self.assertEqual(str(P.parse(text)), canon)
-                else:
-                    with self.assertRaisesRegex(ValueError, "is not available in this build yet"):
-                        P.parse(text)
+                self.assertTrue(runnable)
+                self.assertEqual(str(P.parse(text)), canon)
 
     def test_equal_however_written(self):
         same = [
-            "*=cuda:0 experts=cache; ram experts=48GiB policy=exclusive",
-            "*=CUDA:0 Experts=Cache\nRAM Experts=48gib Policy=Exclusive  # comment",
-            "*=cuda:0 experts=cache; ram experts=49152MiB policy=exclusive demote=swap evict=lfu pagecache=auto",
-            "*=cuda:0 experts=cache; cuda:0 spare=8; ram experts=48Gi policy=exclusive; disk io=auto",
-            '*=cuda:0 experts="cache"; ram experts=48 policy=exclusive; disk experts=model',
+            "*=cuda:0 experts=cache; ram experts=48GiB policy=lazy-exclusive",
+            "*=CUDA:0 Experts=Cache\nRAM Experts=48gib Policy=Lazy-Exclusive  # comment",
+            "*=cuda:0 experts=cache; ram experts=49152MiB policy=lazy-exclusive demote=heat evict=lfu pagecache=auto",
+            "*=cuda:0 experts=cache; cuda:0 spare=8; ram experts=48Gi policy=lazy-exclusive; disk io=auto",
+            '*=cuda:0 experts="cache"; ram experts=48 policy=lazy-exclusive; disk experts=model',
         ]
-        with lifted():
-            ps = [P.parse(s) for s in same]
+        ps = [P.parse(s) for s in same]
         for p in ps[1:]:
             self.assertEqual(p, ps[0])
             self.assertEqual(hash(p), hash(ps[0]))
-        self.assertEqual(str(ps[0]), "*=cuda:0 experts=cache; ram experts=48GiB policy=exclusive")
+        self.assertEqual(str(ps[0]), "*=cuda:0 experts=cache; ram experts=48GiB policy=lazy-exclusive")
         # default-only storage rules vanish: the placement equals the one without them
         self.assertEqual(P.parse("*=cuda:0 experts=cpu; ram pagecache=auto; disk experts=model"),
                          P.parse("*=cuda:0 experts=cpu"))
         self.assertIsNone(P.parse("*=cuda:0 experts=cpu; ram pagecache=auto").ram)
 
     def test_accessors(self):
-        with lifted():
-            p = P.parse("0-11=cuda:0; 12-39=cuda:1 experts=cache hot=8; cuda:1 spare=12 admit=heat; "
-                        "ram experts=96GiB demote=all")
+        p = P.parse("0-11=cuda:0; 12-39=cuda:1 experts=cache hot=8; cuda:1 spare=12 admit=heat; "
+                    "ram experts=96GiB demote=all")
         self.assertEqual(p.cache_devices(), ["cuda:1"])
         self.assertEqual((p.device_store("cuda:1").spare, p.device_store("cuda:1").admit), (12, "heat"))
         self.assertEqual((p.device_store("cuda:0").spare, p.device_store("cuda:0").cache), (8, PS.AUTO))
         self.assertEqual((str(p.ram_store().experts), p.ram_store().demote, p.ram_store().policy),
-                         ("96GiB", "all", "lazy-exclusive"))
+                         ("96GiB", "all", "exclusive"))
         self.assertEqual(p.disk_store(), PS.DiskStore())
         self.assertEqual(P.parse("*=cuda:0").ram_store(), PS.RamStore())
         self.assertEqual(p.experts_for_layer(20).hot, P.Hot(count = 8))
@@ -227,9 +218,8 @@ class ExampleTests(unittest.TestCase):
             path = os.path.join(d, "v41.placement")
             with open(path, "w") as f:
                 f.write(text)
-            with lifted():
-                self.assertEqual(str(P.parse("@" + path)), "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB")
-                self.assertEqual(str(P.parse(" @ " + path + " ")), "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB")
+            self.assertEqual(str(P.parse("@" + path)), "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB")
+            self.assertEqual(str(P.parse(" @ " + path + " ")), "0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB")
             # a file holding the JSON form, quotes and '#' inside values kept
             jpath = os.path.join(d, "p.json")
             src = {"rules": [{"layers": "*", "device": "cuda:0", "experts": "cpu"}],
@@ -237,13 +227,11 @@ class ExampleTests(unittest.TestCase):
             with open(jpath, "w") as f:
                 json.dump(src, f)
             self.assertEqual(str(P.parse("@" + jpath)), "*=cuda:0 experts=cpu; ram experts=all ngram=6GiB")
-            with lifted():
-                q = P.parse('*=cuda:0 experts=cache profile="a b;#\\"c"; disk experts="/x y/#z"')
+            q = P.parse('*=cuda:0 experts=cache profile="a b;#\\"c"; disk experts="/x y/#z"')
             self.assertEqual(q.experts_for_layer(0).profile, 'a b;#"c')
             self.assertEqual(q.disk.experts, "/x y/#z")
             self.assertEqual(str(q), '*=cuda:0 experts=cache profile="a b;#\\"c"; disk experts="/x y/#z"')
-            with lifted():
-                self.assertEqual(P.parse(str(q)), q)
+            self.assertEqual(P.parse(str(q)), q)
         with self.assertRaisesRegex(ValueError, r"^placement: cannot read '/nonexistent/x' \(No such file or directory\)$"):
             P.parse("@/nonexistent/x")
 
@@ -282,37 +270,43 @@ class RefusalTests(unittest.TestCase):
 
     def test_parse_time(self):
         for text, msg in PARSE_ERRORS:
-            with self.subTest(text), lifted():
+            with self.subTest(text):
                 with self.assertRaises(ValueError) as cm:
                     P.parse(text)
                 self.assertEqual(str(cm.exception), msg)
 
-    def test_pending_words(self):
-        cases = (
-            ("*=cuda:0 experts=cache; disk experts=/mnt/x", "disk experts=<dir>", "expert reads from a copy"),
-            ("*=cuda:0 experts=stream prefetch=layer", "prefetch=", "prefill read-ahead"),
-            ("*=cuda:0 experts=cpu profile=code", "profile=", "expert profiles"),
-            ("*=cuda:0; disk ngram=/mnt/x", "disk ngram=<dir>", "n-gram tables read from a copy"),
-            ("*=cuda:0; disk io=direct", "disk io=", "a forced read mode"),
-        )
-        for text, word, need in cases:
-            with self.subTest(text), self.assertRaises(ValueError) as cm:
-                P.parse(text)
-            msg = str(cm.exception)
-            self.assertTrue(msg.startswith(f"placement '{text}': "), msg)
-            self.assertIn(f": {word} is not available in this build yet; it needs {need}", msg)
-            self.assertTrue(msg.endswith("(see doc/expert_tiers.md)"), msg)
-        # experts=cache runs in this build
-        self.assertEqual(PS.pending_words(P.Placement((P.Rule("rest", (), "cuda:0", P.Experts("cache")),))), [])
-        # every other check comes first: a malformed pending word gets its own message
+    def test_every_word_parses(self):
+        """The words the grammar once accepted without running them: each parses into what its runtime
+        reads (the runtime of each has its own tests)"""
+        p = P.parse("*=cuda:0 experts=cache prefetch=layer:2+router:3 profile=code:3,wiki; "
+                    "disk experts=/mnt/x ngram=/mnt/y io=direct")
+        e = p.experts_for_layer(7)
+        self.assertEqual((e.prefetch, e.profile), ((("layer", 2), ("router", 3)), "code:3,wiki"))
+        self.assertEqual((p.disk.experts, p.disk.ngram, p.disk.io), ("/mnt/x", "/mnt/y", "direct"))
+        self.assertEqual(P.parse("*=cuda:0 experts=cache prefetch=off").experts_for_layer(0).prefetch, ())
+        self.assertIsNone(P.parse("*=cuda:0 experts=cache prefetch=auto").experts_for_layer(0).prefetch)
+        self.assertEqual(P.parse("*=cuda:0 experts=stream hot=8 profile=chat").experts_for_layer(0).profile, "chat")
+        self.assertEqual(P.parse("*=cuda:0 experts=split cpu=8 profile=chat").experts_for_layer(0).profile, "chat")
+        self.assertEqual(P.parse("*=cuda:0; disk ngram=/mnt/y io=buffered").disk.io, "buffered")
+        # malformed values get their own messages
+        with self.assertRaisesRegex(ValueError, "prefetch=next must be off, auto"):
+            P.parse("*=cuda:0 experts=cache prefetch=next")
         with self.assertRaisesRegex(ValueError, "spare=0 leaves no free slot"):
             P.parse("*=cuda:0 experts=cache; cuda:0 spare=0")
-        with self.assertRaisesRegex(ValueError, "prefetch=next must be off, auto"):
-            P.parse("*=cuda:0 experts=stream prefetch=next")
-        # the runnable storage words are not pending
-        for text in ("*=cuda:0; ram ngram=all; disk ngram=off", "*=cuda:0 experts=cpu; ram experts=64GiB",
-                     "*=cuda:0 experts=stream hot=10%; ram pagecache=12GiB ngram=auto"):
-            P.parse(text)
+        # what a word needs to run
+        with self.assertRaisesRegex(ValueError, r"prefetch= applies to experts=cache \(experts=stream holds every "
+                                                r"routed expert in RAM"):
+            P.parse("*=cuda:0 experts=stream prefetch=layer")
+        with self.assertRaisesRegex(ValueError, r"^placement: prefetch=layer:2 reads experts ahead from the disk, which "
+                                                r"'disk experts=off' never reads; remove it \(or write prefetch=off\)$"):
+            P.parse("*=cuda:0 experts=cache prefetch=layer:2; ram experts=all; disk experts=off")
+        P.parse("*=cuda:0 experts=cache prefetch=off; ram experts=all; disk experts=off")
+        with self.assertRaisesRegex(ValueError, r"profile= chooses which routed experts stay in VRAM, and "
+                                                r"experts=stream without hot= keeps none there"):
+            P.parse("*=cuda:0 experts=stream profile=chat")
+        with self.assertRaisesRegex(ValueError, r"experts=cpu without hot= keeps none there"):
+            P.parse("*=cuda:0 experts=cpu profile=chat")
+        self.assertFalse(hasattr(PS, "PENDING"))
 
     def test_branch_refusals_unchanged(self):
         # a sample of the branch's refusals (tests/test_placement_.py has them all), same texts
@@ -354,12 +348,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan("*=cuda:1 experts=cpu hot=1%", 16), ("ram", "hybrid", 0))           # rounds to none
         self.assertEqual(str(P.parse("*=cuda:0 experts=cpu hot=0")), "*=cuda:0 experts=cpu")
         self.assertEqual(str(P.parse("*=cuda:0 experts=cpu hot=12.50%")), "*=cuda:0 experts=cpu hot=12.5%")
-        with lifted():
-            self.assertEqual(plan("*=cuda:0 experts=cache hot=25%", 64), ("cache", "gpu", 16))
-            self.assertEqual(plan("*=cuda:0 experts=cache", 64), ("cache", "gpu", 0))
-            with self.assertRaisesRegex(ValueError, r"^placement: layer 3 experts=cache hot=64 keeps all 64 routed "
-                                                    r"experts in VRAM: use experts=vram$"):
-                plan("*=cuda:0 experts=cache hot=64", 64)
+        self.assertEqual(plan("*=cuda:0 experts=cache hot=25%", 64), ("cache", "gpu", 16))
+        self.assertEqual(plan("*=cuda:0 experts=cache", 64), ("cache", "gpu", 0))
+        with self.assertRaisesRegex(ValueError, r"^placement: layer 3 experts=cache hot=64 keeps all 64 routed "
+                                                r"experts in VRAM: use experts=vram$"):
+            plan("*=cuda:0 experts=cache hot=64", 64)
         with self.assertRaisesRegex(ValueError, "keeps all 16 routed experts in VRAM"):
             plan("*=cuda:0 experts=stream hot=99%", 16)
         # hot= keeps its kind: stream hot is GPU-computed, cpu hot CPU-computed

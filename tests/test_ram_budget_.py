@@ -57,6 +57,9 @@ class Checkpoint:
     def has_tensor(self, key):
         return key in self.tensor_file_map
 
+    def get_tensor_meta(self, key):
+        return {key: {"shape": self.file_headers["f"][key]["shape"]}}
+
     def get_tensor_size(self, key):
         b, e = self.file_headers["f"][key]["data_offsets"]
         return e - b
@@ -95,16 +98,26 @@ class MoE:
 
 
 class NGram:
-    def __init__(self, key, nbytes):
-        self.key, self._n, self.modules = key, nbytes, []
+    def __init__(self, key, nbytes, row_bytes = 82):
+        self.key, self._n, self._rb, self.modules = key, nbytes, row_bytes, []
 
     def table_nbytes(self):
         return self._n
 
+    def ngram_tables(self):
+        return [("", self._n, self._rb, False)]
+
 
 class DSV41Engram:
+    """DeepSeek-V4.1-Flash's engram layer as the budget sees it: 384,006,168 rows of 256 fp8 bytes and
+    8 e8m0 scale bytes"""
+    ROWS = 384_006_168
+
     def __init__(self, key):
         self.key, self.modules = key, []
+
+    def ngram_tables(self):
+        return [("embed.weight", self.ROWS * 256, 256, True), ("embed.scale", self.ROWS * 8, 8, True)]
 
 
 def ip(**kw):
@@ -297,7 +310,18 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(sorted(t.key for t in b.ngram_held), held)
                 self.assertEqual(mdl.config.infer_params.ngram_ram_plan,
                                  {"other.ngram": True, **{t.key: t.key in held for t in tables}})
-                self.assertEqual(b.ngram_bytes, sum(t._n for t in tables if t.key in held))
+                # what the whole tables leave (at least 64 MiB) goes to row caches of the streamed ones
+                whole = sum(t._n for t in tables if t.key in held)
+                left = (budget.nbytes - whole) if budget is not None and budget.is_bytes else 0
+                streamed = [t.key for t in tables if t.key not in held]
+                caches = {k: left // len(streamed) for k in streamed} if streamed and left // len(streamed) >= 64 << 20 else {}
+                self.assertEqual(b.ngram_caches, caches)
+                self.assertEqual(b.ngram_bytes, whole + sum(caches.values()))
+                self.assertEqual(mdl.config.infer_params.ngram_row_cache_plan, {t.key: caches.get(t.key, 0) for t in tables})
+        # 9 GiB: b and c whole, 1 GiB of rows of a cached
+        b = self.plan(model(tables, stc, ngram_ram = RB.as_ngram_ram("9GiB")))
+        self.assertEqual((b.ngram_caches, b.ngram_bytes), ({"a.ngram": 1 * GiB}, 9 * GiB))
+        self.assertIn("n-gram tables 9.0 GiB in RAM (2 of 3 whole, 8.0 GiB; row caches 1.0 GiB for 1 modules)", b.summary())
         with self.assertRaises(RuntimeError) as cm:
             self.plan(model(tables, stc, ngram_ram = RB.ALL), avail = 16)
         self.assertEqual(str(cm.exception),
@@ -308,12 +332,32 @@ class PlanTests(unittest.TestCase):
         b = self.plan(model(tables, stc, component = "mtp", ngram_ram = RB.ALL))
         self.assertEqual(b.ngram_held, [])
 
-    def test_engram_note(self):
+    def test_engram_tables(self):
+        """DeepSeek-V4.1's engram tables take part like any other: smallest first (the scales), the rest
+        of the budget a row cache of each layer's streamed tables; the default streams every row"""
         stc = Checkpoint()
-        b = self.plan(model([DSV41Engram("model.layers.1.engram")], stc, ngram_ram = RB.as_ngram_ram("6GiB")))
+        e1, e14 = DSV41Engram("model.layers.1.engram"), DSV41Engram("model.layers.14.engram")
+        scale = DSV41Engram.ROWS * 8
+        b = self.plan(model([e1, e14], stc, ngram_ram = RB.as_ngram_ram("16GiB")))
+        self.assertEqual(sorted(t.key for t in b.ngram_held), ["model.layers.1.engram.embed.scale",
+                                                               "model.layers.14.engram.embed.scale"])
+        per = (16 * GiB - 2 * scale) // 2
+        self.assertEqual(b.ngram_caches, {"model.layers.1.engram": per, "model.layers.14.engram": per})
+        self.assertEqual(b.ngram_bytes, 2 * scale + 2 * per)
         self.assertTrue(b.worth_reporting())
-        self.assertIn("engram tables stream from disk (ngram=6GiB holds no DeepSeek-V4.1 engram table)", b.summary())
-        self.assertFalse(self.plan(model([DSV41Engram("x")], stc)).worth_reporting())
+        # a budget below the scales: one scale table whole, a cache for the rest
+        b = self.plan(model([e1, e14], stc, ngram_ram = RB.as_ngram_ram("4GiB")))
+        self.assertEqual([t.key for t in b.ngram_held], ["model.layers.1.engram.embed.scale"])
+        self.assertEqual(sorted(b.ngram_caches), ["model.layers.1.engram", "model.layers.14.engram"])
+        # a weight table whole when it fits (with its scales)
+        b = self.plan(model([e1], stc, ngram_ram = RB.as_ngram_ram("100GiB")), avail = 150)
+        self.assertEqual(sorted(t.key for t in b.ngram_held), ["model.layers.1.engram.embed.scale",
+                                                               "model.layers.1.engram.embed.weight"])
+        self.assertEqual(b.ngram_caches, {})
+        # the default: every row from disk
+        b = self.plan(model([e1, e14], stc))
+        self.assertEqual((b.ngram_held, b.ngram_caches, b.ngram_bytes), ([], {}, 0))
+        self.assertFalse(b.worth_reporting())
 
     def test_nothing_to_report(self):
         stc, moes = v41([0], num_experts = 2)
@@ -388,13 +432,14 @@ class PlacementRequestTests(unittest.TestCase):
         b = self.plan(model(tables, stc), "*=cuda:0; ram ngram=auto", avail = 29.9)
         self.assertEqual(sorted(t.key for t in b.ngram_held), ["b.ngram"])
 
-    def test_engram_never_off_the_disk(self):
+    def test_engram_off_the_disk_when_whole(self):
+        """disk ngram=off needs ngram=all: every table whole, the engram's too (the host check decides)"""
         mdl = model([DSV41Engram("model.layers.1.engram")], Checkpoint())
-        with self.assertRaises(ValueError) as cm:
-            self.plan(mdl, "*=cuda:0; ram ngram=all; disk ngram=off")
-        self.assertEqual(str(cm.exception), "placement: 'disk ngram=off' would never read n-gram rows from disk, but the "
-                                            "DeepSeek-V4.1 engram tables of model.layers.1.engram are always read from "
-                                            "disk; remove disk ngram=off")
+        b = self.plan(mdl, "*=cuda:0; ram ngram=all; disk ngram=off", avail = 120)
+        self.assertEqual(len(b.ngram_held), 2)
+        with self.assertRaisesRegex(RuntimeError, r"^placement: ngram=94\.4 GiB needs 94\.4 GiB of host memory, but "
+                                                  r"90\.0 GiB is available"):
+            self.plan(mdl, "*=cuda:0; ram ngram=all; disk ngram=off", avail = 90)
 
 
 class TierStageOneTests(unittest.TestCase):
@@ -404,8 +449,7 @@ class TierStageOneTests(unittest.TestCase):
     P = PlacementRequestTests.P
 
     def parse(self, text):
-        with patch.dict(self.P.storage.PENDING, {}, clear = True):
-            return self.P.parse(text)
+        return self.P.parse(text)
 
     def cached(self, n = 4, hot = 0):
         stc, moes = v41(range(n))
@@ -443,6 +487,53 @@ class TierStageOneTests(unittest.TestCase):
             with patch.dict(os.environ, {"EXL3_MOE_TIER_STAGING": "tripple"}), \
                     self.assertRaisesRegex(ValueError, "EXL3_MOE_TIER_STAGING='tripple' must be double or single"):
                 RB.plan_component(model(moes, stc), placement, memory = memory(150))
+
+    def test_ngram_auto_next_to_a_tier(self):
+        """ram ngram=auto next to experts=cache layers: a tier of a known size keeps it at stage 1; with
+        experts=all the row caches are refitted at the end of the load, never grown; only what a load has
+        made resident counts as held"""
+        stc, moes = self.cached()
+        eng = DSV41Engram("model.layers.1.engram")
+        scale = DSV41Engram.ROWS * 8
+
+        class Cache:
+            def __init__(self):
+                self.sizes = []
+
+            def resize(self, nbytes):
+                self.sizes.append(nbytes)
+
+        with patch.object(RB._expert_tier_config(), "sys", NS(platform = "linux")), \
+                patch.dict(os.environ, {"EXL3_HOST_MEM_RESERVE_MB": "2048"}):
+            # 100 GiB available - 2 GiB reserve - 20 GiB page cache (MemTotal / 8) - the tier's 30 GiB: the scale
+            # table whole, the rest a cache of the fp8 rows (before: 78 GiB, and the stage-1 check refused)
+            mdl = model(moes + [eng], stc)
+            b = RB.plan_component(mdl, self.parse("*=cuda:0 experts=cache; ram experts=30GiB ngram=auto"),
+                                  memory = memory(100))
+            self.assertEqual([t.key for t in b.ngram_held], [eng.key + ".embed.scale"])
+            self.assertEqual(b.ngram_caches, {eng.key: 48 * GiB - scale})
+            self.assertEqual(b.ngram_bytes, 48 * GiB)
+            self.assertEqual(b.ngram_resident_bytes(), scale + (48 * GiB - scale) // 264 * 8)
+            self.assertFalse(RB.refit_row_caches(b, mdl.config, 48 * GiB - scale))   # the same room: unchanged
+            # experts=all: the tier's RAM is known at the end of the load only
+            mdl = model(moes + [eng], stc)
+            b = RB.plan_component(mdl, self.parse("*=cuda:0 experts=cache; ram experts=all ngram=auto"),
+                                  memory = memory(100))
+            self.assertEqual(b.ngram_caches, {eng.key: 78 * GiB - scale})
+            c = Cache()
+            RB.register_row_cache(mdl.config, eng.key, c)
+            self.assertTrue(RB.refit_row_caches(b, mdl.config, 20 * GiB))
+            self.assertEqual((c.sizes, b.ngram_caches, b.ngram_bytes), ([20 * GiB], {eng.key: 20 * GiB}, scale + 20 * GiB))
+            self.assertEqual(mdl.config.infer_params.ngram_row_cache_plan[eng.key], 20 * GiB)
+            self.assertFalse(RB.refit_row_caches(b, mdl.config, 30 * GiB))       # never grown
+            self.assertTrue(RB.refit_row_caches(b, mdl.config, 32 << 20))        # below 64 MiB: no cache
+            self.assertEqual((c.sizes[-1], b.ngram_caches, b.ngram_bytes), (0, {}, scale))
+            self.assertEqual(b.ngram_resident_bytes(), scale)
+            # an explicit budget is never refitted
+            mdl = model(moes + [eng], stc)
+            b = RB.plan_component(mdl, self.parse("*=cuda:0 experts=cache; ram experts=all ngram=40GiB"),
+                                  memory = memory(100))
+            self.assertFalse(RB.refit_row_caches(b, mdl.config, 1 * GiB))
 
 
 class NgramDecisionTests(unittest.TestCase):
@@ -608,6 +699,7 @@ class EngineTests(unittest.TestCase):
         stc2.add("q.ngram.weight", (500, 160), 2)
         m.key, m.config = "q.ngram", NS(stc = stc2)
         self.assertEqual(m.table_nbytes(), 500 * 160 * 2)
+        self.assertEqual(m.ngram_tables(), [("", 500 * 160 * 2, 160 * 2, False)])
         self.assertTrue(RB.is_ngram(m))
 
     def test_load_gen_plans_before_loading(self):

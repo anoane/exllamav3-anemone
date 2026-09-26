@@ -276,6 +276,7 @@ TierHost::TierHost(const PolicyConfig& pc, int64_t layers, int64_t experts, int 
         throw;
     }
     ram_io_.resize((size_t) core.ram.R);
+    presub_ram_.assign((size_t) core.ram.R, -1);
     slab_io_.resize((size_t) hcfg.slab_slots);
     slab_state_.resize((size_t) hcfg.slab_slots);
     for (int32_t i = hcfg.slab_slots - 1; i >= 0; --i) slab_free_.push_back(i);
@@ -363,6 +364,7 @@ void TierHost::read_into(int32_t key, uint8_t* slot, int cls, int64_t deadline, 
     exl3_disk::Options o;
     o.cls = cls;
     o.deadline_ns = deadline;
+    o.direct = hcfg.io_direct;
     *ticket = 0;
     try
     {
@@ -459,7 +461,7 @@ void TierHost::promote_from_ram(int32_t r, uint64_t dst, uint64_t after, bool st
     else
         for (int p = 0; p < geo.projections; ++p)
             tok = copier_->h2d(dst + (uint64_t) geo.proj_off[p], s + ram_slot_offset(r, p), geo.proj_bytes[p], after);
-    io.read_tok = tok;
+    io.read_tok = later(io.read_tok, tok);
     if (staging) ++stats.staged;
     else ++stats.h2d;
 }
@@ -467,26 +469,70 @@ void TierHost::promote_from_ram(int32_t r, uint64_t dst, uint64_t after, bool st
 int32_t TierHost::slab_of(int32_t key) const
 {
     for (size_t i = 0; i < slab_state_.size(); ++i)
-        if (slab_state_[i].key == key) return (int32_t) i;
+        if (slab_state_[i].kind != kSlabFree && slab_state_[i].key == key) return (int32_t) i;
     return -1;
 }
 
-int32_t TierHost::slab_take()
+// A slot for a new read. In order: a free one; the oldest COPIED one whose copy has landed; the
+// read-ahead farthest ahead (beyond `lc`, the layer the read is for; counted as dropped); with
+// may_wait, the oldest COPIED one once its copy lands (counted as a wait). -1 when none: every slot
+// holds a demand read not yet copied, or read-ahead of nearer layers
+int32_t TierHost::slab_take(bool may_wait, int32_t lc)
 {
     if (slab_free_.empty())
     {
-        // every slot holds a prefetch: a demand read goes first, the prefetch farthest ahead yields
         int32_t best = -1;
         for (size_t i = 0; i < slab_state_.size(); ++i)
-            if (slab_state_[i].prefetch && (best < 0 || slab_state_[i].lc > slab_state_[(size_t) best].lc)) best = (int32_t) i;
-        if (best < 0) fail("the disk slab has no free slot");
-        ++stats.slab_waits;
-        ++stats.prefetch_dropped;
+            if (slab_state_[i].kind == kSlabCopied && !slab_state_[i].pinned && copier_->done(slab_io_[i].read_tok) &&
+                (best < 0 || slab_state_[i].age < slab_state_[(size_t) best].age)) best = (int32_t) i;
+        if (best < 0)
+        {
+            for (size_t i = 0; i < slab_state_.size(); ++i)
+                if (slab_state_[i].kind == kSlabPrefetch && !slab_state_[i].pinned && slab_state_[i].lc > lc &&
+                    (best < 0 || slab_state_[i].lc > slab_state_[(size_t) best].lc)) best = (int32_t) i;
+            if (best >= 0) ++stats.prefetch_dropped;
+        }
+        if (best < 0 && may_wait)
+        {
+            for (size_t i = 0; i < slab_state_.size(); ++i)
+                if (slab_state_[i].kind == kSlabCopied && !slab_state_[i].pinned &&
+                    (best < 0 || slab_state_[i].age < slab_state_[(size_t) best].age)) best = (int32_t) i;
+            if (best >= 0) ++stats.slab_waits;
+        }
+        if (best < 0 && may_wait)
+        {
+            // every slot holds an expert a later action of this record needs (a record may need
+            // more slab reads than the slab has slots): take one of those, copied first, read ahead
+            // next, a read in flight last; its action reads its expert again
+            const int pref[3] = { kSlabCopied, kSlabPrefetch, kSlabDemand };
+            for (int k = 0; k < 3 && best < 0; ++k)
+                for (size_t i = 0; i < slab_state_.size() && best < 0; ++i)
+                    if (slab_state_[i].kind == pref[k]) best = (int32_t) i;
+            if (best >= 0) ++stats.slab_waits;
+        }
+        if (best < 0) return -1;
         slab_release(best);
     }
     int32_t i = slab_free_.back();
     slab_free_.pop_back();
     return i;
+}
+
+// Submit the read of `key` into a slab slot of `kind` (demand or read-ahead of layer lc); false when
+// no slot could be taken
+bool TierHost::slab_submit(int32_t key, int cls, int64_t deadline, int kind, int32_t lc, bool may_wait)
+{
+    int32_t i = slab_take(may_wait, kind == kSlabPrefetch ? lc : -1);
+    if (i < 0) return false;
+    exl3_disk::TicketId t = 0;
+    read_into(key, slab_->slot(i), cls, deadline, &t);
+    slab_io_[(size_t) i].ticket = t;
+    slab_io_[(size_t) i].ticket_key = key;
+    Slab& sl = slab_state_[(size_t) i];
+    sl.key = key;
+    sl.kind = kind;
+    sl.lc = lc;
+    return true;
 }
 
 void TierHost::slab_release(int32_t i)
@@ -499,27 +545,35 @@ void TierHost::slab_release(int32_t i)
     slab_free_.push_back(i);
 }
 
-// An SSD read that bypasses the RAM tier (a prefetched slab slot when there is one), then its copy
+// An SSD read that bypasses the RAM tier, then its copy. The read may be in the slab already: a
+// read-ahead, a read presubmit() started, or an earlier read whose slot was not reused yet. The slot
+// stays COPIED (its bytes valid) until slab_take() reclaims it
 void TierHost::stage_from_ssd(int32_t key, uint64_t dst, uint64_t after, bool staging, int cls)
 {
     int32_t i = slab_of(key);
     if (i >= 0)
     {
-        ++stats.prefetch_used;
+        const int kind = slab_state_[(size_t) i].kind;
+        if (kind == kSlabPrefetch) ++stats.prefetch_used;
+        else if (kind == kSlabCopied) ++stats.slab_reused;
         if (slab_io_[(size_t) i].ticket) eng_->promote(slab_io_[(size_t) i].ticket, exl3_disk::kExpert);
     }
     else
     {
-        i = slab_take();
-        exl3_disk::TicketId t = 0;
-        read_into(key, slab_->slot(i), cls, 0, &t);
-        slab_io_[(size_t) i].ticket = t;
-        slab_io_[(size_t) i].ticket_key = key;
-        slab_state_[(size_t) i].key = key;
+        if (!slab_submit(key, cls, 0, kSlabDemand, -1, true))
+        {
+            std::string held;
+            for (const Slab& sl : slab_state_)
+                held += (held.empty() ? "" : ", ") + std::to_string(sl.key) + (sl.kind == kSlabPrefetch ? " (read-ahead)" : "");
+            fail("the disk slab has no free slot for " + where(key) + ": its " + std::to_string(slab_state_.size()) +
+                 " slots hold reads not copied yet (keys " + held + ")");
+        }
+        i = slab_of(key);
     }
     SlotIo& io = slab_io_[(size_t) i];
     finish_read(key, slab_->slot(i), io.ticket);
     io.ticket = 0;
+    throw_if_failed();
     const ExpertExtent& x = ext_[(size_t) key];
     const uint8_t* s = slab_->slot(i);
     uint64_t tok = 0;
@@ -529,10 +583,93 @@ void TierHost::stage_from_ssd(int32_t key, uint64_t dst, uint64_t after, bool st
         tok = copier_->h2d(dst + (uint64_t) geo.proj_off[p], s + x.base[tp] + x.payload[tp] + x.trel[p],
                            geo.proj_bytes[p], after);
     }
-    io.read_tok = tok;
+    io.read_tok = later(io.read_tok, tok);
+    Slab& sl = slab_state_[(size_t) i];
+    sl.kind = kSlabCopied;
+    sl.lc = -1;
+    sl.age = ++slab_age_;
+    sl.pinned = false;
     if (staging) ++stats.staged;
     else ++stats.h2d;
-    slab_release(i);
+}
+
+// The token of a slot's readers after another copy reads it: a token of one Copier stands for every
+// copy up to it (done(), wait() and the fetch kernel's dependencies all take it so, the copies of one
+// stream complete in order), so the later token covers the earlier one; across two Copiers (the fetch
+// kernel's plan and the copy engines of a layer-mode prefill) the earlier one is waited for first
+uint64_t TierHost::later(uint64_t a, uint64_t b)
+{
+    if (!a || !b) return a ? a : b;
+    if (copier_->same_order(a, b)) return b;
+    copier_->wait(a);
+    return b;
+}
+
+// The SSD reads of a record's actions, submitted together before any of its copies is issued, so
+// their latencies overlap instead of adding up. A read into a RAM slot starts early only when no
+// earlier action of the record copies from or into that slot (its old bytes must be read or written
+// first); a read into the slab only while a slot is free (or reclaimable without waiting)
+void TierHost::presubmit(const std::vector<Action>& acts)
+{
+    bool any = false;
+    for (const Action& a : acts)
+        if (a.op == kActSsd || a.op == kActStageSsd)
+        {
+            any = true;
+            // what the slab holds already (read ahead, or an earlier read) stays until its action
+            int32_t i = slab_of(a.a);
+            if (i >= 0) slab_state_[(size_t) i].pinned = true;
+        }
+    if (!any) return;
+    std::vector<int32_t> copied;               // RAM slots an earlier action copies from or into
+    auto was_copied = [&](int32_t r) { return std::find(copied.begin(), copied.end(), r) != copied.end(); };
+    for (const Action& a : acts)
+    {
+        switch (a.op)
+        {
+            case kActH2D:
+            case kActRefill:
+            case kActStageRam:
+                copied.push_back(a.b);
+                break;
+            case kActD2H:
+                copied.push_back(a.c);
+                break;
+            case kActSsd:
+                if (a.b >= 0)
+                {
+                    if (!was_copied(a.b) && presub_ram_[(size_t) a.b] < 0 && slab_of(a.a) < 0)
+                    {
+                        ram_ready_for_write(a.b);
+                        SlotIo& io = ram_io_[(size_t) a.b];
+                        exl3_disk::TicketId t = 0;
+                        read_into(a.a, arena_->slot(a.b), exl3_disk::kExpert, 0, &t);
+                        io.layout = 1;
+                        io.layout_key = a.a;
+                        io.ticket = t;
+                        io.ticket_key = a.a;
+                        presub_ram_[(size_t) a.b] = a.a;
+                        ++stats.presubmitted;
+                    }
+                    copied.push_back(a.b);
+                }
+                else if (slab_of(a.a) < 0 && slab_submit(a.a, exl3_disk::kExpert, 0, kSlabDemand, -1, false))
+                {
+                    slab_state_[(size_t) slab_of(a.a)].pinned = true;
+                    ++stats.presubmitted;
+                }
+                break;
+            case kActStageSsd:
+                if (slab_of(a.a) < 0 && slab_submit(a.a, exl3_disk::kExpert, 0, kSlabDemand, -1, false))
+                {
+                    slab_state_[(size_t) slab_of(a.a)].pinned = true;
+                    ++stats.presubmitted;
+                }
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 void TierHost::run_action(const Action& a, const Record* rec, uint64_t* entry_after)
@@ -558,7 +695,10 @@ void TierHost::run_action(const Action& a, const Record* rec, uint64_t* entry_af
         case kActDupReclaim:
         case kActRamOverwrite:
         {
-            // the slot's bytes are no longer anyone's; the next write into it waits for its readers
+            // the slot's bytes are no longer anyone's; the next write into it waits for its readers.
+            // A read presubmit() started into it already belongs to its next expert (the action that
+            // takes the slot comes later in this record): its layout stays
+            if (presub_ram_[(size_t) a.b] >= 0) break;
             SlotIo& io = ram_io_[(size_t) a.b];
             io.layout = 0;
             io.layout_key = -1;
@@ -571,16 +711,36 @@ void TierHost::run_action(const Action& a, const Record* rec, uint64_t* entry_af
         case kActSsd:
         {
             uint64_t dst = dst_addr(a.c, a.d, 0);
-            if (a.b >= 0)
+            if (a.b >= 0 && presub_ram_[(size_t) a.b] != a.a && slab_of(a.a) >= 0)
             {
+                // the slab has it (read ahead, or an earlier read not reclaimed yet): the copy comes
+                // from there now, and the RAM slot the policy gave it is filled by a background read
+                stage_from_ssd(a.a, dst, *entry_after, false, exl3_disk::kExpert);
                 ram_ready_for_write(a.b);
                 SlotIo& io = ram_io_[(size_t) a.b];
                 exl3_disk::TicketId t = 0;
-                read_into(a.a, arena_->slot(a.b), exl3_disk::kExpert, 0, &t);
+                read_into(a.a, arena_->slot(a.b), exl3_disk::kRefill, 0, &t);
                 io.layout = 1;
                 io.layout_key = a.a;
                 io.ticket = t;
                 io.ticket_key = a.a;
+                if (t) refills_.push_back({ a.b, t });
+                ++stats.slab_to_vram;
+            }
+            else if (a.b >= 0)
+            {
+                if (presub_ram_[(size_t) a.b] == a.a) presub_ram_[(size_t) a.b] = -1;      // read started already
+                else
+                {
+                    ram_ready_for_write(a.b);
+                    SlotIo& io = ram_io_[(size_t) a.b];
+                    exl3_disk::TicketId t = 0;
+                    read_into(a.a, arena_->slot(a.b), exl3_disk::kExpert, 0, &t);
+                    io.layout = 1;
+                    io.layout_key = a.a;
+                    io.ticket = t;
+                    io.ticket_key = a.a;
+                }
                 promote_from_ram(a.b, dst, *entry_after, false);
             }
             else stage_from_ssd(a.a, dst, *entry_after, false, exl3_disk::kExpert);
@@ -649,6 +809,7 @@ void TierHost::run_action(const Action& a, const Record* rec, uint64_t* entry_af
 void TierHost::execute(const Record* rec, std::vector<Action>& acts)
 {
     last_ = acts;
+    presubmit(acts);
     // An in-place admission (spare=0) writes its victim's slot: the victim's demotion (if any) must
     // read it first, so it runs ahead of the other actions of its entry
     std::vector<uint8_t> done(acts.size(), 0);
@@ -673,6 +834,8 @@ void TierHost::execute(const Record* rec, std::vector<Action>& acts)
         run_action(a, rec, &entry_after);
         done[i] = 1;
     }
+    for (int32_t k : presub_ram_)
+        if (k >= 0) fail("a presubmitted read of " + where(k) + " was not consumed by its action");
 }
 
 Record TierHost::call(int32_t lc, const int32_t* ids, int64_t n, int mode)
@@ -744,13 +907,59 @@ void TierHost::layer_call(int32_t lc, const int32_t* ids, int64_t n, int half)
     cur_half_ = 0;
     // prefetches of this layer that were not needed (the expert reached RAM or VRAM meanwhile)
     for (size_t i = 0; i < slab_state_.size(); ++i)
-        if (slab_state_[i].prefetch && slab_state_[i].lc == lc)
+        if (slab_state_[i].kind == kSlabPrefetch && slab_state_[i].lc == lc)
         {
             ++stats.prefetch_dropped;
             slab_release((int32_t) i);
         }
     if (hcfg.deterministic) drain();
     else poll();
+    throw_if_failed();
+}
+
+void TierHost::read_ahead(const Record& rec)
+{
+    throw_if_failed();
+    if (slab_state_.empty()) return;
+    const int64_t deadline = mono_ns() + 1000000;
+    for (const Entry& x : rec.entries)
+    {
+        const int32_t k = x.key;
+        if (k < 0 || k >= core.K) fail("a prediction of key " + std::to_string(k) + " out of range");
+        if (core.vram.slot_of[(size_t) k] >= 0 || core.ram.of[(size_t) k] >= 0 || slab_of(k) >= 0) continue;
+        if (slab_submit(k, exl3_disk::kPrefetch, deadline, kSlabPrefetch, rec.lc, false)) ++stats.predicted_reads;
+        else ++stats.prefetch_starved;
+    }
+}
+
+void TierHost::stage_layer(int32_t lc, int half, std::vector<int32_t>* keys)
+{
+    throw_if_failed();
+    if (half < 0 || half > 1) fail("staging half " + std::to_string(half));
+    std::vector<Action> acts;
+    poll();
+    core.layer_plan(lc, acts);
+    promote_layer(lc);                          // its read-ahead still queued is needed now
+    cur_half_ = half;
+    try
+    {
+        execute(nullptr, acts);
+    }
+    catch (...)
+    {
+        cur_half_ = 0;
+        throw;
+    }
+    cur_half_ = 0;
+    if (keys)
+        for (const Action& a : acts) keys->push_back(a.a);
+    // read-ahead of this layer that was not needed (the expert reached RAM or VRAM meanwhile)
+    for (size_t i = 0; i < slab_state_.size(); ++i)
+        if (slab_state_[i].kind == kSlabPrefetch && slab_state_[i].lc == lc)
+        {
+            ++stats.prefetch_dropped;
+            slab_release((int32_t) i);
+        }
     throw_if_failed();
 }
 
@@ -761,21 +970,24 @@ void TierHost::prefetch_layer(int32_t lc, int64_t deadline_ns)
     for (int64_t e = 0; e < core.E; ++e)
     {
         int32_t k = (int32_t) (lc * core.E + e);
-        if (core.vram.slot_of[(size_t) k] >= 0 || core.ram.of[(size_t) k] >= 0 || slab_of(k) >= 0) continue;
-        if (slab_free_.empty())
+        if (core.vram.slot_of[(size_t) k] >= 0 || core.ram.of[(size_t) k] >= 0) continue;
+        int32_t have = slab_of(k);
+        if (have >= 0)
+        {
+            // already there (an earlier read of it, not reclaimed yet): keep it for this layer
+            Slab& sl = slab_state_[(size_t) have];
+            if (sl.kind == kSlabCopied)
+            {
+                sl.kind = kSlabPrefetch;
+                sl.lc = lc;
+            }
+            continue;
+        }
+        if (!slab_submit(k, exl3_disk::kPrefetch, deadline_ns, kSlabPrefetch, lc, false))
         {
             ++stats.prefetch_starved;
             continue;
         }
-        int32_t i = slab_free_.back();
-        slab_free_.pop_back();
-        exl3_disk::TicketId t = 0;
-        read_into(k, slab_->slot(i), exl3_disk::kPrefetch, deadline_ns, &t);
-        slab_io_[(size_t) i].ticket = t;
-        slab_io_[(size_t) i].ticket_key = k;
-        slab_state_[(size_t) i].key = k;
-        slab_state_[(size_t) i].prefetch = true;
-        slab_state_[(size_t) i].lc = lc;
         ++stats.prefetch_issued;
     }
 }
@@ -783,7 +995,7 @@ void TierHost::prefetch_layer(int32_t lc, int64_t deadline_ns)
 void TierHost::promote_layer(int32_t lc)
 {
     for (size_t i = 0; i < slab_state_.size(); ++i)
-        if (slab_state_[i].prefetch && slab_state_[i].lc == lc && slab_io_[i].ticket)
+        if (slab_state_[i].kind == kSlabPrefetch && slab_state_[i].lc == lc && slab_io_[i].ticket)
             eng_->promote(slab_io_[i].ticket, exl3_disk::kExpert);
 }
 
@@ -940,20 +1152,36 @@ void TierHost::cold_fill(const std::vector<int32_t>& order, const std::vector<in
         compact_ram(slots);
     }
     for (size_t c = 0; c < arena_->base.size(); ++c) copier_->chunk_filled(arena_->base[c], arena_->bytes[c]);
-    // the hot pins, through the slab
+    // the hot pins, then the pool: from the RAM copy when RAM holds one (inclusive), else read through
+    // the slab, as many reads in flight as it has slots
+    std::vector<std::pair<int32_t, uint64_t>> via_ssd;
     for (size_t i = 0; i < pins.size(); ++i)
     {
-        stage_from_ssd(pins[i], copier_->pool_addr(core.vram.S + (int32_t) i), 0, false, exl3_disk::kPrefetch);
+        via_ssd.push_back({ pins[i], copier_->pool_addr(core.vram.S + (int32_t) i) });
         ++stats.cold_vram;
     }
-    // the pool: from the RAM copy when RAM holds one (inclusive), else through the slab
     for (int32_t k : vk)
     {
         int32_t s = core.vram.slot_of[(size_t) k];
         int32_t r = core.ram.of[(size_t) k];
         if (r >= 0) promote_from_ram(r, copier_->pool_addr(s), 0, false);
-        else stage_from_ssd(k, copier_->pool_addr(s), 0, false, exl3_disk::kPrefetch);
+        else via_ssd.push_back({ k, copier_->pool_addr(s) });
         ++stats.cold_vram;
+    }
+    std::deque<size_t> reading;
+    size_t next = 0;
+    while (next < via_ssd.size() || !reading.empty())
+    {
+        if (next < via_ssd.size() &&
+            slab_submit(via_ssd[next].first, exl3_disk::kPrefetch, 0, kSlabDemand, -1, reading.empty()))
+        {
+            reading.push_back(next++);
+            continue;
+        }
+        if (reading.empty()) fail("the disk slab has no slot for the cold fill");
+        const auto& x = via_ssd[reading.front()];
+        reading.pop_front();
+        stage_from_ssd(x.first, x.second, 0, false, exl3_disk::kPrefetch);
     }
     drain();
     stats.cold_ns += mono_ns() - t0;

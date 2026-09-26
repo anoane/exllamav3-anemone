@@ -144,6 +144,9 @@ struct Options
     int64_t deadline_ns = 0;            // class 2 order (CLOCK_MONOTONIC), 0 = after deadlines
     uint32_t* flag = nullptr;           // set to flag_value (release) when the ticket completes
     uint32_t flag_value = 0;
+    int direct = -1;                    // page cache: -1 as EXL3_DISK_DIRECT says (rows or extents),
+                                        // 0 buffered, 1 O_DIRECT (buffered where the file system
+                                        // refuses it); a placement's disk io= sets it per model
 };
 
 constexpr int kHistBuckets = 8 + 60 * 8;     // log-linear, 8 per octave: <= 12.5 % wide
@@ -315,6 +318,9 @@ bool ngram_route_engine();
 // Class used by ngram_gather_cpu calls from this thread (default kEngram)
 int thread_class();
 int set_thread_class(int cls);
+// Page-cache mode of ngram_gather_cpu calls from this thread (Options::direct; default -1)
+int thread_direct();
+int set_thread_direct(int direct);
 
 // ngram_gather_cpu on the default engine: 0, or -errno when a read failed. Throws Error for bad
 // knobs or arguments (rows past the end of the file included)

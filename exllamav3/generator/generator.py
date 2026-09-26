@@ -584,6 +584,10 @@ class Generator:
         # numerics) and must never land mid-stream
         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
         run_pending_swap_sweeps(self.model.config.infer_params)
+        # Expert tiers (experts=cache): the heat file, between generations
+        tiers = getattr(self.model.config, "expert_tiers", None)
+        if tiers is not None:
+            tiers.quiescent()
         malloc_trim()
 
 

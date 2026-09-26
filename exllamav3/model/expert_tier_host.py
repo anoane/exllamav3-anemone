@@ -35,6 +35,20 @@ except ImportError:                                               # loaded by pa
     PolicyConfig, DECODE, ROUTED, round_robin_order = _m.PolicyConfig, _m.DECODE, _m.ROUTED, _m.round_robin_order
 
 
+def _by_path(name: str, file: str):
+    """A torch-free sibling module loaded by path (the tests load this one that way)"""
+    import importlib.util as ilu
+    import sys
+    from pathlib import Path
+    m = sys.modules.get(name)
+    if m is None:
+        spec = ilu.spec_from_file_location(name, Path(__file__).resolve().parent / file)
+        m = ilu.module_from_spec(spec)
+        sys.modules[name] = m
+        spec.loader.exec_module(m)
+    return m
+
+
 def native_extents(index) -> tuple:
     """(files, extents, geometry) of an ExtentIndex in the native host's format"""
     files = index.files
@@ -74,7 +88,8 @@ class TierHost:
     def __init__(self, index, layers: int, experts: int, policy: PolicyConfig, pool_slots: int, ram_slots: int,
                  pins: int = 0, slab_slots: int = 8, chunk_bytes: int = 1 << 30, hugepage: bool | None = None,
                  fill_inflight: int = 8, staging_slots: int = 0, deterministic: bool = True,
-                 defer_returns: bool = False, prefault_threads: int = 8, ext = None):
+                 defer_returns: bool = False, prefault_threads: int = 8, ext = None, files_map = None,
+                 io_direct: int = -1):
         if len(index) != layers * experts:
             raise ValueError(f"expert tier: {len(index)} extents for {layers} x {experts} experts")
         if hugepage is None:
@@ -83,10 +98,13 @@ class TierHost:
         self.policy = policy
         self.geometry = index.geometry
         files, extents, geometry = native_extents(index)
+        if files_map is not None:
+            files = files_map(files)            # disk experts=<dir>: the checked copies
         self.files = files
         host = {"chunk_bytes": int(chunk_bytes), "hugepage": bool(hugepage), "slab_slots": int(slab_slots),
                 "fill_inflight": int(fill_inflight), "staging_slots": int(staging_slots),
-                "deterministic": bool(deterministic), "prefault_threads": int(prefault_threads)}
+                "deterministic": bool(deterministic), "prefault_threads": int(prefault_threads),
+                "io_direct": int(io_direct)}
         self.ext = ext or _ext()
         self.h = self.ext.TierHost(dataclasses.asdict(policy), layers, experts, pool_slots, ram_slots, pins, geometry,
                                    files, extents, host, defer_returns)
@@ -106,6 +124,15 @@ class TierHost:
 
     def layer(self, lc: int, ids, half: int = 0):
         self.h.layer(lc, [int(e) for e in ids], half)
+
+    def stage(self, lc: int, half: int = 0) -> list:
+        """Layer mode's first half (the GPU runtime's layer_plan): stage layer lc into `half`; the staged
+        keys in staging order. The call's record follows through process()"""
+        return list(self.h.stage(lc, half))
+
+    def read_ahead(self, record):
+        """prefetch=router: read the disk-only experts a prediction record lists into the slab"""
+        self.h.read_ahead(record)
 
     def prefetch(self, lc: int, deadline_ns: int = 0):
         self.h.prefetch(lc, deadline_ns)
@@ -195,5 +222,13 @@ class TierHost:
             slab_slots = 0 if policy.disk_off else (tier_config.disk_slab or 8)
         kw.setdefault("deterministic", True)
         kw.setdefault("hugepage", tier_config.hugepage)
+        # the placement's disk rule: the shards (or a checked copy of them), the page-cache mode
+        try:
+            from .disk_source import expert_files, io_direct
+        except ImportError:
+            ds = _by_path("_exl3_torch_free_disk_source", "disk_source.py")
+            expert_files, io_direct = ds.expert_files, ds.io_direct
+        kw.setdefault("files_map", lambda files: expert_files(placement, files))
+        kw.setdefault("io_direct", io_direct(placement))
         return cls(index, len(modules), experts.pop(), policy, pool_slots, ram_slots, slab_slots = slab_slots,
                    ext = ext, **kw)

@@ -1,9 +1,10 @@
 # Expert tiers and RAM budgets
 
-**Experimental.** A large MoE model rarely fits in GPU memory whole. Its routed experts can live
-in three places: the GPU's memory (VRAM), system RAM, and the checkpoint on the SSD. This document
-covers the budgets that bound how much system RAM a load may take for routed experts and for
-n-gram tables, and how a load checks them against the host before it allocates anything.
+A large MoE model rarely fits in GPU memory whole. Its routed experts can live in three places: the
+GPU's memory (VRAM), system RAM, and the checkpoint on the SSD. This document covers the budgets
+that bound how much system RAM a load may take for routed experts and for n-gram tables, how a load
+checks them against the host before it allocates anything, and the expert tier: a VRAM cache per
+GPU over a RAM tier over the SSD, for the `experts=cache` layers of a placement.
 
 It is the reference for:
 
@@ -11,20 +12,13 @@ It is the reference for:
 |---|---|---|---|---|
 | RAM for the routed experts of the main model | `-er` / `--expert_ram <size>` | `EXL3_EXPERT_RAM` | `expert_ram` | no cap |
 | RAM for the routed experts of a draft model or MTP head | `-der` / `--draft_expert_ram <size>` | none | `draft_expert_ram` | no cap |
-| RAM for n-gram tables (PLE models) | `-ngr` / `--ngram_ram [<size>]` | `EXL3_NGRAM_RAM`, and the older `EXL3_NGRAM_STREAM` | `ngram_ram` (and the older `ngram_stream_from_disk`) | `0`: every row streams from disk |
+| RAM for n-gram tables (PLE models, DeepSeek-V4.1's engram tables) | `-ngr` / `--ngram_ram [<size>]` | `EXL3_NGRAM_RAM`, and the older `EXL3_NGRAM_STREAM` | `ngram_ram` (and the older `ngram_stream_from_disk`) | `0`: every row streams from disk |
 | Host memory kept free by every check | none | `EXL3_HOST_MEM_RESERVE_MB` | none | `2048` |
 
 The explicit placement ([placement.md](placement.md)) says which layers keep their experts in
 system RAM. The budgets say how much RAM they may take in total. The placement's storage rules
 (`cuda:<n>`, `ram`, `disk`, below) extend it with the three levels of the expert tier; the flags
-are caps, the placement's `ram` rule is the request.
-
-**In this build.** The budgets, the `ram` rule's `experts=` / `ngram=` / `pagecache=` for
-`stream` / `cpu` / `split` layers and n-gram tables, `hot=` on `stream` / `cpu`, `disk ngram=off`
-and the dict / JSON / file forms work. The expert tier itself (`experts=cache`, the `cuda:<n>`
-rule, the RAM tier's `policy=` / `demote=` / `evict=`, `disk experts=`) and `prefetch=`,
-`profile=`, `disk ngram=<dir>`, `disk io=` are parsed and checked in full, then refused as not
-available yet (`placement_storage.PENDING`).
+are caps, the placement's `ram` rule is the request. Every word of the grammar runs.
 
 ## Sizes
 
@@ -96,26 +90,42 @@ CPU MoE: model.layers.20.mlp would bring the routed experts held in RAM by this 
 
 ### `-ngr` / `--ngram_ram [<size>]`
 
-The system RAM for n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next, whose quantized
-table is tens of GB). A table held in RAM serves its rows from memory; any other table streams its
-rows from disk with per-forward gathers (run-coalesced positioned reads into pinned staging),
-which costs little on SSD-class storage.
+The system RAM for n-gram embedding tables: those of PLE models (e.g. Qwen3.8-Flash-Next, whose
+quantized table is tens of GB) and DeepSeek-V4.1's engram tables (per engram layer, 384,006,168 rows
+of 256 fp8 bytes, 91.5 GiB, and their 8-byte e8m0 scales, 2.86 GiB; two layers). A table held whole
+in RAM serves its rows from memory; any other table streams its rows from disk with per-forward
+gathers (run-coalesced positioned reads into pinned staging, through the disk engine), and what the
+budget has left after the whole tables caches the rows the streamed tables deliver.
 
 | Value | Meaning |
 |---|---|
-| unset (default), `0` | every table streams from disk |
+| unset (default), `0` | every table streams from disk; no row cache (the page cache is the rows' only warm tier) |
 | `-ngr` alone, `all` | every table whole in RAM (the flag's meaning before it took a size) |
-| a size | the tables that fit, whole, smallest first (tables read by every gathered row would go first; PLE models have none); the others stream |
+| a size | the tables that fit, whole, smallest first (tables every gathered row reads go first: the engram's scales); what is left is split evenly into a row cache per module whose tables stream (none below 64 MiB) |
+| `auto` (the placement's `ram ngram=auto`) | a size of what the host has left after the reserve, the page cache kept free and the RAM-held experts |
 
-A table is held whole or not at all: a 12 GiB budget next to a 41 GiB table holds nothing and
-the table streams. As `-ngr` takes an optional value, a bare `-ngr` right before a word that is
-not a size takes that word and is refused (`ngram_ram=prompt.txt: not a size ...`), never
-silently. `NGramEmbedding(stream_from_disk = True / False)` still overrides the budget for one
-module.
+A table is held whole or not at all: a 12 GiB budget next to a 41 GiB table holds no table, and
+the 12 GiB become that table's row cache. For DeepSeek-V4.1 with `-ngr 16GiB`, both scale tables
+are held whole (5.7 GiB) and each engram layer gets a 5.1 GiB cache of its fp8 rows (about 20
+million rows each); `-ngr 100GiB` holds one layer's two tables whole (94.4 GiB) and caches the
+other layer's rows in the rest. `-ngr all` next to the engram asks 189 GiB, which the host check
+refuses on any machine without that much RAM free.
 
-DeepSeek-V4.1's engram tables (two of about 94.6 GiB each) are always read from disk, whatever
-`--ngram_ram` says; a non-zero budget next to them is reported by the load (`engram tables
-stream from disk (ngram=6GiB holds no DeepSeek-V4.1 engram table)`), not refused.
+**The row cache** (`modules/ngram_row_cache.py`) is direct-mapped: row `u` lives in slot
+`hash(u) mod slots` (the top bits of `u` times the golden-ratio constant), tagged with `u`; a row
+that hashes to an occupied slot replaces what is there. One slot holds the row of every cached
+table of the module (the engram's fp8 row and its scale share their row ids), plus an 8-byte tag.
+A gather looks every row up at once (vectorized, torch on the CPU): hits are copied into the
+staging rows the forward uploads, misses are read from disk into scratch rows and, once the read
+completed, copied into their staging rows and their slots. A row is served from the cache only
+after a completed read stored it whole, so the cache can only change where a row comes from, never
+its bytes; the prefetch worker and the forward's thread may use one module's cache at once (a lock
+around each lookup and insert). A table's rows are the table's bytes whatever the cache holds: the
+logits are the same with any budget.
+
+As `-ngr` takes an optional value, a bare `-ngr` right before a word that is not a size takes that
+word and is refused (`ngram_ram=prompt.txt: not a size ...`), never silently.
+`NGramEmbedding(stream_from_disk = True / False)` still overrides the budget for one module.
 
 `EXL3_NGRAM_RAM` is the default of `--ngram_ram`. The older `EXL3_NGRAM_STREAM=0` still means
 every table in RAM (`all`); next to an `EXL3_NGRAM_RAM` other than `all` it is refused as a
@@ -145,8 +155,13 @@ With a placement, its `ram` rule is the request and the flags stay caps:
 --ngram_ram caps this component at 6GiB`; `-ngr all` caps nothing). `ram ngram=auto` takes what
 the host has left after `EXL3_HOST_MEM_RESERVE_MB`, the page cache kept free (`ram pagecache=`,
 default `auto` = max(8 GiB, MemTotal / 8)) and the RAM-held experts, and fills it with whole
-tables as a size would. The placement names the main model's layers, so its `ram` rule applies to
-the main model's text component only.
+tables as a size would. An expert tier's RAM counts as RAM-held experts: a size (`ram experts=48GiB`,
+or the `-er` cap) at the start of the load; `ram experts=all` only at its end, when the tier is
+sized, so the row caches `auto` made at the start (still empty) are shrunk to what is left then,
+never grown. A row cache's rows are faulted in as rows arrive: the end-of-load host check counts
+them as not yet held, so a budget the host cannot keep is refused at the load, not met by the
+memory cgroup or the OOM killer later. The placement names the main model's layers, so its `ram`
+rule applies to the main model's text component only.
 
 The variables are read when a `Config` is created (a malformed value raises a `ValueError`
 there); the flags when `model_init` builds it (argparse refuses a malformed value with the size
@@ -175,15 +190,18 @@ loads, the loader makes one plan of what this component will hold in host memory
    capped at E - 1 and limited by `EXL3_MOE_CPU_SPLIT_LAYERS`), counted per expert as above.
 2. **Caps**: the arena against `--expert_ram` / `--draft_expert_ram`; refused with the messages
    above.
-3. **N-gram tables**: which tables the budget holds whole; the others stream.
+3. **N-gram tables**: which tables the budget holds whole; the others stream, and what is left of
+   the budget becomes their row caches.
 4. **One host check** of everything together (below). The result is kept for the n-gram modules
-   (`infer_params.ngram_ram_plan`), which load in RAM exactly the tables the plan holds.
+   (`infer_params.ngram_ram_plan`, `infer_params.ngram_row_cache_plan`), which load in RAM exactly
+   the tables the plan holds and make exactly the row caches it sizes.
 
 A load with anything in RAM, or with a budget set, prints one line, e.g.
 
 ```
  -- RAM budget (text): routed experts 52.4 GiB (-mcl 11: 11 layers), cap 56GiB; 118.3 GiB available
- -- RAM budget (text): n-gram tables 41.2 GiB in RAM (1 of 1 whole); 150.0 GiB available
+ -- RAM budget (text): n-gram tables 41.2 GiB in RAM (1 of 1 whole, 41.2 GiB); 150.0 GiB available
+ -- RAM budget (text): n-gram tables 16.0 GiB in RAM (2 of 4 whole, 5.7 GiB; row caches 10.3 GiB for 2 modules); 142.6 GiB available
 ```
 
 ### Host memory
@@ -259,8 +277,8 @@ device      = "cuda:" , uint ;
 layer-attr  = "experts=" , ( "vram" | "cache" | "stream" | "cpu" | "split" | "hybrid" )
             | "hot=" , ( uint | share )                          (* cache, stream, cpu, hybrid *)
             | "cpu=" , uint                                      (* split only *)
-            | "prefetch=" , ( "auto" | "off" | method , { "+" , method } )
-            | "profile=" , value ;
+            | "prefetch=" , ( "auto" | "off" | method , { "+" , method } )   (* cache *)
+            | "profile=" , value ;                               (* cache, split; stream / cpu with hot= *)
 method      = ( "layer" | "router" ) , [ ":" , uint ] ;          (* depth, default 1 *)
 
 device-attr = "cache=" , ( "auto" | size )
@@ -310,19 +328,19 @@ case.
 | Attribute | Default | Meaning |
 |---|---|---|
 | `experts=` | the `--expert_ram` cap; else `auto` for `cache` layers; else what the layers need | system RAM for the component's routed experts: the static arenas of its `stream` / `cpu` / `split` layers first, the rest is the RAM tier of its `cache` layers. `all` = what the layers need (with `cache` layers: every cached expert outside VRAM, so none is read from disk after load); `auto` = the smaller of `all` and what the host has left after the reserve, the page cache and the other budgets; `0` = no RAM tier |
-| `ngram=` | the `--ngram_ram` cap, else `0` | system RAM for n-gram tables: `0` streams every row, `all` holds every table whole, a size the tables that fit (whole, smallest first), `auto` what the host has left |
+| `ngram=` | the `--ngram_ram` cap, else `0` | system RAM for n-gram tables: `0` streams every row, `all` holds every table whole, a size the tables that fit (whole, smallest first) and a row cache of the others in the rest, `auto` what the host has left (see `-ngr`) |
 | `pagecache=` | `auto` = max(8 GiB, MemTotal / 8) | RAM that `auto` budgets leave unpinned (the page cache is the n-gram rows' warm tier); it does not limit explicit sizes. `all` is refused |
-| `policy=` | `lazy-exclusive` | the RAM tier against the VRAM cache: `lazy-exclusive` (a promotion leaves the RAM copy as a reclaimable duplicate), `exclusive` (a promotion frees the RAM copy), `inclusive` (RAM keeps what it holds) |
-| `demote=` | `swap` | what happens to a VRAM victim with no RAM copy: `swap` (copied back only into the RAM slot its replacement left, and only when warmer than RAM's coldest), `heat` (into any free slot, or over RAM's coldest when warmer), `all` (every victim), `off` (dropped; the disk still has it) |
+| `policy=` | `exclusive` | the RAM tier against the VRAM cache: `lazy-exclusive` (a promotion leaves the RAM copy as a reclaimable duplicate), `exclusive` (a promotion frees the RAM copy), `inclusive` (RAM keeps what it holds) |
+| `demote=` | `heat` | what happens to a VRAM victim with no RAM copy: `swap` (copied back only into the RAM slot its replacement left, and only when warmer than RAM's coldest), `heat` (into any free slot, or over RAM's coldest when warmer), `all` (every victim), `off` (dropped; the disk still has it) |
 | `evict=` | `lfu` | RAM tier victims: `lfu` (lowest heat of a 16-entry sample) or `lru` |
 
 ### `disk`: where experts and n-gram rows are read
 
 | Attribute | Default | Meaning |
 |---|---|---|
-| `experts=` | `model` | `model`: the checkpoint's shards, read in place. `<dir>`: a copy on another drive. `off`: never read an expert at runtime; the load refuses unless VRAM and RAM hold every cached expert, and every victim returns to RAM |
-| `ngram=` | `model` | the same for n-gram tables; `off` needs `ram ngram=all` |
-| `io=` | `auto` | `auto`: experts `O_DIRECT` (buffered if refused), n-gram rows buffered; `direct` / `buffered` force one mode |
+| `experts=` | `model` | `model`: the checkpoint's shards, read in place. `<dir>`: a copy of the shards in another directory (another drive), same file names; every shard the tier reads must be there with the model's size and safetensors header, byte for byte, or the load is refused naming the file (`model/disk_source.py`); every expert read (cold fill, misses, read-ahead, refills) then goes to the copy. `off`: never read an expert at runtime; the load refuses unless VRAM and RAM hold every cached expert, and every victim returns to RAM |
+| `ngram=` | `model` | the same for n-gram tables (PLE tables and DeepSeek-V4.1's engram tables): `<dir>` reads their rows from a checked copy; `off` needs `ram ngram=all` |
+| `io=` | `auto` | the page-cache mode of the component's expert and n-gram reads through the disk engine: `auto` leaves it to the engine (`EXL3_DISK_DIRECT`: with `io_uring`, expert extents `O_DIRECT` and rows buffered); `direct` reads everything `O_DIRECT` (buffered where the file system refuses it; rows through the engine's bounce slots); `buffered` reads everything through the page cache. Needs the disk engine: refused with `EXL3_DISK_BACKEND=original` when n-gram rows stream |
 
 ### Checks the grammar cannot express (parse time)
 
@@ -330,7 +348,9 @@ case.
 - One kind of host-held experts per GPU: GPU-computed (`stream`, `cache`) and CPU-computed
   (`cpu`, `split`) layers on different GPUs.
 - `hot=` applies to `cache`, `stream`, `cpu` (and is required by `hybrid`); `cpu=` only to
-  `split`; `prefetch=` only to `cache` and `stream`; `profile=` not to `vram`.
+  `split`; `prefetch=` only to `cache` (it reads experts ahead from the disk; `stream` layers hold
+  all theirs in RAM); `profile=` to `cache`, `split`, and `stream` / `cpu` with `hot=` (it chooses
+  which experts stay in VRAM, and without `hot=` those layers keep none there).
 - One `cuda:<n>` rule per GPU, one `ram` rule, one `disk` rule. A `cuda:<n>` rule needs an
   `experts=cache` layer on that GPU; `cache=0` takes no `spare=` / `evict=` / `admit=`;
   `spare=0` needs `ram demote=off` or `policy=inclusive` (no free slot would take a demoted
@@ -339,7 +359,8 @@ case.
   `cache` layer and a RAM tier (`experts=0` has none). `demote=` has no effect with
   `policy=inclusive` and is refused there. At most one of `experts=` and `ngram=` can be `auto`.
 - `disk experts=<dir|off>` needs a `cache` layer. `disk experts=off` refuses `demote=off` unless
-  the policy is `inclusive`. `disk ngram=off` needs `ngram=all`. `io=` with both `experts=off` and
+  the policy is `inclusive`, and an explicit `prefetch=layer` / `router` (nothing is read from the
+  disk to read ahead). `disk ngram=off` needs `ngram=all`. `io=` with both `experts=off` and
   `ngram=off` has nothing to configure.
 - Storage rules need layer rules: without a placement, the flags carry the budgets.
 
@@ -355,28 +376,31 @@ to an equal placement. Placements without storage rules print exactly as before.
 
 ### Examples
 
-| # | Meaning | Canonical form | In this build |
-|---|---|---|---|
-| T1 | one GPU, every expert in VRAM | `*=cuda:0` | yes |
-| T3 | one GPU, 32 of 128 experts per layer resident, the rest on the CPU worker (`-mcs 96`) | `*=cuda:0 experts=cpu hot=32` | yes |
-| T3c | the same, in the older spelling (`experts=hybrid hot=32`, normalized) | `*=cuda:0 experts=cpu hot=32` | yes |
-| T4 | DeepSeek-V4.1 serving layout, CMP + PRO | `0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1` | yes |
-| T5 / (c) | V4.1, CMP + PRO: layers 12-39 cached on the PRO over RAM that holds the rest; the disk never read for experts | `0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off` | no |
-| (a) | the PRO alone, RAM for every expert outside VRAM | `*=cuda:0 experts=cache; ram experts=all; disk experts=off` | no |
-| (b) | the PRO alone, 96 GiB of RAM tier, the SSD for the rest | `*=cuda:0 experts=cache; ram experts=96GiB` | no |
-| T6 | the PRO alone: 75 GiB cache, 96 GiB RAM tier, n-gram budget | `*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB ngram=6GiB` | no |
-| T7 | a RAM-limited box: 16 experts per layer pinned; the tier takes what is free after 24 GiB of page cache | `*=cuda:0 experts=cache hot=16; ram experts=auto pagecache=24GiB` | no |
-| T8 | no RAM tier: the VRAM cache straight over the SSD | `*=cuda:0 experts=cache; ram experts=0` | no |
-| T10 | a big-RAM host: inclusive RAM, whole n-gram tables | `*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive` | no |
-| T11 | every policy knob | `*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; ram experts=64GiB pagecache=16GiB policy=exclusive demote=heat evict=lru; disk io=direct` | no |
-| T12 | no D2H copies at all | `*=cuda:0 experts=cache; ram experts=48GiB demote=off` | no |
-| T13 | CPU-computed layers on one GPU, cached layers on the other | `0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB` | no |
-| T14 | experts and n-gram tables read from other drives | `*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"` | no |
-| T16 | GPU streaming with a resident slice (`-mcs k -mcm stream_only`) | `*=cuda:1 experts=stream hot=64` | yes |
-| T17 | units: `cache=1.5`, `ram experts=48GB ngram=512mi` | `*=cuda:0 experts=cache; cuda:0 cache=1536MiB; ram experts=48GB ngram=512MiB` | no |
-| T18 | an n-gram budget only, for a PLE model | `*=cuda:0; ram ngram=12GiB` | yes |
-| R1 | the RAM of stream layers capped by the placement | `0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1; ram experts=64GiB` | yes |
-| R2 | whole n-gram tables, never read from disk | `*=cuda:0; ram ngram=all; disk ngram=off` | yes |
+| # | Meaning | Canonical form |
+|---|---|---|
+| T1 | one GPU, every expert in VRAM | `*=cuda:0` |
+| T3 | one GPU, 32 of 128 experts per layer resident, the rest on the CPU worker (`-mcs 96`) | `*=cuda:0 experts=cpu hot=32` |
+| T3c | the same, in the older spelling (`experts=hybrid hot=32`, normalized) | `*=cuda:0 experts=cpu hot=32` |
+| T4 | DeepSeek-V4.1 serving layout, CMP + PRO | `0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1` |
+| T5 / (c) | V4.1, CMP + PRO: layers 12-39 cached on the PRO over RAM that holds the rest; the disk never read for experts | `0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=all; disk experts=off` |
+| (a) | the PRO alone, RAM for every expert outside VRAM | `*=cuda:0 experts=cache; ram experts=all; disk experts=off` |
+| (b) | the PRO alone, 96 GiB of RAM tier, the SSD for the rest | `*=cuda:0 experts=cache; ram experts=96GiB` |
+| P1 | read two layers ahead at prefill, predict the next layer's experts at decode | `*=cuda:0 experts=cache prefetch=layer:2+router` |
+| P2 | hot pins and the cold fill from two weighted profiles | `*=cuda:0 experts=cache hot=16 profile=code:3,chat:1` |
+| P3 | the resident slice of streamed layers from a profile | `*=cuda:1 experts=stream hot=64 profile=chat` |
+| T6 | the PRO alone: 75 GiB cache, 96 GiB RAM tier, n-gram budget | `*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB ngram=6GiB` |
+| T7 | a RAM-limited box: 16 experts per layer pinned; the tier takes what is free after 24 GiB of page cache | `*=cuda:0 experts=cache hot=16; ram experts=auto pagecache=24GiB` |
+| T8 | no RAM tier: the VRAM cache straight over the SSD | `*=cuda:0 experts=cache; ram experts=0` |
+| T10 | a big-RAM host: inclusive RAM, whole n-gram tables | `*=cuda:0 experts=cache; ram experts=all ngram=all policy=inclusive` |
+| T11 | every policy knob | `*=cuda:0 experts=cache; cuda:0 cache=40GiB spare=12 evict=lfu admit=heat; ram experts=64GiB pagecache=16GiB policy=lazy-exclusive demote=swap evict=lru; disk io=direct` |
+| T12 | no D2H copies at all | `*=cuda:0 experts=cache; ram experts=48GiB demote=off` |
+| T13 | CPU-computed layers on one GPU, cached layers on the other | `0-9=cuda:0 experts=cpu; 10-39=cuda:1 experts=cache; cuda:1 cache=40GiB; ram experts=96GiB` |
+| T14 | experts and n-gram tables read from other drives | `*=cuda:0 experts=cache; ram experts=48GiB; disk experts=/nvme1/v41 ngram="/mnt/engram disk/v41"` |
+| T16 | GPU streaming with a resident slice (`-mcs k -mcm stream_only`) | `*=cuda:1 experts=stream hot=64` |
+| T17 | units: `cache=1.5`, `ram experts=48GB ngram=512mi` | `*=cuda:0 experts=cache; cuda:0 cache=1536MiB; ram experts=48GB ngram=512MiB` |
+| T18 | an n-gram budget only, for a PLE model | `*=cuda:0; ram ngram=12GiB` |
+| R1 | the RAM of stream layers capped by the placement | `0-11=cuda:0; 12-22=cuda:1 experts=stream; 23-39=cuda:1; ram experts=64GiB` |
+| R2 | whole n-gram tables, never read from disk | `*=cuda:0; ram ngram=all; disk ngram=off` |
 
 A multi-line value with comments; the written-out defaults vanish from the canonical form
 (`0-11=cuda:0; 12-39=cuda:1 experts=cache; ram experts=52GiB`):
@@ -386,7 +410,7 @@ export EXL3_PLACEMENT="
 0-11  = cuda:0                                  # CMP: resident
 12-39 = cuda:1 experts=cache                    # PRO: cached
 cuda:1 cache=auto spare=8 evict=lru admit=adaptive
-ram experts=52GiB pagecache=auto policy=lazy-exclusive demote=swap evict=lfu
+ram experts=52GiB pagecache=auto policy=exclusive demote=heat evict=lfu
 disk experts=model ngram=model io=auto
 "
 ```
@@ -410,7 +434,10 @@ Each is a `ValueError`, prefixed with `placement rule <n> '<rule>': ` where one 
 | `*=cuda:0 experts=hybrid` | `experts=hybrid needs hot=<routed experts per layer kept in VRAM> (the same as experts=cpu hot=<k>)` |
 | `*=cuda:0 experts=cpu cpu=96` | `cpu= only applies to experts=split (write experts=cpu hot=<k> to keep k routed experts per layer in VRAM)` |
 | `*=cuda:0 experts=cache hot=100%` | `hot=100%: a share must lie between 0% and 100%, exclusive` |
-| `*=cuda:0 experts=cpu prefetch=layer` | `prefetch= applies to experts=cache and stream (experts=cpu computes on the CPU worker)` |
+| `*=cuda:0 experts=cpu prefetch=layer` | `prefetch= applies to experts=cache (experts=cpu computes on the CPU worker)` |
+| `*=cuda:0 experts=stream prefetch=router` | `prefetch= applies to experts=cache (experts=stream holds every routed expert in RAM and streams each call's experts, with nothing to read ahead from the disk)` |
+| `*=cuda:0 experts=stream profile=chat` | `profile= chooses which routed experts stay in VRAM, and experts=stream without hot= keeps none there; add hot=<k> (or use experts=cache)` |
+| `*=cuda:0 experts=cache prefetch=layer:2; ram experts=all; disk experts=off` | `placement: prefetch=layer:2 reads experts ahead from the disk, which 'disk experts=off' never reads; remove it (or write prefetch=off)` |
 | `*=cuda:0 profile=code` | `profile= chooses hot or cached experts; experts=vram has none to choose` |
 | `...; cuda:0 cache=all` | `cache=all would hold every expert of its layers: write experts=vram on them` |
 | `...; cuda:0 cache=0 spare=4` | `cache=0 has no slots for spare= / evict= / admit= to govern` |
@@ -428,21 +455,20 @@ Each is a `ValueError`, prefixed with `placement rule <n> '<rule>': ` where one 
 | `...; ram experts=all demote=off; disk experts=off` | `placement: 'disk experts=off' keeps no copy of an expert outside VRAM and RAM, so demote=off would lose VRAM victims; drop demote=off (with the disk off, every victim moves back to the RAM slot its replacement left) or use policy=inclusive with ram experts=all` |
 | `0-19=cuda:0 experts=cpu; 20-39=cuda:0 experts=cache` | `placement: cuda:0 holds both GPU-computed (experts=stream / cache) and CPU-computed (experts=cpu / split) layers; one kind of host-held experts per GPU is supported` |
 | `ram ngram=6GiB` | `placement: storage rules (cuda:<n>, ram, disk) need layer rules to go with; without a placement, set RAM budgets with --expert_ram / --ngram_ram` |
-| `*=cuda:0 experts=cache` (in this build) | `placement '*=cuda:0 experts=cache': experts=cache is not available in this build yet; it needs the expert tier runtime (a VRAM expert cache per GPU over the RAM tier and the disk) (see doc/expert_tiers.md)` |
 
 `tests/test_placement_tiers_.py` holds every case with its full text.
 
 ## The expert tier
 
-`experts=cache` runs in this build: a VRAM expert cache per GPU (a lookup kernel inside the MoE
-dispatch, a tier thread doing the copies on the copy engines), over the RAM tier, over the model's
-own shards on the SSD. This section describes what the words ask for, how a load sizes the tier and
-what it refuses (`model/expert_tier_config.py`; its tests, `tests/test_expert_tier_config_.py`, run
-every number below), the extent index, the policy (reference and native), the RAM tier host, and
-the VRAM cache itself. Not in this build yet: the whole-layer double-buffered prefill (every prefill
-call runs in routed mode, see "The VRAM cache"), the prefill read-ahead (`prefetch=`), profiles and
-the heat file, hot pins re-chosen by heat, reading experts from another directory
-(`disk experts=<dir>`), `disk io=`.
+The `experts=cache` layers of a placement keep their routed experts in three levels: a VRAM cache
+per GPU (a lookup kernel inside the MoE dispatch decides each call's slots; a tier thread turns the
+decisions into copies; whole layers are staged on the copy engines during a long prefill), a RAM
+tier of the warmest experts the cache does not hold, and the model's own shards on the SSD, read in
+place through the disk engine. This section describes what the words ask for, how a load sizes the
+tier and what it refuses (`model/expert_tier_config.py`; its tests,
+`tests/test_expert_tier_config_.py`, run every number below), the extent index, the policy
+(reference and native), the RAM tier host, the VRAM cache, the layer-mode prefill, the read-ahead,
+and the profiles and the heat file.
 
 ### Where a routed expert of a `cache` layer lives
 
@@ -450,10 +476,10 @@ the heat file, hot pins re-chosen by heat, reading experts from another director
 |---|---|---|
 | VRAM, `hot=` pins | `hot` experts per layer, never evicted | the layer (counted as its weights) |
 | VRAM, the GPU's cache | a changing set, shared by every `cache` layer on that GPU (one least-recently-used pool per GPU) | `cuda:<n> cache=` |
-| VRAM, prefill staging | the next layer's experts during a long prefill | `EXL3_MOE_TIER_STAGING` |
+| VRAM, staging | a decode or routed call's transients (half 0); in a layer-mode prefill, the whole layer being computed and the next one being copied (two halves) | `EXL3_MOE_TIER_STAGING` |
 | RAM, the tier | the warmest experts VRAM does not hold (`policy=lazy-exclusive` / `exclusive`), or a copy of what it holds too (`inclusive`) | `ram experts=` |
-| RAM, the disk slab | SSD reads that bypass the tier | `EXL3_MOE_TIER_DISK_SLAB` |
-| SSD | every expert: the checkpoint's shards, read in place, never written | `disk experts=` |
+| RAM, the disk slab | SSD reads that bypass the tier: misses read ahead of their call (`prefetch=`), a record's reads in flight together, a layer's disk-only experts being staged | `EXL3_MOE_TIER_DISK_SLAB` |
+| SSD | every expert: the checkpoint's shards (or a checked copy of them, `disk experts=<dir>`), read in place, never written | `disk experts=` |
 
 With `disk experts=off` nothing is read from the SSD after the load: VRAM and RAM must hold every
 cached expert, and every VRAM victim moves back to RAM (demotion is then unconditional).
@@ -485,8 +511,19 @@ disk-only experts = N - sum(held) - R                           (inclusive: N - 
 ```
 
 `ram experts=` covers the `stream` / `cpu` / `split` layers' arenas first; the tier gets the rest.
-The disk slab (8 slots by default) is pinned too when `disk experts=` is not `off`. The host check
-covers the static arenas, the tier, the n-gram tables and the slab together.
+When `disk experts=` is not `off`, each cache GPU has a disk slab of `EXL3_MOE_TIER_DISK_SLAB`
+slots (RAM slots, pinned), `auto` by default:
+
+```
+per_layer = min(E, ceil(1.25 x disk-only experts / cache layers))
+slab      = 8 + (D + 1) x per_layer + Dr x top-k        D: deepest prefetch=layer, Dr: deepest prefetch=router
+```
+
+8 for one decode call's misses read together, `D + 1` layers' shares of the disk-only experts for a
+layer-mode prefill (the layer being staged and the `D` read ahead; a quarter more for layers that
+hold more than their share), `Dr x top-k` for the router's predictions; 8 alone when VRAM and RAM
+hold every cached expert. The host check covers the static arenas, the tier, the n-gram tables and
+the slabs together.
 
 A load checks what it can before any module loads (explicit `cache=` and `ram experts=` sizes,
 the settings, the host memory they need), and sizes the pools at the end of the layer split, with
@@ -494,7 +531,7 @@ each GPU's room, before any of the tier is allocated. It prints:
 
 ```
  -- expert tiers: cuda:1 cache 6553 slots (81.0 GiB, 8 spare, evict=lru admit=adaptive; staging 768 slots (9.5 GiB, double))
-    ram experts 52.2 GiB pinned (static 0 MiB + tier 4207 slots), policy lazy-exclusive demote=swap, evict=lfu
+    ram experts 52.2 GiB pinned (static 0 MiB + tier 4207 slots), policy exclusive demote=heat, evict=lfu
     ngram 0 MiB (every row streams from disk)
     disk experts=off io=auto: 0 experts on disk only; 73.8 GiB of RAM left unpinned
 ```
@@ -502,7 +539,10 @@ each GPU's room, before any of the tier is allocated. It prints:
 ### Where an expert is read from: extents and slot geometry
 
 The tier never repacks the checkpoint. Each routed expert of a `cache` layer is read in place
-from its shard (`model/expert_extents.py`, `build_extent_index`, from the headers alone):
+from its shard (`model/expert_extents.py`, `build_extent_index`, from the headers alone), or from
+the same shard in the directory `disk experts=<dir>` names, once that copy is checked to have the
+model's size and safetensors header (`model/disk_source.py`: the offsets the index took from the
+model's headers must hold in the copy):
 
 - **One extent per expert.** An expert's tensors (per projection: `suh`, `svh`, `mul1`,
   `trellis`, and `bias` when present) are written back to back by `convert.py`, so the extent from
@@ -582,7 +622,7 @@ and an admission never waits on a demotion. `spare=0` (allowed with `ram demote=
 | its RAM tier slot (host to device, three copies from an SSD-filled slot, one from a demoted one) | RAM holds it |
 | the SSD (a class-1 read of the disk engine, into a RAM slot or the disk slab) | otherwise |
 
-| What RAM keeps | `exclusive` | `lazy-exclusive` (default) | `inclusive` |
+| What RAM keeps | `exclusive` (default) | `lazy-exclusive` | `inclusive` |
 |---|---|---|---|
 | admitted, was in RAM | the RAM slot is freed | the RAM copy becomes a reclaimable duplicate | the RAM copy becomes a duplicate |
 | admitted, read from the SSD | nothing (read into the slab) | a duplicate, in a free slot or over a reclaimed duplicate; else nothing | a duplicate, in a free slot or over the coldest owner |
@@ -592,8 +632,8 @@ and an admission never waits on a demotion. `spare=0` (allowed with `ram demote=
 | The victim (`ram demote=`) | Rule |
 |---|---|
 | has a duplicate in RAM | the duplicate becomes the owner; nothing is copied |
-| `swap` (default) | copied back only into the RAM slot its admission freed or made a duplicate, and only when it is warmer than RAM's coldest sampled owner; else dropped: at most one copy back per promotion from RAM |
-| `heat` | copied into a free slot, else over a reclaimed duplicate, else over the coldest sampled owner when warmer; else dropped |
+| `swap` | copied back only into the RAM slot its admission freed or made a duplicate, and only when it is warmer than RAM's coldest sampled owner; else dropped: at most one copy back per promotion from RAM |
+| `heat` (default) | copied into a free slot, else over a reclaimed duplicate, else over the coldest sampled owner when warmer; else dropped |
 | `all` | always copied back (a free slot, else a reclaimed duplicate, else over the coldest sampled owner) |
 | `off`, or `EXL3_MOE_TIER_DEMOTE=0` | dropped (the SSD has it) |
 | any, with `disk experts=off` | always copied back: into the slot its admission left, else a free slot, else a reclaimed duplicate |
@@ -614,8 +654,12 @@ its three trellis tensors back to back (compact layout).
   count; in deterministic mode they have all landed), the others are dropped, never queued. Decode
   misses already went through RAM admission.
 - **Layer mode** (prefill calls from `EXL3_MOE_TIER_PREFILL_ROWS` rows): every cached expert of
-  the layer that the pool does not hold is staged (from RAM, or read from the SSD into the slab);
-  no stamps, no admission, no demotion; heat grows.
+  the layer that the pool does not hold is staged, in expert order (from RAM, or read from the SSD
+  into the slab); no stamps, no admission, no demotion; heat grows by the call's assignments, and
+  the experts it used that only the disk holds are refill candidates (in expert order). The GPU
+  runtime runs the two halves apart (`layer_plan`: the staging, before the layer's routing is known;
+  `layer_record`: heat and refills, from the call's record), which give exactly the actions of the
+  whole (`layer_call`, the CPU replay; tested).
 
 **Heat** is a decayed routing count per key, kept in 16.16 fixed point with the epoch it was last
 written in. The epoch is `decode tokens // EXL3_MOE_HEAT_HALFLIFE` (one decode pass = one token);
@@ -623,14 +667,15 @@ reading a key halves its value once per epoch since (lazily, no sweep). A decode
 1.0, a prefill assignment `EXL3_MOE_HEAT_PREFILL` (1/16): a 4K-token prompt adds about 4 to every
 expert of a layer, a few tokens of decode.
 
-**Cold fill** (end of the load): in priority order (round robin across layers by expert index:
-expert 0 of every layer, then expert 1, ...), the first `C` experts fill the pool (all of them when
-they fit), the next `R` the RAM tier (`inclusive`: RAM first takes a duplicate of every pool
-expert). Nothing else is read after the load unless a decode or prefill call misses.
+**Cold fill** (end of the load): in priority order (a profile's or the heat file's, see "Profiles
+and the heat file"; else round robin across layers by expert index: expert 0 of every layer, then
+expert 1, ...), the first `C` experts fill the pool (all of them when they fit), the next `R` the RAM
+tier (`inclusive`: RAM first takes a duplicate of every pool expert). Nothing else is read after the
+load unless a call misses, a refill or a read-ahead reads.
 
 **Checked in the tests** (`tests/test_expert_tier_policy_.py`): nine micro-scenarios with every
 record, counter and final state; invariants after every call of 200 random configurations x 5,000
-calls; agreement with the policy simulator the defaults were chosen on; the adaptive rule on
+calls; agreement with the policy simulator the first defaults were chosen on; the adaptive rule on
 scripted cache lives, exactly. The native core (`tests/test_expert_tier_native_.py`) makes the
 same decisions as the reference on the micro-scenarios and 200 random configurations: the same
 records, actions, counters and final state, heat, random draws and the adaptive probability
@@ -651,8 +696,8 @@ model's own shards.
 | Part | What it is | V4.1 3.0 bpw |
 |---|---|---|
 | RAM tier | `R` slots of the RAM slot size, in anonymous mappings of whole slots (one chunk = at most 1 GiB; transparent huge pages only with `EXL3_MOE_TIER_HUGEPAGE=1`); each chunk is one registered io_uring buffer of the disk engine, so reads into it are `READ_FIXED` (up to 1,023 chunks) | 80 slots (1,065,615,360 bytes) per chunk; `R` = 4,976 slots = 63 chunks for layout (c) |
-| disk slab | `EXL3_MOE_TIER_DISK_SLAB` slots (default 8), same layout, registered too | 106.6 MB |
-| pool and staging | the GPU's; this build's CPU replay stands in a host buffer for them | |
+| disk slab | `EXL3_MOE_TIER_DISK_SLAB` slots (`auto`, see "Sizing"), same layout, registered too | 13.3 MB per slot |
+| pool and staging | the GPU's; the CPU replay (`TierHost`) stands in a host buffer for them | |
 
 Every slot is filled at load, so the chunks are faulted in right away by several threads
 (`prefault_threads`, 8), then registered with io_uring, which pins them; the GPU runtime registers
@@ -669,14 +714,15 @@ layout*: the three trellis tensors back to back, as in a VRAM slot). A promotion
 ranges from an extent-layout slot and one from a compact one.
 
 **Reads** go through the process-wide disk engine ([disk_engine.md](disk_engine.md)), with the
-extent API (`O_DIRECT` when the backend and file system allow it; the payload offset is the same
-either way), one ticket per expert, in the engine's request classes:
+extent API, one ticket per expert, in the page-cache mode `disk io=` says (`auto`: the engine's,
+`O_DIRECT` for extents with `io_uring`; the payload offset is the same either way), in the engine's
+request classes:
 
 | Class | Tier reads |
 |---|---|
 | 1 expert demand | a decode or routed call's miss that only the SSD holds; a layer-mode staging read that was not read ahead |
-| 2 prefetch | the cold fill; the layer-mode read-ahead (`prefetch_layer`), with a deadline, promoted to class 1 when its layer is staged (`promote_layer`) |
-| 3 refill | refills (the policy's refill decisions) |
+| 2 prefetch | the cold fill; the layer-mode read-ahead (`prefetch=layer`: `prefetch_layer`, deadline its layer's expected start, promoted to class 1 when its layer is staged); the router's predictions (`prefetch=router`: `read_ahead`, deadline 1 ms) |
+| 3 refill | refills (the policy's refill decisions); the RAM slot of a miss served from the slab |
 
 A read the engine fails (an I/O error, a short read, a file that changed) is retried once with a
 plain `pread` of the same bytes into the same place. If that fails too, the tier fails: the call
@@ -692,28 +738,46 @@ reading from). A pool slot returns to the free list only after the demotion that
 landed. `spare=0` replaces victims in place, so it needs `ram demote=off` or `policy=inclusive`
 (the runtime refuses it otherwise, as the grammar does).
 
-**Disk slab.** Reads that bypass the RAM tier land in the slab, are copied, and give their slot
-back. The layer-mode read-ahead fills free slab slots only (the rest of the layer is counted as
-*starved* and read on demand); a demand read that finds the slab full of read-ahead takes the slot
-of the read-ahead farthest ahead (counted as dropped). Read-ahead of an expert that reached RAM or
-VRAM another way before its layer is dropped when the layer is staged.
+**A record's reads go out together.** Before any copy of a call's record is issued, every SSD read
+the record needs is submitted (`presubmit`): the reads into the slab while it has a slot to spare,
+and a read into a RAM slot when no earlier action of the record copies from or into that slot (its
+old bytes are still needed first; that read waits for its turn). A call with six SSD misses then
+waits for about the slowest read, not for six in a row (`presubmitted` counts them).
+
+**Disk slab.** A slab slot is free, reading or read for a demand (a read `presubmit` started, or
+the one a miss makes), a read-ahead (`prefetch=`, of layer `lc`), or copied: its copy to VRAM was
+issued and its bytes stay valid, so a later miss of the same expert copies it again without a read
+(`slab_reused`) until the slot is taken for another read, oldest first once its copy has landed.
+A slot is taken, in order: a free one; the oldest copied one whose copy has landed; the read-ahead
+farthest ahead (counted as dropped); a demand may also wait for the oldest copied slot's copy
+(`slab_waits`). The slots a record needs are pinned while it runs, so its own reads never take
+each other's slots, unless the record needs more slab reads than the slab has slots (then a later
+action reads its expert again). A decode miss whose expert the slab holds (read ahead) is served
+from there even when the policy gives it a RAM slot: the copy to VRAM comes from the slab at once,
+and the RAM slot is filled by a background read of its own (class 3, `slab_to_vram`). Read-ahead
+of an expert that reached RAM or VRAM another way before its layer is dropped when the layer is
+staged.
 
 **Cold fill** (`cold_fill`, end of the load): the RAM tier's experts are read straight into their
-slots, `fill_inflight` (8) at a time; the pool's experts are copied from their RAM copy when RAM
-holds one (`policy=inclusive`), else read through the slab. The order is the policy's (round robin
-across layers by expert index, until a heat file or profile gives another). On the AI VM, 44 real
-V4.1 experts (586 MB) fill at 8.9 GB/s.
+slots, `fill_inflight` (8) at a time; the hot pins' and the pool's experts are copied from their RAM
+copy when RAM holds one (`policy=inclusive`), else read through the slab, as many reads in flight as
+the slab has slots. The order is the seed's (see "Profiles and the heat file"). On the AI VM, 44
+real V4.1 experts (586 MB) fill at 8.9 GB/s.
 
-**Deterministic mode** (the default of this build, `EXL3_MOE_TIER_DETERMINISTIC=1` in the GPU
-runtime): a call returns only when every read and copy it started, refills included, has landed.
-Otherwise refills complete in the background and land on `poll()` or the next access of their
-slot. Either way the decisions are the same; only timing differs.
+**Deterministic mode** (`TierHost(deterministic = True)`, the CPU replay's default;
+`EXL3_MOE_TIER_DETERMINISTIC=1` on the GPU): a call returns only when every read and copy it
+started, refills included, has landed. Otherwise refills complete in the background and land on
+`poll()` or the next access of their slot. Either way the decisions are the same; only timing
+differs.
 
 **Statistics** (`TierHost.stats()`): `ssd_reads`, `ssd_bytes`, `pread_fallbacks`, `h2d` / `d2h` /
 `d2d` (copies, a three-piece promotion counts once) and their bytes, `staged`, `prefetch_issued`,
 `prefetch_used`, `prefetch_starved`, `prefetch_dropped`, `refill_reads`, `hazard_waits` (a write
 waited for a reader or writer of its slot), `slab_waits`, `cold_ram`, `cold_vram`, `cold_bytes`,
-`cold_ns`, `arena_ns` (mapping, faulting in and registering the tier), and the policy's counters (`policy_hits`, `policy_admits`, ... as in "Policies").
+`cold_ns`, `arena_ns` (mapping, faulting in and registering the tier), `compacted`, `presubmitted`
+(SSD reads of a record submitted before its first copy), `slab_reused`, `predicted_reads`
+(`prefetch=router`), `slab_to_vram`, and the policy's counters (`policy_hits`, `policy_admits`, ...
+as in "Policies").
 
 **Python.**
 
@@ -729,7 +793,10 @@ tier.cold_fill()                                  # round robin across layers
 tier.tick()                                       # one decode pass
 entries = tier.call(lc, ids)                      # [(key, kind, dst, cnt, heat, vkey, vslot, ...)]
 tier.prefetch(lc + 1); tier.promote(lc + 1)       # layer-mode read-ahead, then its layer is next
-tier.layer(lc + 1, ids, half = 1)                 # stage the layer into staging half 1
+tier.layer(lc + 1, ids, half = 1)                 # stage the layer into staging half 1 (a layer call)
+keys = tier.stage(lc + 1, half = 1)               # ... or its halves, as the GPU runtime runs them:
+tier.process((seq, lc + 1, LAYER, entries))       #     the staging, then the call's record
+tier.read_ahead((seq, lc + 2, 3, entries))        # prefetch=router: a prediction record
 tier.stats(); tier.state(); tier.arena()
 # or from a load's placement and sizing: TierHost.from_placement(stc, cache_modules, placement,
 #     "cuda:1", tier_config, pool_slots = S, ram_slots = R)
@@ -744,12 +811,15 @@ after every call of scripted and random traces over every policy x demote x admi
 disk on and off, `spare=0`, deferred returns and asynchronous refills, the host's records, actions
 and state equal the reference policy's, and every pool slot, retiring slot, RAM tier slot and
 staging slot holds exactly the checkpoint bytes of the expert the policy says it holds; the cold
-fill with every engine backend; the read-ahead; refills; every engine read failing (the `pread`
-fallback serves them); a shard cut short (the error names the expert); the arena's chunks and
-registrations; the real V4.1 shards. The C++ driver runs under AddressSanitizer,
+fill with every engine backend; the read-ahead, and a read-ahead serving a decode miss; the router's
+predictions; layer calls split into their halves (the same actions, bytes and state as whole);
+refills; every engine read failing (the `pread` fallback serves them); a shard cut short (the error
+names the expert); the arena's chunks and registrations; `disk experts=<dir>` (every read from the
+copy, the model's shards moved away meanwhile; a copy with another header refused) and `disk
+io=direct` / `buffered`; the real V4.1 shards. The C++ driver runs under AddressSanitizer,
 UndefinedBehaviorSanitizer and ThreadSanitizer.
 
-### The VRAM cache: lookup, copies and the tier thread
+### The VRAM cache: decode and routed calls
 
 A `cache` layer is a resident layer in every respect but one: its routed experts' trellis tensors
 are not loaded with it. Its expert `Linear`s get their EXL3 inner at load with `suh`, `svh`, `mcg` /
@@ -763,9 +833,18 @@ tier takes, 455 for V4.1) gets the trellis tensors where the tables point
 (`BC_BlockSparseMLP.run_single_expert_dq_views`, same kernels and arguments as
 `run_single_expert_dq`). The graph and torch per-expert paths read an expert's own trellis tensor:
 a `cache` layer must be one the fused MoE kernel covers (refused at load otherwise) and raises should
-one of those paths be reached anyway.
+one of those paths be reached anyway. A tiered layer therefore computes exactly what the same layer
+computes resident, bit for bit: same kernels, same arguments, same trellis bytes, only where the
+bytes live differs.
 
-**One MoE call** (`BlockSparseMLP.forward`, right after routing), two kernels on the compute stream:
+A call's mode follows its rows: up to `EXL3_MOE_TIER_DECODE_ROWS` (8) a **decode** call (stamps,
+admission), from `EXL3_MOE_TIER_PREFILL_ROWS` (256) a **layer-mode** call (next section), in between
+a **routed** call (hits keep their slots, misses are staged as transients for the call; no stamps,
+no admission, no demotion). A forward pass has one row count, so all its calls on a GPU have one
+mode.
+
+**One decode or routed call** (`BlockSparseMLP.forward`, right after routing), two kernels on the
+compute stream:
 
 ```
 compute stream                                   tier thread (native, one per GPU, no CUDA calls)
@@ -773,14 +852,14 @@ compute stream                                   tier thread (native, one per GP
 lookup kernel (1 CTA of 1,024 threads):          reads the record from the ring in mapped memory
   harvest the slots the host returned            applies it to its mirror of the directory
   dedup, heat, stamp the hits (decode)           runs the policy's host step (sources, RAM side,
-  decide every miss (admit / transient),           demotions, RAM admission, refills)
-  retire victims                                 appends the call's copy commands to the plan ring:
-  point the layer's tables at the slots            promotions (RAM -> VRAM, slab -> VRAM after an
-  publish the call's record                        SSD read), rescues (a retiring VRAM slot ->
-fetch kernel (cooperative, half the SMs + 1):      VRAM), demotions (VRAM -> RAM), then END
-  all hits: returns at once                      polls the completion flags; a demoted slot goes
-  else runs the call's commands with the SMs  <--  back through the return ring once its copy is done
-    until END
+  decide every miss (admit / transient),           demotions, RAM admission, refills), submits the
+  retire victims                                   record's SSD reads together
+  point the layer's tables at the slots          appends the call's copy commands to the plan ring:
+  publish the call's record                        promotions (RAM -> VRAM, slab -> VRAM after an
+fetch kernel (cooperative, half the SMs + 1):      SSD read), rescues (a retiring VRAM slot ->
+  all hits: returns at once                        VRAM), demotions (VRAM -> RAM), then END
+  else runs the call's commands with the SMs  <--  polls the completion flags; a demoted slot goes
+    until END                                      back through the return ring once its copy is done
 the unchanged MoE kernels
 ```
 
@@ -791,12 +870,14 @@ the unchanged MoE kernels
   copies the stream is waiting for. (A first version issued the copies with `cudaMemcpyAsync` from
   the tier thread and deadlocked exactly there: the caller's `.tolist()` waited for the stream while
   holding a driver lock the tier thread's next copy needed.) The copy engines serve the cold fill,
-  before the tier thread starts.
+  before the tier thread starts, and the layer-mode prefill, from the caller's thread.
 - The SMs copy as fast as the copy engines here: on the AI VM (RTX PRO 6000) 13.3 MB from
   page-locked memory to VRAM at 50-52 GB/s with 94 CTAs of 256 threads (the copy engines: 52.7),
-  VRAM to page-locked memory at 30-37 GB/s (the copy engines: 55). Host memory is read uncached
-  (`ld.global.cv`): a RAM slot the host rewrote is never served stale. Sources at odd offsets (the
-  extent layout of an SSD fill) are read as aligned words and shifted.
+  VRAM to page-locked memory at 30-37 GB/s (the copy engines: 55). Each thread keeps four 16-byte
+  loads in flight. Host memory is read uncached (`ld.global.cv`): a RAM slot the host rewrote is
+  never served stale. A source at an odd offset (the extent layout of an SSD fill) is read as
+  aligned words, each once, through shared memory, and every output word is assembled from two
+  neighbours: every source byte crosses the link once, as for an aligned source.
 - An all-hit call's fetch returns at once: the decode path has **no host synchronization**, and a
   call with misses waits on the GPU for its own copies only.
 - The lookup decides exactly what the policy core decides (`VramDirectory::lookup`): the same
@@ -808,18 +889,15 @@ the unchanged MoE kernels
   projection, and a demotion into its RAM slot that waited for the last one alone could overwrite
   the slot while the first two still read it). A victim is only ever an expert the call does not use; a pool slot is only reused
   after its demotion is done; a copy for call `n` runs in `n`'s fetch, after every earlier kernel
-  on the stream, so nothing a kernel may still read is overwritten.
-- Calls up to `EXL3_MOE_TIER_DECODE_ROWS` rows (8) are **decode** calls (stamps, admission); larger
-  calls are **routed**: hits keep their slots, misses are staged as transients for the call, no
-  stamps, no admission, no demotion. This build runs every prefill call in routed mode (the
-  whole-layer double-buffered prefill of `EXL3_MOE_TIER_PREFILL_ROWS` is not in it yet): the
-  misses of a layer are copied before its MoE computes, without overlap. One staging area of
-  `max(E - hot)` slots is allocated (9.49 GiB is what `EXL3_MOE_TIER_STAGING=double` will reserve;
-  the sizing uses one half until the whole-layer prefill lands).
-- **Hot pins** (`hot=<k>` or `hot=<p>%` on `cache` layers): the first `k` experts of each layer are
-  placed in pin slots after the pool at load and are hits forever (never victims, never in the RAM
-  tier). Choosing them by heat between generations is not in this build.
+  on the stream, so nothing a kernel may still read is overwritten. Command tokens and completion
+  flags are 64-bit (a command index never wraps).
+- **Hot pins** (`hot=<k>` or `hot=<p>%` on `cache` layers): `k` experts of each layer (the first
+  `k`, or the `k` a profile ranks highest) are placed in pin slots after the pool at load and are
+  hits forever (never victims, never in the RAM tier).
 - **Heat** advances one decode token per decode call of the GPU's first cache layer.
+- The host side (policy state, RAM tier, statistics) is read and changed under one lock: by the
+  tier thread while it handles a record or returns slots, by the caller's thread while it plans a
+  layer-mode prefill, and by whoever reads statistics.
 
 **Memory** (per GPU with `cache` layers):
 
@@ -827,214 +905,63 @@ the unchanged MoE kernels
 |---|---|---|
 | pool | `S` slots of the compact VRAM slot (256-byte aligned), in allocations of at most 4 GiB, allocated by torch at the end of the layer split (still under the `-gs` fraction) | 13,271,040 B per slot |
 | pin slots | `hot` per layer, after the pool | |
-| staging | `max over cache layers of (E - hot)` slots | 384 slots, 4.75 GiB |
+| staging | two halves (`EXL3_MOE_TIER_STAGING=double`) or one (`single`) of `max over cache layers of (E - hot)` slots | 384 slots per half, 4.75 GiB |
 | sentinel | one slot, zeroed | 12.7 MiB |
 | directory | slot state, key, stamp, address; per key slot, heat; free bitmap; counters (`cudaMalloc`) | ~0.3 MB at S = 6,000 |
-| control page | mapped pinned host memory: flags, the return ring (a power of two above `S + pins`), the record ring (4 MiB), the plan ring (65,536 commands of 32 bytes) and its completion flags | 6.3 MiB |
-| fetch state | the plan's device mirror, completion flags and counters (`cudaMalloc`) | 3.1 MiB |
+| control page | mapped pinned host memory: flags, the return ring (a power of two above `S + pins`), the record ring (4 MiB), the plan ring (65,536 commands of 40 bytes) and its completion flags | 7.1 MiB |
+| fetch state | the plan's device mirror, completion flags and counters (`cudaMalloc`) | 3.9 MiB |
+| layer-mode tables | pinned host memory: every cache layer's three pointer tables | 9 KiB per layer |
 
 The RAM tier's chunks are page-locked and mapped (`cudaHostRegister`, portable and mapped: the fetch
-kernel reads and writes them at their host addresses) once the cold fill has filled them; the disk
-slab is page-locked at creation, and released after the cold fill when `disk experts=off` (nothing
-reads the SSD afterwards).
+kernel reads and writes them at their host addresses; the copy engines read them) once the cold fill
+has filled them; the disk slab is page-locked at creation, and released after the cold fill when
+`disk experts=off` (nothing reads the SSD afterwards).
 
 **Load.** At the end of the layer split, per GPU with `cache` layers: its room (what is left inside
 the `-gs` budget and physically, after the placed modules, the Cache, the largest transient and
 `EXL3_AUTOSPLIT_MARGIN_MB`; minus the pin slots), its host link (a 64 MiB page-locked copy; the
 `EXL3_MOE_TIER_MIN_LINK_GBS` refusal), then `size_tiers` with those rooms (the sizing summary is
-printed), the extents of every expert of its cache layers (`build_for_modules`), the native runtime,
-the cold fill, and the tier thread. With cache layers on several GPUs the component's RAM tier is
-split between them by what each pool does not hold. The load prints:
+printed), the extents of every expert of its cache layers (`build_for_modules`, from the model's
+shards or a checked copy), the native runtime, the seed (hot pins, cold-fill order and heat), the
+cold fill, and the tier thread. With cache layers on several GPUs the component's RAM tier is split
+between them by what each pool does not hold. The load prints:
 
 ```
- -- expert cache cuda:<n>: cold fill of <pool + pins> VRAM and <R> RAM experts, <bytes> read in <t> s; <bytes> of RAM page-locked in <t> s
-```
-
-**Modes.** Production (default): an all-hit call's fetch returns at once, the thread returns demoted
-slots when their copy is done, and a slot returned late only makes an admission use a transient
-(counted as *starved*). `EXL3_MOE_TIER_DETERMINISTIC=1`: every call's fetch waits until the thread
-has applied its record, run its copies and returned its slots, so the directory is exactly the
-policy core's after every call (the tests; a debugging aid). Logits never depend on the mode.
-`EXL3_MOE_TIER_VERIFY=1` synchronizes after every call and checks that the device directory equals
-the mirror. The tier thread spins while calls keep coming (`EXL3_MOE_TIER_SPIN_US=-1`: until 2 ms
-after the last call; `0`: never, a sleeping thread is woken by the next call; `N`: N us) and runs
-on `EXL3_MOE_TIER_AFFINITY` when set.
-
-**Failures.** A read that fails twice (disk engine, then `pread`), a policy error or a lookup error (an
-expert id outside the layer, more transients than staging slots) puts the tier in an error state: the
-fetch kernels stop waiting (the abort flag), and the next call raises `RuntimeError` with the
-message. At most the token in flight is affected. A fetch that waits a minute without a command
-gives up the same way (`kErrPlan`).
-
-**Statistics** (`TierHost.stats()`): `ssd_reads`, `ssd_bytes`, `pread_fallbacks`, `h2d` / `d2h` /
-`d2d` (copies, a three-piece promotion counts once) and their bytes, `staged`, `prefetch_issued`,
-`prefetch_used`, `prefetch_starved`, `prefetch_dropped`, `refill_reads`, `hazard_waits` (a write
-waited for a reader or writer of its slot), `slab_waits`, `cold_ram`, `cold_vram`, `cold_bytes`,
-`cold_ns`, `arena_ns` (mapping, faulting in and registering the tier), and the policy's counters (`policy_hits`, `policy_admits`, ... as in "Policies").
-
-**Python.**
-
-```python
-from exllamav3.model.expert_extents import build_extent_index
-from exllamav3.model.expert_tier_policy import PolicyConfig, round_robin_order, DECODE, ROUTED
-from exllamav3.model.expert_tier_host import TierHost
-
-index = build_extent_index(stc, keys)             # keys[lc * E + e] = (gate, up, down) projection keys
-tier = TierHost(index, layers = L, experts = E, policy = PolicyConfig(spare = 8), pool_slots = S,
-                ram_slots = R, slab_slots = 8)
-tier.cold_fill()                                  # round robin across layers
-tier.tick()                                       # one decode pass
-entries = tier.call(lc, ids)                      # [(key, kind, dst, cnt, heat, vkey, vslot, ...)]
-tier.prefetch(lc + 1); tier.promote(lc + 1)       # layer-mode read-ahead, then its layer is next
-tier.layer(lc + 1, ids, half = 1)                 # stage the layer into staging half 1
-tier.stats(); tier.state(); tier.arena()
-# or from a load's placement and sizing: TierHost.from_placement(stc, cache_modules, placement,
-#     "cuda:1", tier_config, pool_slots = S, ram_slots = R)
-```
-
-`call()` runs the policy's own lookup (the CPU replay of a routing trace); `process(record)` takes a
-record decided elsewhere (the GPU lookup kernel's) and applies it to the host's mirror of the
-directory before the same host step.
-
-**Checked in the tests** (`tests/test_expert_tier_ram_.py`, `tests/expert_tier/tier_host_test.cpp`):
-after every call of scripted and random traces over every policy x demote x admit x evict, with the
-disk on and off, `spare=0`, deferred returns and asynchronous refills, the host's records, actions
-and state equal the reference policy's, and every pool slot, retiring slot, RAM tier slot and
-staging slot holds exactly the checkpoint bytes of the expert the policy says it holds; the cold
-fill with every engine backend; the read-ahead; refills; every engine read failing (the `pread`
-fallback serves them); a shard cut short (the error names the expert); the arena's chunks and
-registrations; the real V4.1 shards. The C++ driver runs under AddressSanitizer,
-UndefinedBehaviorSanitizer and ThreadSanitizer.
-
-### The VRAM cache: lookup, copies and the tier thread
-
-A `cache` layer is a resident layer in every respect but one: its routed experts' trellis tensors
-are not loaded with it. Its expert `Linear`s get their EXL3 inner at load with `suh`, `svh`, `mcg` /
-`mul1` and `bias` resident (about 44.5 KB per V4.1 expert) and a trellis that is a view of one
-zeroed *sentinel* slot per GPU (`modules/block_sparse_mlp_tier.py`), so the layer builds its
-`MultiLinear` pointer tables, bound classes and fused buffers exactly as a resident layer does. The
-tier then owns one thing of the layer: its per-expert trellis pointer tables (gate, up, down), which
-every quantized MoE path reads on the device (the fused decode kernels, the fused MoE kernel, the
-batched reconstruct tier). The per-expert dequant path (an expert with more rows than the batched
-tier takes, 455 for V4.1) gets the trellis tensors where the tables point
-(`BC_BlockSparseMLP.run_single_expert_dq_views`, same kernels and arguments as
-`run_single_expert_dq`). The graph and torch per-expert paths read an expert's own trellis tensor:
-a `cache` layer must be one the fused MoE kernel covers (refused at load otherwise) and raises should
-one of those paths be reached anyway.
-
-**One MoE call** (`BlockSparseMLP.forward`, right after routing), two kernels on the compute stream:
-
-```
-compute stream                                   tier thread (native, one per GPU, no CUDA calls)
---------------------------------------------     -------------------------------------------------
-lookup kernel (1 CTA of 1,024 threads):          reads the record from the ring in mapped memory
-  harvest the slots the host returned            applies it to its mirror of the directory
-  dedup, heat, stamp the hits (decode)           runs the policy's host step (sources, RAM side,
-  decide every miss (admit / transient),           demotions, RAM admission, refills)
-  retire victims                                 appends the call's copy commands to the plan ring:
-  point the layer's tables at the slots            promotions (RAM -> VRAM, slab -> VRAM after an
-  publish the call's record                        SSD read), rescues (a retiring VRAM slot ->
-fetch kernel (cooperative, half the SMs + 1):      VRAM), demotions (VRAM -> RAM), then END
-  all hits: returns at once                      polls the completion flags; a demoted slot goes
-  else runs the call's commands with the SMs  <--  back through the return ring once its copy is done
-    until END
-the unchanged MoE kernels
-```
-
-- The tier thread **never calls the CUDA API** once the model runs: records, commands, completion
-  flags and returned slots are plain loads and stores on mapped memory. This is what makes the
-  design safe next to any other code in the process: a thread that holds the driver's locks in a
-  synchronous call (a pageable copy such as `.tolist()` waiting for the stream) cannot hold up the
-  copies the stream is waiting for. (A first version issued the copies with `cudaMemcpyAsync` from
-  the tier thread and deadlocked exactly there: the caller's `.tolist()` waited for the stream while
-  holding a driver lock the tier thread's next copy needed.) The copy engines serve the cold fill,
-  before the tier thread starts.
-- The SMs copy as fast as the copy engines here: on the AI VM (RTX PRO 6000) 13.3 MB from
-  page-locked memory to VRAM at 50-52 GB/s with 94 CTAs of 256 threads (the copy engines: 52.7),
-  VRAM to page-locked memory at 30-37 GB/s (the copy engines: 55). Host memory is read uncached
-  (`ld.global.cv`): a RAM slot the host rewrote is never served stale. Sources at odd offsets (the
-  extent layout of an SSD fill) are read as aligned words and shifted.
-- An all-hit call's fetch returns at once: the decode path has **no host synchronization**, and a
-  call with misses waits on the GPU for its own copies only.
-- The lookup decides exactly what the policy core decides (`VramDirectory::lookup`): the same
-  records for the same calls. The tier thread's mirror applies those records; it never re-decides.
-- Commands run in order per worker CTA; a command that must wait for another (a demotion into the
-  RAM slot a promotion of the same call reads, the in-place replacement of `spare=0`) names it and
-  waits for it. A victim is only ever an expert the call does not use; a pool slot is only reused
-  after its demotion is done; a copy for call `n` runs in `n`'s fetch, after every earlier kernel
-  on the stream, so nothing a kernel may still read is overwritten.
-- Calls up to `EXL3_MOE_TIER_DECODE_ROWS` rows (8) are **decode** calls (stamps, admission); larger
-  calls are **routed**: hits keep their slots, misses are staged as transients for the call, no
-  stamps, no admission, no demotion. This build runs every prefill call in routed mode (the
-  whole-layer double-buffered prefill of `EXL3_MOE_TIER_PREFILL_ROWS` is not in it yet): the
-  misses of a layer are copied before its MoE computes, without overlap. One staging area of
-  `max(E - hot)` slots is allocated (9.49 GiB is what `EXL3_MOE_TIER_STAGING=double` will reserve;
-  the sizing uses one half until the whole-layer prefill lands).
-- **Hot pins** (`hot=<k>` or `hot=<p>%` on `cache` layers): the first `k` experts of each layer are
-  placed in pin slots after the pool at load and are hits forever (never victims, never in the RAM
-  tier). Choosing them by heat between generations is not in this build.
-- **Heat** advances one decode token per decode call of the GPU's first cache layer.
-
-**Memory** (per GPU with `cache` layers):
-
-| Part | Where | V4.1 3.0 bpw |
-|---|---|---|
-| pool | `S` slots of the compact VRAM slot (256-byte aligned), in allocations of at most 4 GiB, allocated by torch at the end of the layer split (still under the `-gs` fraction) | 13,271,040 B per slot |
-| pin slots | `hot` per layer, after the pool | |
-| staging | `max over cache layers of (E - hot)` slots | 384 slots, 4.75 GiB |
-| sentinel | one slot, zeroed | 12.7 MiB |
-| directory | slot state, key, stamp, address; per key slot, heat; free bitmap; counters (`cudaMalloc`) | ~0.3 MB at S = 6,000 |
-| control page | mapped pinned host memory: flags, the return ring (a power of two above `S + pins`), the record ring (4 MiB), the plan ring (65,536 commands of 32 bytes) and its completion flags | 6.3 MiB |
-| fetch state | the plan's device mirror, completion flags and counters (`cudaMalloc`) | 3.1 MiB |
-
-The RAM tier's chunks are page-locked and mapped (`cudaHostRegister`, portable and mapped: the fetch
-kernel reads and writes them at their host addresses) once the cold fill has filled them; the disk
-slab is page-locked at creation, and released after the cold fill when `disk experts=off` (nothing
-reads the SSD afterwards).
-
-**Load.** At the end of the layer split, per GPU with `cache` layers: its room (what is left inside
-the `-gs` budget and physically, after the placed modules, the Cache, the largest transient and
-`EXL3_AUTOSPLIT_MARGIN_MB`; minus the pin slots), its host link (a 64 MiB page-locked copy; the
-`EXL3_MOE_TIER_MIN_LINK_GBS` refusal), then `size_tiers` with those rooms (the sizing summary is
-printed), the extents of every expert of its cache layers (`build_for_modules`), the native runtime,
-the cold fill, and the tier thread. With cache layers on several GPUs the component's RAM tier is
-split between them by what each pool does not hold. The load prints:
-
-```
- -- expert cache cuda:<n>: cold fill of <pool + pins> VRAM and <R> RAM experts, <bytes> read in <t> s; <bytes> of RAM page-locked in <t> s
+ -- expert cache cuda:<n>: cold fill of <pool + pins> VRAM and <R> RAM experts, <bytes> read in <t> s; <bytes> of RAM page-locked in <t> s; seeded from <source>
 ```
 
 **Modes.** Production (default): an all-hit call's fetch returns at once, the thread returns demoted
 slots when their copy is done, and a slot returned late only makes an admission use a transient
-(counted as *starved*). `EXL3_MOE_TIER_DETERMINISTIC=1`: every call's fetch waits until the thread
-has applied its record, run its copies and returned its slots, so the directory is exactly the
-policy core's after every call (the tests; a debugging aid). Logits never depend on the mode.
-`EXL3_MOE_TIER_VERIFY=1` synchronizes after every call and checks that the device directory equals
-the mirror. The tier thread spins while calls keep coming (`EXL3_MOE_TIER_SPIN_US=-1`: until 2 ms
-after the last call; `0`: never, a sleeping thread is woken by the next call; `N`: N us) and runs
-on `EXL3_MOE_TIER_AFFINITY` when set.
+(counted as *starved*). `EXL3_MOE_TIER_DETERMINISTIC=1`: every decode and routed call's fetch waits
+until the thread has applied its record, run its copies and returned its slots, so the directory is
+exactly the policy core's after every call (the tests; a debugging aid). Logits never depend on the
+mode. `EXL3_MOE_TIER_VERIFY=1` synchronizes after every call and checks that the device directory
+equals the mirror. The tier thread spins while calls keep coming (`EXL3_MOE_TIER_SPIN_US=-1`: until
+2 ms after the last call; `0`: never, a sleeping thread is woken by the next call; `N`: N us) and runs
+on `EXL3_MOE_TIER_AFFINITY` when set. `EXL3_MOE_TIER_TRACE=<path>` writes every record the thread
+handles to a file: a header line (`{"format": "exl3-tier-trace", "version": 1, "device", "layers",
+"experts", "slots", "pins", "ram_slots", "spare"}`), then one JSON line per call (`{"seq", "lc",
+"mode", "tokens", "e": [[key, kind, count, dst, victim key, victim slot], ...]}`; kind 0 hit, 1
+admitted, 2 transient or staged; mode 0 decode, 1 routed, 2 layer), with `.cuda<n>` appended to the
+path per GPU when several hold cache layers. A trace replays through the policy cores (each call's
+experts, each repeated `count` times in the listed order, give the same record).
 
-**Failures.** A read that fails twice (disk engine, then `pread`), an unexpected CUDA error or a
-lookup error (an expert id outside the layer, more transients than staging slots) puts the tier in
-an error state: the waiting stream is released, and the next call raises `RuntimeError` with the
-message. At most the token in flight is affected.
+**Failures.** A read that fails twice (disk engine, then `pread`), a policy error or a lookup error
+(an expert id outside the layer, more transients than staging slots) puts the tier in an error
+state: the fetch kernels stop waiting (the abort flag), and the next call raises `RuntimeError` with
+the message. At most the token in flight is affected. A fetch that waits a minute without a command
+gives up the same way.
 
 **Statistics** (`TierDevice.stats()`, `ExpertTierSet.stats()`): `records`, `host_records` (calls
-with misses), `returns`, `max_lag` (records waiting when the thread picked one up), `idle_sleeps`,
-`work_ns`, `overflow` (all-hit records dropped on a full ring: heat and stamps of the mirror only),
-`device_error`, the fetch kernel's copy counts and bytes (`h2d_*`, `d2h_*`, `d2d_*`), `plan_commands`,
-`plan_full_waits`, `plan_deps_done` (dependencies already met when a command was written), the load's
-(`cold_h2d_bytes`, `pinned_bytes`, `pin_ns`, `compacted`, `compact_ns`), the
-RAM tier host's (`ssd_reads`, `cold_*`, ...) and the policy's (`policy_hits`, `policy_admits`,
-`policy_d2h`, ...).
-
-**Measured on the AI VM** (RTX PRO 6000, sm_120):
-
-| | |
-|---|---|
-| one lookup at the V4.1 shape (28 layers x 384, 6,000 slots), production mode, event to event | median 9.4-11 us for 0, 1, 6 and 48 misses (p99 26-35 us) |
-| a V4.1 decode call with one expert promoted from RAM (lookup to ready, swap demotions running) | median 403 us; 478 us per expert with six |
-| cold fill of two V4.1 layers (432 experts) | 5.65 GB in 0.71 s; 5.06 GiB page-locked in 0.22 s |
+with misses), `returns`, `predictions`, `max_lag` (records waiting when the thread picked one up),
+`idle_sleeps`, `work_ns`, `overflow` (all-hit records dropped on a full ring: heat and stamps of the
+mirror only), `device_error`, the fetch kernel's copy counts and bytes (`h2d_*`, `d2h_*`, `d2d_*`),
+`plan_commands`, `plan_full_waits`, `plan_deps_done` (dependencies already met when a command was
+written), the layer mode's (`layer_plans`, `layer_calls`, `layer_catch_ups`, `layer_h2d_bytes`,
+`layer_h2d_copies`, `layer_batches`), the load's (`cold_h2d_bytes`, `pinned_bytes`, `pin_ns`,
+`compacted`, `compact_ns`), the RAM tier host's (`ssd_reads`, `ssd_bytes`, `presubmitted`,
+`prefetch_*`, `predicted_reads`, `slab_to_vram`, `cold_*`, ...) and the policy's (`policy_hits`,
+`policy_admits`, `policy_d2h`, ...).
 
 **Checked in the tests** (GPU; on the AI VM through `/root/rnd/gpu_window.sh`):
 `tests/expert_tier/tier_kernel_gpu_.py` (the kernel's records, the mirror state and the device
@@ -1048,7 +975,126 @@ staging and RAM slot byte-checked against the checkpoint after every call, over 
 memory operations and with the fallback kernels, byte checks after a drain, and the data path of
 1,500 calls checked as the MoE kernels would read it; the V4.1 promotion cost);
 `tests/expert_tier/tier_bitwise_gpu_.py` (real V4.1 layers resident and cached give bit-identical
-outputs, see below).
+outputs for decode, routed and layer-mode calls under every policy, over RAM and over the SSD, with
+the read-ahead, in production mode through thousands of calls); `tests/expert_tier/tier_model_gpu_.py`
+(the whole model: the same logits with a layer's experts resident, streamed and cached, under the
+stable arithmetic profile).
+
+### Prefill: layer mode
+
+A prefill chunk of a few thousand rows uses nearly every expert of every layer, so a call from
+`EXL3_MOE_TIER_PREFILL_ROWS` (256) rows stages the whole layer instead of its misses: every cached
+expert the pool does not hold, from RAM or read from the SSD through the slab, into a staging half,
+on the **copy engines**, one layer ahead, while the previous layer computes. Nothing is admitted,
+stamped or demoted: decode-hot contents survive any prompt. The caller's thread (the Python thread
+that runs the forward, or the V4.1 pipeline's second-stage thread) drives it; the tier thread keeps
+its role (the record: heat and refills) and still never calls CUDA.
+
+```
+caller's thread (compute stream C, copy stream K)        GPU
+-----------------------------------------------------     -----------------------------------------
+layer L's call (resolve):                                 K: copies of L's staging (planned earlier)
+  first layer of the pass: layer_begin, layer_plan(L)
+  layer_run(L): C waits for L's copies; L's tables        C: waits, uploads L's tables (9 KiB),
+    uploaded; heat record (lookup kernel, mode 2)             heat record, L's MoE
+  L's MoE enqueued
+after L's compute (after_compute):
+  layer_after(L): C records "half(L) consumed"            K: waits "half(L+1) consumed" (by L-1),
+  layer_plan(L+1): into the other half, K waits for           then L+1's copies, then a completion
+    L-1's compute, then L+1's copies; tables built            flag
+```
+
+- **Planning** (`TierGpu::layer_plan`, native, GIL released): under the host lock, the policy's
+  `layer_plan` lists every expert of the layer the pool does not hold, in expert order; the host
+  submits their SSD reads together (into slab slots, or found there read ahead), then issues the
+  copies on the copy stream: three per expert from an extent-layout RAM slot or a slab slot, one
+  from a compact RAM slot, in the order the staging index gives. The layer's pointer tables are
+  built on the host (VRAM-held experts at their pool or pin slot, the others at their staging slot)
+  into pinned memory the compute stream uploads right before the layer. An SSD read the plan needs
+  and that is still reading makes the caller wait (the GPU still has the previous layer queued);
+  the read-ahead (`prefetch=layer:D`, next section) starts those reads `D` layers earlier.
+- **Double buffering** (`EXL3_MOE_TIER_STAGING=double`, default): layer `L+1` is copied into the
+  half layer `L-1` used, as soon as `L-1`'s compute is done, so the copies overlap `L`'s compute
+  (and whatever runs between two cache layers, e.g. layers on another GPU). `single`: one half; the
+  copies of `L+1` wait for `L`'s compute; half the staging memory, no overlap.
+- **Transitions.** A layer-mode pass after decode or routed calls first waits until the GPU ran
+  them and the tier thread applied their records (the plan reads the directory as of them:
+  `layer_catch_ups` counts these waits); consecutive prefill chunks need none. The copy stream
+  starts after everything enqueued on the compute stream before the pass; a decode or routed call
+  after a pass waits for the copy stream's last batch (a pass may end before its last planned layer
+  ran). A layer's pinned table is reused only after its previous upload landed. One thread drives a
+  pass: a cache layer called from another thread in the middle of a pass is refused
+  (`RuntimeError`), and the next layer-mode call begins a new pass.
+- **Copy completion without the CUDA API on the tier thread**: every plan's copies end with a
+  one-thread kernel on the copy stream that writes a completion flag in the control page; a RAM or
+  slab slot a staging copy reads keeps that batch's token, and whoever must write the slot (a
+  refill, a demotion, another read) waits for the flag with plain loads.
+- **The record** of a layer-mode call (the lookup kernel in mode 2: dedup, heat, no stamps, no table
+  writes) reaches the tier thread like any other: heat, and refills of the used experts only the
+  disk holds. The policy decisions are those of the CPU replay's layer call, split in two
+  (tested).
+- **DQ views.** An expert above the batched reconstruct tier's row cap (455 rows for V4.1) takes the
+  per-expert dequant path with the addresses the plan chose (host-known, no device read).
+
+### Read-ahead: `prefetch=`
+
+`prefetch=` (on `experts=cache` layer rules) says what the tier reads from the disk ahead of the
+call that needs it; transfer only, it never changes routing or what the cache holds:
+
+| Value | What is read ahead |
+|---|---|
+| `auto` (default) | `layer:1` when the disk holds experts (`disk experts=` not `off`), else nothing |
+| `layer[:D]` | layer-mode prefill: planning cache layer `L` also reads the disk-only experts of the layers up to `L + D` (a layer's own depth: it is read `D` layers ahead of its call) into free slab slots, class 2 with a deadline of their expected start (the time between two plans), promoted to class 1 when their layer is planned; unused ones are dropped then. `D` defaults to 1 |
+| `router[:D]` | decode: each decode call of cache layer `L` applies the router of cache layer `L + D` (the same GPU) to `L`'s router input and reads the picks that neither VRAM nor RAM holds from the disk into the slab (class 2, deadline 1 ms); when `L + D`'s call misses one of them, its copy comes from the slab (its RAM slot, if the policy gives it one, is filled by a background read). DeepSeek's sqrt-softplus router runs its own selection kernel into private buffers (the picks `L + D` would make for that input); other routers select on the gate logits plus the selection bias. `D` defaults to 1 |
+| `layer:D+router:D2` | both |
+| `off` | nothing |
+
+With `disk experts=off` nothing is read from the disk: an explicit `prefetch=layer` or `router` is
+refused there (`auto` means nothing). The slab (`EXL3_MOE_TIER_DISK_SLAB=auto`) is sized for the
+deepest read-ahead; a read-ahead that finds no free slot is dropped (`prefetch_starved`), a demand
+read takes the slot of the read-ahead farthest ahead (`prefetch_dropped`). Counters: layer mode
+`prefetch_issued`, `prefetch_used`, `prefetch_dropped`, `prefetch_starved`; router `predictions`
+(records), `predicted_reads`, `slab_to_vram`.
+
+### Profiles and the heat file
+
+A profile is how often each routed expert of each MoE layer was selected on some workload, measured
+ahead of time and shipped as a file (`model/moe_profile.py`). `profile=<spec>` on a layer rule names
+one or several, with weights (`profile=code`, `profile=code:3,chat:1`, `profile="/data/p/x.exl3moe"`);
+counts are normalized per layer before the weighting. Files are found by name in
+`<model dir>/moe_profiles/`, then each directory of `EXL3_MOE_PROFILE_DIR` (`os.pathsep`-separated),
+then `~/.cache/exllamav3/moe_profiles/`, with the extensions `.exl3moe`, `.safetensors`, `.npz`,
+`.json` in that order (a path is taken as it is):
+
+| Format | Contents |
+|---|---|
+| `.exl3moe`, `.safetensors` | tensors `counts` `[layers, experts]` (any number type) and/or `ranking` `[layers, experts]` (expert ids, most selected first); metadata `layer_keys` (JSON list of the MoE modules' keys) and `fingerprint` (JSON) |
+| `.npz` | `counts_decode` (preferred), `counts` or `counts_prefill`: `[layers, experts]`, or `[prompts, layers, experts]` summed; layer keys and fingerprint from a `<name>.meta.json` sidecar when there is one |
+| `.json` | `{"<layer key>": [count per expert], ...}` |
+
+Rows are matched to layers by key when the file names them, else by MoE-layer ordinal (the n-th MoE
+layer of the model). A profile whose fingerprint names another model (architecture, layer count,
+experts per layer, hidden or expert width) is refused; one of another quantization of the same
+model is used (a seed, not a placement). What it seeds:
+
+- **`experts=cache`**: the hot pins (`hot=<k>` pins the layer's `k` most selected experts, not its
+  first `k`); the cold-fill order (every expert by its share of its layer's selections, highest
+  first, across the GPU's cache layers; layers the profile lacks after, in the round robin); and the
+  heat (each expert at the decayed count its share would reach in steady decode: share x top-k x
+  `EXL3_MOE_HEAT_HALFLIFE` / ln 2). It seeds; it never freezes: from the first call the policies move
+  experts by the live heat, which takes over within a few half-lives.
+- **`stream` / `cpu` with `hot=`, `split`**: which experts stay resident in VRAM (the hottest `E - k`)
+  and which go to system RAM, through the split's expert permutation; the dynamic placement sweeps
+  (`EXL3_MOE_CPU_SWAP`) keep moving them by live traffic. A profile takes precedence over
+  `EXL3_MOE_CPU_SPLIT_STATS` for its layers.
+
+**The heat file.** `EXL3_MOE_HEAT_FILE=<path>`: the tier's heat (each expert's decayed routing
+count) is written there at unload and between generations (the generator's queue drained, at most
+once a minute), atomically (a temporary file renamed), in the `.exl3moe` format (`counts` in
+decode-assignment units, `layer_keys` the cache layers' keys, `fingerprint`, `format`). A later load
+whose placement names no profile reads it back as the seed: the same order and hot pins as a
+profile, and the heat exactly as saved. A missing file is simply no seed; an unreadable one, or one
+whose fingerprint names another model, is reported and ignored.
 
 ### The three test layouts (DeepSeek-V4.1-Flash 3.0 bpw on the AI VM)
 
@@ -1072,7 +1118,7 @@ layers only, as in (c).
 | `disk experts=off`, tiers too small | `placement: disk experts=off needs every cached expert in VRAM or RAM, but 1628 of 10752 fit in neither (6545 VRAM slots besides the spare ones, 2579 RAM slots); raise ram experts= by 20.2 GiB or allow disk reads` |
 | budgets above the host memory | `placement: ram experts=96.0 GiB + ngram=6.0 GiB + disk slab=102 MiB need 102.1 GiB of host memory, but 53.0 GiB is available and 2.0 GiB is kept free (EXL3_HOST_MEM_RESERVE_MB) (no swap: pinned and anonymous memory cannot be reclaimed); lower the budgets or use auto` (with the cgroup when it is the limit) |
 | cache below its minimum | `placement: cuda:0 cache=100MiB holds 7 expert slots; experts=cache needs at least top-k (6) + spare (8) = 14 slots (177 MiB), or cache=0` |
-| cache above the device's room | `placement: cuda:0 cache=90GiB does not fit: 80.0 GiB is free on cuda:0 after the placed modules, the cache and the margins (the prefill staging, 9.5 GiB with EXL3_MOE_TIER_STAGING=double, and EXL3_MOE_TIER_HEADROOM_MB=1024 are set aside first)` |
+| cache above the device's room | `placement: cuda:0 cache=90GiB does not fit: 80.0 GiB is free on cuda:0 after the placed modules, the cache and the margins (the prefill staging, 9.5 GiB with EXL3_MOE_TIER_STAGING=double, and EXL3_MOE_TIER_HEADROOM_MB=4096 are set aside first)` |
 | staging leaves too little | `placement: cuda:0 has 100 MiB left for the expert cache after the placed modules, the margins and the prefill staging (9.5 GiB, EXL3_MOE_TIER_STAGING=double); an expert cache needs at least top-k + spare = 14 slots (177 MiB); set EXL3_MOE_TIER_STAGING=single, raise -gs on cuda:0, or move layers` |
 | request above the flag | `placement asks ram experts=64GiB (64.0 GiB) but --expert_ram caps this component at 48GiB` |
 | static arenas above the request | `placement: the stream / cpu layers keep 47.6 GiB of routed experts in RAM, more than ram experts=40GiB; raise it or move layers to experts=cache` |
@@ -1083,6 +1129,14 @@ layers only, as in (c).
 | two expert shapes on one GPU | `placement: the experts=cache layers on cuda:1 have different expert shapes (...); one expert slot size per GPU is supported` |
 | a layer the tier cannot serve | `placement: <layer> cannot use experts=cache: it needs the fused MoE kernel (EXL3 mul1 codebook shared by gate, up and down; silu, silu_ref or gelu gated, or relu2 gateless; no per-expert biases; unpadded dims; at most 512 experts); use experts=vram, stream or cpu for this layer` |
 | not Linux | `placement: experts=cache needs the disk engine, which is Linux-only` |
+| `disk experts=` / `ngram=<dir>`: no such directory | `placement: disk experts=/nvme1/v41: no such directory` |
+| a shard missing from the copy | `placement: disk experts=/nvme1/v41: model-00007-of-00041.safetensors is not there (the copy must hold every shard the reads touch, under the model's file names)` |
+| a copy of another size | `placement: disk experts=/nvme1/v41: /nvme1/v41/model-00007-of-00041.safetensors is 4989123 bytes, the model's /models/v41/model-00007-of-00041.safetensors is 4989124; the copy must be the same file` |
+| a copy with another header | `placement: disk ngram=/mnt/e: the safetensors header of /mnt/e/model-00002-of-00041.safetensors differs from the model's /models/v41/model-00002-of-00041.safetensors; the copy must be the same file` |
+| `disk io=` next to the original gather pool | `placement: disk io=direct sets the page-cache mode of the disk engine's reads, but DeepSeek-V4.1's engram rows are read by the original gather pool (EXL3_DISK_BACKEND=original); unset EXL3_DISK_BACKEND or name a backend, or drop io=` |
+| a profile that is not there | `expert profile 'code' not found: looked in /models/v41/moe_profiles, /root/.cache/exllamav3/moe_profiles for code{.exl3moe,.safetensors,.npz,.json}` |
+| a profile of another model | `expert profile /data/p/code.exl3moe was built for another model (experts: profile 288, model 384)` (also: `... 288 experts per layer, the model's MoE layers have 384; it was built for another model`) |
+| a positional profile of another depth | `expert profile /data/p/code.npz names no layers and has 42 rows, the model has 40 MoE layers` |
 
 ### Tuning
 
@@ -1094,12 +1148,12 @@ did-you-mean hint) and prints the ones that differ from their default.
 | Variable | Default | Values |
 |---|---|---|
 | `EXL3_MOE_TIER_DEMOTE` | `1` | `0` drops every VRAM victim (master switch of `ram demote=`) |
-| `EXL3_MOE_TIER_STAGING` | `double` | `double`, `single` |
-| `EXL3_MOE_TIER_PREFILL_ROWS` | `256` | rows from which a call copies whole layers (2 .. 2^20, above the decode rows) |
+| `EXL3_MOE_TIER_STAGING` | `double` | `double` (layer mode overlaps the next layer's copies with this layer's compute), `single` (half the staging VRAM, no overlap) |
+| `EXL3_MOE_TIER_PREFILL_ROWS` | `256` | rows from which a call runs in layer mode (2 .. 2^20, above the decode rows; 1048576 keeps every prefill call routed) |
 | `EXL3_MOE_TIER_DECODE_ROWS` | `8` | rows up to which a call may admit (1 .. 8) |
 | `EXL3_MOE_HEAT_HALFLIFE` | `256` | decode tokens per halving of the heat |
 | `EXL3_MOE_HEAT_PREFILL` | `0.0625` | heat of a prefill assignment (0 .. 1) |
-| `EXL3_MOE_HEAT_FILE` | unset | path |
+| `EXL3_MOE_HEAT_FILE` | unset | path of the heat file (see "Profiles and the heat file") |
 | `EXL3_MOE_TIER_ADMIT_P` | unset | pins the adaptive probability (0 .. 1) |
 | `EXL3_MOE_TIER_ADAPT_EVERY` | `2048` | accesses per adaptation |
 | `EXL3_MOE_TIER_ADMIT_PMIN` | `0.05` | lower bound of the probability |
@@ -1107,18 +1161,51 @@ did-you-mean hint) and prints the ones that differ from their default.
 | `EXL3_MOE_TIER_RAM_ADMIT` | `always` | `always`, `heat` |
 | `EXL3_MOE_TIER_REFILL` | `1` | `0` turns refills off |
 | `EXL3_MOE_TIER_REFILL_INFLIGHT` | `2` | 1 .. 64 |
-| `EXL3_MOE_TIER_DISK_SLAB` | `auto` | slots, 1 .. 4096 |
+| `EXL3_MOE_TIER_DISK_SLAB` | `auto` | slots per cache GPU, 1 .. 4096 (`auto`: see "Sizing a tiered load") |
 | `EXL3_MOE_TIER_HUGEPAGE` | `0` | `1`: transparent huge pages for the RAM tier and the slab |
 | `EXL3_MOE_TIER_COMPACT` | `1` | `0` keeps the cold-filled RAM slots in the extent layout |
-| `EXL3_MOE_TIER_HEADROOM_MB` | `1024` | MiB |
+| `EXL3_MOE_TIER_HEADROOM_MB` | `4096` | MiB |
 | `EXL3_MOE_TIER_MIN_LINK_GBS` | `2.0` | GB/s; `0` allows any link |
 | `EXL3_MOE_TIER_SPIN_US` | `-1` | `-1` while a pass is active, `0` never, N us |
 | `EXL3_MOE_TIER_AFFINITY` | unset | CPU list |
 | `EXL3_MOE_TIER_DETERMINISTIC` | `0` | `1` applies every call before the next |
 | `EXL3_MOE_TIER_VERIFY` | `0` | `1` checks invariants after every call |
-| `EXL3_MOE_TIER_TRACE` | unset | path of the call-record trace |
+| `EXL3_MOE_TIER_TRACE` | unset | path of the call-record trace (JSON lines) |
+| `EXL3_MOE_PROFILE_DIR` | unset | directories searched for `profile=` names (`os.pathsep`-separated) |
 
 The policies themselves (`admit=`, `evict=`, `policy=`, `demote=`) are words of the placement, so
-one string says what a load does; the defaults (`admit=adaptive`, `evict=lru`,
-`policy=lazy-exclusive`, `demote=swap`, `ram evict=lfu`, `spare=8`) are those of the policy
-simulation until measurements on the target host replace them.
+one string says what a load does. The defaults are `admit=adaptive`, `evict=lru`, `policy=exclusive`,
+`demote=heat`, `ram evict=lfu` and `spare=8`: `admit=`, `evict=` and `spare=` those of the policy
+simulation, `policy=` and `demote=` the fastest of every combination measured on the test host
+(below; the simulation had chosen `lazy-exclusive` and `swap`).
+
+**The measurement** (DeepSeek-V4.1-Flash 3.0 bpw, the RTX PRO 6000 alone, `CUDA_VISIBLE_DEVICES=0`,
+cudaMallocAsync, a 64K-token Cache; one process per combination, loaded fresh; a 32,768-token prompt
+of the canonical ids, then 256 greedy tokens, twice on fresh generators, after an untimed prefill of
+the same prompt; the second run, warm, is the one below). Configuration (a): `*=cuda:0
+experts=cache; ram experts=102GiB`, the largest RAM tier within a 120 GB host budget (the pool
+held 5,889 experts, RAM 8,222, the SSD alone 1,249); (b): `ram experts=93GiB` (99.9 GB), 7,496 in
+RAM and 1,975 on the SSD alone. Every combination had the same decode hit rate (0.961 for (a), 0.962 for (b)): the
+policies differ in where the misses come from and in how much prefill reads from the SSD.
+
+| `policy=` / `demote=` | (a) decode tok/s | (a) prefill tok/s | (b) decode tok/s | (b) prefill tok/s | prefill SSD GB (a / b) | decode SSD MB/token (a / b) |
+|---|---|---|---|---|---|---|
+| `exclusive` / `heat` (default) | **43.5** | **1,393** | 39.5 | **1,308** | 142 / 224 | 0.3 / 1.0 |
+| `exclusive` / `all` | 42.7 | 1,395 | 39.3 | 1,299 | 142 / 224 | 0.2 / 0.8 |
+| `exclusive` / `swap` | 41.3 | 1,356 | 41.2 | 1,277 | 167 / 238 | 0.2 / 1.6 |
+| `exclusive` / `off` | 38.3 | 819 | 37.7 | 825 | 397 / 450 | 16.3 / 17.6 |
+| `lazy-exclusive` / `swap` | 42.3 | 1,302 | 39.7 | 1,277 | 168 / 239 | 0.2 / 1.5 |
+| `lazy-exclusive` / `heat` | 38.5 | 1,391 | 41.2 | 1,300 | 142 / 224 | 0.3 / 1.0 |
+| `lazy-exclusive` / `all` | 39.7 | 1,397 | 38.5 | 1,291 | 142 / 224 | 0.2 / 0.8 |
+| `lazy-exclusive` / `off` | 38.8 | 832 | 40.5 | 844 | 390 / 441 | 8.3 / 9.3 |
+| `inclusive` | refused (a) | | 35.9 | 444 | - / 874 | - / 43.5 |
+
+`exclusive` / `heat` has the best mean over (a) and (b) of both decode (41.5 tok/s) and prefill
+(1,351 tok/s). With one run per combination the decode differences of the first seven rows (38.5 to
+43.5 tok/s, at equal hit rates) are within the run-to-run spread; the prefill ones are not: `swap`
+stages about 25 GB (a) and 14 GB (b) more from the SSD per prompt than `heat` and `all`, `off` more
+than twice as much, and `inclusive`, whose RAM tier holds only copies of what VRAM holds besides the
+rest, reads the SSD for most of every prefill. (a) with `inclusive` was refused at load: its disk
+slab is larger (5.7 GiB) and the budgets no longer fit the 120 GB. On the same host the serving
+layout without the tier (`0-11=cuda:0; 12-22=cuda:1 experts=cpu; 23-39=cuda:1`, CMP + PRO, 1M Cache)
+decodes 23.2 tok/s and prefills 1,000 tok/s on the same prompt.

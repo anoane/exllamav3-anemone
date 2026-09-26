@@ -412,9 +412,11 @@ class LayerMode(Base):
         self.assertEqual(s["refill_reads"], h.counters()["refills"])
         self.verify(h)
 
-    def test_prefetch_not_needed_is_dropped(self):
-        """A prefetched expert that reaches RAM another way (a decode admission read straight into a
-        RAM slot) is not staged from the slab: its read-ahead is dropped at the layer call"""
+    def test_prefetch_serves_a_decode_miss(self):
+        """A read-ahead serves a decode miss of the same expert before its layer call: the admission's
+        copy comes from the slab, and the RAM slot the policy gives the expert is filled by a
+        background read; at the layer call the expert is staged from RAM, and the rest of the
+        read-ahead from the slab"""
         policy = cfg(spare = 2)
         h = self.host(policy, 8, 4, slab_slots = 16)
         h.cold_fill()                                   # layer 2: 32, 33 in the pool, 34 in RAM
@@ -422,13 +424,86 @@ class LayerMode(Base):
         issued = h.stats()["prefetch_issued"]
         self.assertEqual(issued, 13)
         h.call(2, [2], P.DECODE)                        # 34 promoted from RAM: its copy becomes a duplicate
-        h.call(2, [15], P.DECODE)                       # 47 read into RAM over that duplicate, not from the slab
+        h.call(2, [15], P.DECODE)                       # 47 admitted, its RAM slot over that duplicate
         self.assertTrue(any(a[:2] == ("ssd", 47) and a[2] >= 0 and a[3] == P.ADMIT for a in h.last_actions()),
                         h.last_actions())
+        s = h.stats()
+        self.assertEqual((s["slab_to_vram"], s["prefetch_used"]), (1, 1))
         h.layer(2, [1], 0)
         s = h.stats()
         self.assertEqual(s["prefetch_used"] + s["prefetch_dropped"], issued)
-        self.assertEqual(s["prefetch_dropped"], 1)
+        self.assertEqual(s["prefetch_dropped"], 0)
+        self.verify(h)
+
+    def test_split_layer_call(self):
+        """The GPU runtime runs a layer call in two halves: the staging before the layer runs (stage),
+        then the call's record (heat, refills) once its routing is known. Together they give the CPU
+        replay's layer call: the same actions in the same order, the same staging bytes, the same state"""
+        ck = self.ck
+        rng = random.Random(41)
+        for what, policy, S, R in (("ram", cfg(spare = 2), 12, 14), ("disk off", cfg(spare = 2, disk_off = True), 12,
+                                                                        ck.L * ck.E - 10),
+                                   ("inclusive", cfg(spare = 2, policy = "inclusive", demote = "off"), 10, 20)):
+            h1, h2 = self.host(policy, S, R, slab_slots = 20), self.host(policy, S, R, slab_slots = 20)
+            h1.cold_fill()
+            h2.cold_fill()
+            half = 0
+            for i, op in enumerate(zipf_trace(rng, ck.L, ck.E, 120, layer = 0.2)):
+                if op[0] == "tick":
+                    h1.tick(op[1])
+                    h2.tick(op[1])
+                    continue
+                if op[0] == "call":
+                    self.assertEqual(h1.call(op[1], op[2], op[3]), h2.call(op[1], op[2], op[3]))
+                    continue
+                half ^= 1
+                lc, ids = op[1], op[2]
+                h1.layer(lc, ids, half)
+                acts1 = h1.last_actions()
+                keys = h2.stage(lc, half)
+                acts2 = h2.last_actions()
+                self.assertEqual(keys, [a[1] for a in acts2], f"{what} op {i}")
+                seq = h1.state()["seq"]
+                order = []
+                for e in ids:
+                    if e not in order:
+                        order.append(e)
+                rec = (seq, lc, P.LAYER, [(lc * ck.E + e, P.TRANSIENT, -1, ids.count(e), 0, -1, -1, 0, 0, 0)
+                                          for e in order])
+                h2.process(rec)
+                self.assertEqual(acts2 + h2.last_actions(), acts1, f"{what} op {i}")
+                for a in acts2:
+                    self.assertEqual(tbytes(h2.staging(half, a[-1])), ck.expected[a[1]], f"{what} op {i}: {a}")
+                st1, st2 = h1.state(), h2.state()
+                for k in ("vram_key", "ram_key", "heat_v", "heat_ep", "seq"):
+                    self.assertEqual(st1[k], st2[k], f"{what} op {i}: {k}")
+            h1.drain()
+            h2.drain()
+            self.assertEqual(h1.counters(), h2.counters(), what)
+            self.verify(h2, where = what)
+
+    def test_router_read_ahead(self):
+        """prefetch=router's prediction records read the experts neither VRAM nor RAM holds into the
+        slab; a decode miss on one of them is served from there, its RAM slot filled in the background"""
+        ck = self.ck
+        policy = cfg(spare = 2)
+        h = self.host(policy, 8, 4, slab_slots = 16)
+        h.cold_fill()
+        st = h.state()
+        lc = 2
+        disk_only = [e for e in range(ck.E) if st["slot_of"][lc * ck.E + e] < 0 and st["ram_of"][lc * ck.E + e] < 0]
+        pred = disk_only[:3] + [e for e in range(ck.E) if e not in disk_only][:2]
+        rec = (0, lc, 3, [(lc * ck.E + e, P.TRANSIENT, -1, 1, 0, -1, -1, 0, 0, 0) for e in pred])
+        h.read_ahead(rec)
+        s = h.stats()
+        self.assertEqual(s["predicted_reads"], 3)
+        h.read_ahead(rec)                                   # already there: nothing more is read
+        self.assertEqual(h.stats()["predicted_reads"], 3)
+        reads = h.stats()["ssd_reads"]
+        h.call(lc, disk_only[:1] + disk_only[:1], P.DECODE)
+        s = h.stats()
+        self.assertEqual(s["prefetch_used"], 1)
+        self.assertEqual(s["ssd_reads"] - reads, s["slab_to_vram"])       # only a RAM slot's background fill
         self.verify(h)
 
     def test_refills(self):
@@ -513,12 +588,10 @@ class Placement(Base):
     def test_from_placement(self):
         """The placement's words and the tuning reach the host; the cache layers' experts are indexed"""
         from types import SimpleNamespace as NS
-        from unittest.mock import patch
         T = load("_etc_for_ram", ROOT / "exllamav3/model/expert_tier_config.py")
         PL = load("_placement_for_ram", ROOT / "exllamav3/model/placement.py")
-        with patch.dict(PL.storage.PENDING, {}, clear = True):
-            pl = PL.parse("*=cuda:0 experts=cache; cuda:0 spare=3 evict=lfu admit=heat; "
-                          "ram experts=1GiB policy=exclusive demote=heat")
+        pl = PL.parse("*=cuda:0 experts=cache; cuda:0 spare=3 evict=lfu admit=heat; "
+                      "ram experts=1GiB policy=exclusive demote=heat")
         ck = self.ck
 
         def module(l):
@@ -539,6 +612,56 @@ class Placement(Base):
         bad.placement_plan = lambda: ("cache", "gpu", 4)
         with self.assertRaisesRegex(ValueError, "hot pins are placed by the GPU runtime"):
             H.TierHost.from_placement(FakeSTC(ck.files), [bad], pl, "cuda:0", tc, 10, 12, ext = ext())
+
+    def test_disk_rule(self):
+        """disk experts=<dir>: every read from the checked copy (the model's shards unreadable meanwhile
+        proves it); a copy that differs is refused naming the file. disk io=direct / buffered: the
+        page-cache mode of the reads, the same bytes either way"""
+        from types import SimpleNamespace as NS
+        import shutil
+        T = load("_etc_for_ram", ROOT / "exllamav3/model/expert_tier_config.py")
+        PL = load("_placement_for_ram", ROOT / "exllamav3/model/placement.py")
+        ck = self.ck
+
+        def module(l):
+            lin = lambda p: [NS(key = f"layers.{l}.ffn.experts.{e}.{p}") for e in range(ck.E)]
+            return NS(num_experts = ck.E, gated = True, gates = lin("w1"), ups = lin("w3"), downs = lin("w2"),
+                      key = f"layers.{l}.ffn", placement_plan = lambda: ("cache", "gpu", 0))
+
+        tc = T.TierConfig()
+        mods = [module(l) for l in range(ck.L)]
+        with tempfile.TemporaryDirectory(dir = os.environ.get("EXL3_DISK_TEST_DIR")) as d:
+            for f in ck.files:
+                shutil.copy(f, d)
+            pl = PL.parse(f'*=cuda:0 experts=cache; ram experts=1GiB; disk experts="{d}"')
+            h = H.TierHost.from_placement(FakeSTC(ck.files), mods, pl, "cuda:0", tc, 10, 12, ext = ext())
+            self.assertEqual(sorted(h.files), sorted(os.path.join(d, os.path.basename(f)) for f in ck.files))
+            saved = [f + ".away" for f in ck.files]
+            for f, g in zip(ck.files, saved):
+                os.rename(f, g)
+            try:
+                h.cold_fill()
+                for ids in ([3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14], [0, 1, 2, 15, 3, 4]):
+                    h.call(2, ids)
+                self.verify(h)
+                self.assertGreater(h.stats()["ssd_reads"], 22)
+            finally:
+                for f, g in zip(ck.files, saved):
+                    os.rename(g, f)
+            del h
+            # a copy with another header is refused before anything is read
+            with open(os.path.join(d, os.path.basename(ck.files[1])), "r+b") as f:
+                f.seek(9)
+                f.write(b"#")
+            with self.assertRaisesRegex(ValueError, "the safetensors header of .* differs from the model's"):
+                H.TierHost.from_placement(FakeSTC(ck.files), mods, pl, "cuda:0", tc, 10, 12, ext = ext())
+        for io, direct in (("direct", 1), ("buffered", 0), ("auto", -1)):
+            pl = PL.parse(f"*=cuda:0 experts=cache; ram experts=1GiB; disk io={io}")
+            h = H.TierHost.from_placement(FakeSTC(ck.files), mods, pl, "cuda:0", tc, 10, 12, ext = ext())
+            h.cold_fill()
+            h.call(1, [3, 4, 5, 6, 7, 8])
+            self.verify(h, where = f"io={io}")
+            del h
 
 
 class Faults(Base):

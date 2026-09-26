@@ -608,3 +608,40 @@ def test_hold_class_and_zero_window(ext, data):
     for v in ("256K", "64M", "1G", "inf"):
         ext.disk_engine_configure({"backend": "io_uring", "window_expert": v})
     ext.disk_engine_configure({"backend": "io_uring"})
+
+
+@pytest.mark.parametrize("cfg", BACKENDS, ids = lambda c: ",".join(f"{k}={v}" for k, v in c.items()))
+def test_page_cache_mode_per_request(ext, data, cfg):
+    """A request's own page-cache mode (disk io= of a placement): direct=1 reads O_DIRECT, 0 buffered,
+    -1 as EXL3_DISK_DIRECT says; the bytes are the same every way, for rows, extents and the thread's
+    mode of ngram_gather_cpu"""
+    path, fd, buf = data
+    ext.disk_engine_configure(cfg)
+    rng = np.random.default_rng(21)
+    w_base, s_base = 664, 30 * (1 << 20) + 2712
+    rows = min((s_base - w_base) // 256, (len(buf) - s_base) // 8)
+    uids = np.unique(rng.integers(0, rows, size = 300)).astype(np.int64)
+    u = torch.from_numpy(uids)
+    for direct in (-1, 0, 1):
+        w = torch.zeros((len(uids), 256), dtype = torch.uint8)
+        s = torch.zeros((len(uids), 8), dtype = torch.uint8)
+        assert ext.disk_gather_rows(u, 0, [fd, fd], [w_base, s_base], [256, 8], [w, s], direct = direct) is None
+        assert np.array_equal(w.numpy(), ref_rows(buf, w_base, 256, uids)), direct
+        assert np.array_equal(s.numpy(), ref_rows(buf, s_base, 8, uids)), direct
+        t = ext.disk_gather_rows(u, 0, [fd], [w_base], [256], [w], cls = 2, wait = False, direct = direct)
+        t.wait(timeout = 60)
+        t.release()
+        assert np.array_equal(w.numpy(), ref_rows(buf, w_base, 256, uids)), direct
+        prev = ext.disk_set_thread_direct(direct)
+        try:
+            out = torch.zeros((len(uids), 160), dtype = torch.uint8)
+            ext.ngram_gather_cpu(fd, 64, 160, u, 0, out)
+            assert np.array_equal(out.numpy(), ref_rows(buf, 64, 160, uids)), direct
+        finally:
+            assert ext.disk_set_thread_direct(prev) == direct
+    with pytest.raises(RuntimeError, match = "direct must be -1, 0 or 1"):
+        ext.disk_gather_rows(u, 0, [fd], [w_base], [256], [w], direct = 2)
+    with pytest.raises(RuntimeError, match = "direct must be -1, 0 or 1"):
+        ext.disk_set_thread_direct(-2)
+    assert ext.disk_set_thread_direct(-1) == -1
+    ext.disk_engine_configure({"backend": "io_uring"})

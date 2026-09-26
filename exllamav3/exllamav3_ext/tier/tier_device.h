@@ -83,22 +83,27 @@ struct TierCtl
     uint64_t p_q32;     uint64_t _p5[7];        // host: threshold of admit=adaptive (2^32 = always)
     uint32_t error;     uint32_t _p6[15];       // kernel: first DevError
     uint32_t overflow;  uint32_t _p7[15];       // kernel: all-hit records dropped on a full ring
+    uint64_t layer_done; uint64_t _p8[7];       // copy stream: the last layer-mode copy batch completed
 };
+static_assert(sizeof(TierCtl) <= 4096, "the control page's fields fit its first 4 KiB");
 constexpr size_t kCtlBytes = 4096;              // then the return ring, the record ring, the plan ring,
                                                 // the plan's completion flags
 
-// One copy command (host plan ring, 32 bytes). bytes a multiple of 16, dst 16-byte aligned, src any
-// alignment. dep: a token (command index + 1) that must complete first, 0 none
+// One copy command (host plan ring, 40 bytes). bytes a multiple of 16, dst 16-byte aligned, src any
+// alignment. dep: a token (command index + 1) that must complete first, 0 none. Tokens and the
+// completion flags are 64-bit: a command index never wraps
 enum PlanKind : uint32_t { kPlanCopy = 0, kPlanEnd = 1 };
 struct PlanCmd
 {
     uint64_t src;
     uint64_t dst;
+    uint64_t dep;
     uint32_t bytes;
     uint32_t seq;
-    uint32_t dep;
     uint32_t kind;
+    uint32_t pad;
 };
+static_assert(sizeof(PlanCmd) == 40, "the fetch kernel reads a PlanCmd as ten 32-bit words");
 
 // The same command as the reader CTA hands it to the workers (device ring), with its first global chunk
 struct FetchCmd
@@ -106,10 +111,11 @@ struct FetchCmd
     uint64_t src;
     uint64_t dst;
     uint64_t base;
+    uint64_t dep;
     uint32_t bytes;
     uint32_t seq;
-    uint32_t dep;
     uint32_t kind;
+    uint32_t pad;
 };
 
 // Everything a lookup reads: device pointers (directory, tables) and mapped pointers (control page)
@@ -145,9 +151,9 @@ struct FetchParams
 {
     TierCtl* ctl;                               // mapped
     const PlanCmd* plan;                        // [plan_n] mapped
-    uint32_t* done_host;                        // [plan_n] mapped: command i complete -> i + 1
+    uint64_t* done_host;                        // [plan_n] mapped: command i complete -> i + 1
     FetchCmd* dring;                            // [plan_n] device
-    uint32_t* ddone;                            // [plan_n] device: command i complete -> i + 1
+    uint64_t* ddone;                            // [plan_n] device: command i complete -> i + 1
     uint32_t* dcnt;                             // [plan_n] device: workers done with command i
     uint64_t* dctr;                             // the lookup's counters (kDcNeedsHost, kDcFetch*)
     uint32_t plan_n;                            // power of two
@@ -156,10 +162,16 @@ struct FetchParams
 };
 
 // Launch one lookup of cache layer lc on `stream`: ids = the call's selected experts (int64,
-// device, row-major, n of them), mode 0 decode (stamps, admission) or 1 routed (no stamps, misses
-// become transients), seq the call's sequence number, tokens the decode tokens so far (heat epoch)
+// device, row-major, n of them), mode 0 decode (stamps, admission), 1 routed (no stamps, misses
+// become transients), 2 layer (heat and the record only: the host staged the layer and wrote its
+// tables) or 3 predict (the record only: the experts a later layer's router picks, for the disk
+// read-ahead of prefetch=router), seq the call's sequence number, tokens the decode tokens so far
+// (heat epoch)
 void tier_lookup_launch(const TierKParams& p, const int64_t* ids, int n, int lc, int mode, uint32_t seq,
                         uint64_t tokens, cudaStream_t stream);
+
+// *flag = value on `stream` once everything before it there has run (a one-thread kernel)
+void tier_flag_write_launch(uint64_t* flag, uint64_t value, cudaStream_t stream);
 
 // Launch the call's fetch on `stream` right after its lookup (a cooperative launch of workers + 1 CTAs)
 cudaError_t tier_fetch_launch(const FetchParams& f, uint32_t seq, cudaStream_t stream);

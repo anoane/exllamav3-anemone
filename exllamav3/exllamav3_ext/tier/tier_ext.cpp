@@ -215,8 +215,10 @@ HostConfig host_config_of(const py::dict& d)
     h.prefault_threads = value<int>(d, "prefault_threads", h.prefault_threads);
     h.deterministic = value<bool>(d, "deterministic", h.deterministic);
     h.compact_fill = value<bool>(d, "compact_fill", h.compact_fill);
-    if (h.chunk_bytes <= 0 || h.slab_slots < 0 || h.fill_inflight < 1)
-        throw std::invalid_argument("expert tier: chunk_bytes > 0, slab_slots >= 0, fill_inflight >= 1");
+    h.io_direct = value<int>(d, "io_direct", h.io_direct);
+    if (h.chunk_bytes <= 0 || h.slab_slots < 0 || h.fill_inflight < 1 || h.io_direct < -1 || h.io_direct > 1)
+        throw std::invalid_argument("expert tier: chunk_bytes > 0, slab_slots >= 0, fill_inflight >= 1, io_direct -1, 0 "
+                                    "or 1");
     return h;
 }
 
@@ -339,6 +341,21 @@ void TierHostHandle::layer(int64_t lc, const std::vector<int32_t>& ids, int64_t 
     host_->layer_call((int32_t) lc, ids.data(), (int64_t) ids.size(), (int) half);
 }
 
+std::vector<int32_t> TierHostHandle::stage(int64_t lc, int64_t half)
+{
+    std::vector<int32_t> keys;
+    py::gil_scoped_release nogil;
+    host_->stage_layer((int32_t) lc, (int) half, &keys);
+    return keys;
+}
+
+void TierHostHandle::read_ahead(const py::tuple& record)
+{
+    Record rec = record_of(record);
+    py::gil_scoped_release nogil;
+    host_->read_ahead(rec);
+}
+
 void TierHostHandle::prefetch(int64_t lc, int64_t deadline_ns)
 {
     py::gil_scoped_release nogil;
@@ -427,6 +444,11 @@ py::dict TierHostHandle::stats()
     d["cold_bytes"] = s.cold_bytes;
     d["cold_ns"] = s.cold_ns;
     d["arena_ns"] = s.arena_ns;
+    d["presubmitted"] = s.presubmitted;
+    d["slab_reused"] = s.slab_reused;
+    d["predicted_reads"] = s.predicted_reads;
+    d["slab_to_vram"] = s.slab_to_vram;
+    d["compacted"] = s.compacted;
     d["h2d_bytes"] = copier_->h2d_bytes;
     d["d2h_bytes"] = copier_->d2h_bytes;
     d["d2d_bytes"] = copier_->d2d_bytes;

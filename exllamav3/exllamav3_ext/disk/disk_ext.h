@@ -58,7 +58,8 @@ std::unique_ptr<DiskTicket> disk_gather_rows
     const c10::optional<at::Tensor>& flag,
     int64_t flag_index,
     int64_t flag_value,
-    int64_t deadline_ns
+    int64_t deadline_ns,
+    int64_t direct                      // -1 EXL3_DISK_DIRECT's choice, 0 buffered, 1 O_DIRECT
 );
 
 std::unique_ptr<DiskTicket> disk_read_extents
@@ -87,6 +88,7 @@ py::dict disk_engine_configure(const py::dict& overrides);
 void disk_engine_shutdown();
 int64_t disk_engine_forget(const std::string& path);   // 1 closed, 0 not open, -1 closed once idle
 int64_t disk_set_thread_class(int64_t cls);
+int64_t disk_set_thread_direct(int64_t direct);         // ngram_gather_cpu's page-cache mode; returns the previous
 std::string disk_ngram_route();
 int64_t disk_register_buffer(const at::Tensor& t);
 void disk_unregister_buffer(int64_t idx);

@@ -3,7 +3,10 @@
 #include "tier_gpu.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 
 #if defined(__linux__)
@@ -239,7 +242,7 @@ uint64_t CudaCopier::staging_addr(int half, int32_t i)
 
 // ---------------------------------------------------------------------------------------- plan
 
-PlanCopier::PlanCopier(PlanCmd* ring, uint32_t* done_flags, TierCtl* ctl, uint32_t n, std::vector<uint64_t> pool,
+PlanCopier::PlanCopier(PlanCmd* ring, uint64_t* done_flags, TierCtl* ctl, uint32_t n, std::vector<uint64_t> pool,
                        std::vector<uint64_t> staging, int64_t staging_per_half)
     : ring_(ring), done_(done_flags), ctl_(ctl), n_(n), pool_(std::move(pool)), staging_(std::move(staging)),
       staging_per_half_(staging_per_half)
@@ -251,7 +254,7 @@ void PlanCopier::scan()
     while (contig_ < tail_)
     {
         const uint64_t i = contig_;
-        if (ring_[i & (n_ - 1)].kind == kPlanEnd || __atomic_load_n(&done_[i & (n_ - 1)], __ATOMIC_ACQUIRE) == (uint32_t) (i + 1))
+        if (ring_[i & (n_ - 1)].kind == kPlanEnd || __atomic_load_n(&done_[i & (n_ - 1)], __ATOMIC_ACQUIRE) == i + 1)
             ++contig_;
         else break;
     }
@@ -260,6 +263,11 @@ void PlanCopier::scan()
 bool PlanCopier::done(uint64_t token)
 {
     if (!token) return true;
+    if (token & kLayerTag)
+    {
+        if (!other_) fail_tier("a layer-mode copy token without the layer-mode copier");
+        return other_->done(token);
+    }
     if (token <= contig_) return true;
     scan();
     return token <= contig_;
@@ -267,6 +275,12 @@ bool PlanCopier::done(uint64_t token)
 
 void PlanCopier::wait(uint64_t token)
 {
+    if (token & kLayerTag)
+    {
+        if (!other_) fail_tier("a layer-mode copy token without the layer-mode copier");
+        other_->wait(token);
+        return;
+    }
     int64_t t0 = 0;
     while (!done(token))
     {
@@ -301,13 +315,14 @@ uint64_t PlanCopier::push(uint64_t src, uint64_t dst, int64_t n, uint64_t after,
     PlanCmd& c = ring_[tail_ & (n_ - 1)];
     c.src = src;
     c.dst = dst;
+    c.dep = after;
     c.bytes = (uint32_t) n;
     c.seq = seq;
-    c.dep = (uint32_t) after;
     c.kind = kind;
+    c.pad = 0;
     // the fetch kernel checks a slot's flag against index + 1: a stale one from n commands back never
     // matches, but the host's own scan must not see it either
-    __atomic_store_n(&done_[tail_ & (n_ - 1)], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&done_[tail_ & (n_ - 1)], (uint64_t) 0, __ATOMIC_RELAXED);
     ++tail_;
     __atomic_store_n(&ctl_->plan_tail, tail_, __ATOMIC_RELEASE);
     ++commands;
@@ -354,6 +369,116 @@ uint64_t PlanCopier::staging_addr(int half, int32_t i)
     return staging_[(size_t) idx];
 }
 
+// ---------------------------------------------------------------------------------------- layer copier
+
+LayerCopier::LayerCopier(int device, uint64_t* done_host, uint64_t* done_dev, std::vector<uint64_t> pool,
+                         std::vector<uint64_t> staging, int64_t staging_per_half)
+    : device_(device), done_host_(done_host), done_dev_(done_dev), pool_(std::move(pool)), staging_(std::move(staging)),
+      staging_per_half_(staging_per_half)
+{
+    DeviceGuard g(device_);
+    cuda_ok(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking), "layer-mode copy stream");
+}
+
+LayerCopier::~LayerCopier()
+{
+    DeviceGuard g(device_);
+    if (s_)
+    {
+        cudaStreamSynchronize(s_);
+        cudaStreamDestroy(s_);
+    }
+}
+
+uint64_t LayerCopier::h2d(uint64_t dst, const uint8_t* src, int64_t n, uint64_t after)
+{
+    // a copy of this stream is ordered after the earlier ones by the stream; one of the fetch
+    // kernel's (a demotion still writing the source) is waited for here
+    if (after && !(after & kLayerTag) && !done(after)) wait(after);
+    cuda_ok(cudaMemcpyAsync(reinterpret_cast<void*>(dst), src, (size_t) n, cudaMemcpyHostToDevice, s_),
+            "layer-mode staging copy");
+    h2d_bytes += n;
+    ++h2d_copies;
+    open_copies_ = true;
+    return kLayerTag | batch_;
+}
+
+uint64_t LayerCopier::d2h(uint8_t*, uint64_t, int64_t, uint64_t)
+{
+    fail_tier("layer mode copies host to device only");
+}
+
+uint64_t LayerCopier::d2d(uint64_t, uint64_t, int64_t, uint64_t)
+{
+    fail_tier("layer mode copies host to device only");
+}
+
+uint64_t LayerCopier::close_batch()
+{
+    if (!open_copies_) return 0;
+    const uint64_t b = batch_++;
+    tier_flag_write_launch(done_dev_, b, s_);
+    cuda_ok(cudaGetLastError(), "layer-mode completion flag");
+    open_copies_ = false;
+    ++batches;
+    return b;
+}
+
+bool LayerCopier::done(uint64_t token)
+{
+    if (!token) return true;
+    if (!(token & kLayerTag))
+    {
+        if (!other_) fail_tier("a plan token without the fetch kernel's copier");
+        return other_->done(token);
+    }
+    const uint64_t b = token & ~kLayerTag;
+    // the open batch has no completion flag yet: its copies are only enqueued
+    if (b >= batch_ && open_copies_) return false;
+    return __atomic_load_n(done_host_, __ATOMIC_ACQUIRE) >= b;
+}
+
+void LayerCopier::wait(uint64_t token)
+{
+    if (!token) return;
+    if (!(token & kLayerTag))
+    {
+        if (!other_) fail_tier("a plan token without the fetch kernel's copier");
+        other_->wait(token);
+        return;
+    }
+    const uint64_t b = token & ~kLayerTag;
+    if (b >= batch_ && open_copies_)
+    {
+        // a plan waits for one of its own copies (a slab slot it copied from, to read another expert
+        // into): publish the batch so far. Only the caller's thread, which runs the plan, may launch
+        if (!planning) fail_tier("waiting for a layer-mode copy whose batch is still open");
+        close_batch();
+    }
+    int64_t t0 = 0;
+    while (__atomic_load_n(done_host_, __ATOMIC_ACQUIRE) < b)
+    {
+        if (abort_ && abort_->load()) fail_tier("the tier stopped while a layer-mode copy was pending");
+        if (!t0) t0 = mono_ns();
+        else if (mono_ns() - t0 > 120000000000ll) fail_tier("a layer-mode copy did not complete within 120 s");
+        cpu_relax();
+    }
+}
+
+uint64_t LayerCopier::pool_addr(int32_t slot)
+{
+    if (slot < 0 || (size_t) slot >= pool_.size()) fail_tier("pool slot " + std::to_string(slot) + " out of range");
+    return pool_[(size_t) slot];
+}
+
+uint64_t LayerCopier::staging_addr(int half, int32_t i)
+{
+    int64_t idx = (int64_t) half * staging_per_half_ + i;
+    if (half < 0 || i < 0 || i >= staging_per_half_ || idx >= (int64_t) staging_.size())
+        fail_tier("staging slot " + std::to_string(i) + " of half " + std::to_string(half) + " out of range");
+    return staging_[(size_t) idx];
+}
+
 // ---------------------------------------------------------------------------------------- runtime
 
 TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int pool_slots, int64_t ram_slots, int pins_,
@@ -368,8 +493,11 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
         fail_tier(std::to_string(gc_.pool.size()) + " slot addresses for " + std::to_string(S + pins) + " slots");
     if ((int64_t) gc_.tables.size() != layers * gc_.projections)
         fail_tier("one pointer table per layer and projection");
-    if (gc_.staging_per_half < 1 || (int64_t) gc_.staging.size() < gc_.staging_per_half)
-        fail_tier("the staging area needs a slot per expert a call can miss");
+    if (gc_.halves < 1 || gc_.halves > 2) fail_tier("the staging area has one or two halves");
+    if (gc_.staging_per_half < 1 || (int64_t) gc_.staging.size() < gc_.staging_per_half * gc_.halves)
+        fail_tier("the staging area needs a slot per expert a call can miss, in each half");
+    if (!gc_.prefetch_layer.empty() && (int64_t) gc_.prefetch_layer.size() != layers)
+        fail_tier("one read-ahead depth per cache layer");
     if (host_ && host_->hcfg.deterministic != gc_.deterministic) fail_tier("host and runtime disagree on determinism");
     if (host_ && host_->core.defer_returns == gc_.deterministic)
         fail_tier("production mode returns demoted slots when their copy lands (defer_returns)");
@@ -393,7 +521,7 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
     plan_n_ = pn;
     size_t off_dring = al(off_tables + 8 * gc_.tables.size());
     size_t off_ddone = al(off_dring + sizeof(FetchCmd) * pn);
-    size_t off_dcnt = al(off_ddone + 4 * (size_t) pn);
+    size_t off_dcnt = al(off_ddone + 8 * (size_t) pn);
     size_t total = al(off_dcnt + 4 * (size_t) pn);
     cuda_ok(cudaMalloc(&dev_mem_, total), "expert tier directory");
     cuda_ok(cudaMemset(dev_mem_, 0, total), "expert tier directory");
@@ -410,7 +538,7 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
     dev.staging = reinterpret_cast<int64_t*>(b + off_staging);
     dev.tables = reinterpret_cast<int64_t*>(b + off_tables);
     dev.dring = reinterpret_cast<FetchCmd*>(b + off_dring);
-    dev.ddone = reinterpret_cast<uint32_t*>(b + off_ddone);
+    dev.ddone = reinterpret_cast<uint64_t*>(b + off_ddone);
     dev.dcnt = reinterpret_cast<uint32_t*>(b + off_dcnt);
     cuda_ok(cudaMemcpy(dev.addr, gc_.pool.data(), 8 * n, cudaMemcpyHostToDevice), "slot addresses");
     cuda_ok(cudaMemcpy(dev.staging, gc_.staging.data(), 8 * (size_t) gc_.staging_per_half, cudaMemcpyHostToDevice),
@@ -422,7 +550,7 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
     ret_n_ = rn;
     rec_bytes_ = (uint64_t) std::max<int64_t>(1 << 16, gc_.rec_ring_bytes) & ~(uint64_t) 7;
     const size_t off_plan = kCtlBytes + 4 * (size_t) ret_n_ + (size_t) rec_bytes_;
-    const size_t ctl_bytes = off_plan + sizeof(PlanCmd) * plan_n_ + 4 * (size_t) plan_n_;
+    const size_t ctl_bytes = off_plan + sizeof(PlanCmd) * plan_n_ + 8 * (size_t) plan_n_;
     void* hp = nullptr;
     cuda_ok(cudaHostAlloc(&hp, ctl_bytes, cudaHostAllocMapped | cudaHostAllocPortable), "expert tier control page");
     std::memset(hp, 0, ctl_bytes);
@@ -434,7 +562,7 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
     ret_ring_ = reinterpret_cast<uint32_t*>(ctl_mem_ + kCtlBytes);
     rec_ring_ = ctl_mem_ + kCtlBytes + 4 * (size_t) ret_n_;
     plan_ring_ = reinterpret_cast<PlanCmd*>(ctl_mem_ + off_plan);
-    plan_done_ = reinterpret_cast<uint32_t*>(ctl_mem_ + off_plan + sizeof(PlanCmd) * plan_n_);
+    plan_done_ = reinterpret_cast<uint64_t*>(ctl_mem_ + off_plan + sizeof(PlanCmd) * plan_n_);
 
     kp_.state = dev.state;
     kp_.key = dev.key;
@@ -474,7 +602,7 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
     if (!coop) fail_tier("the device cannot launch cooperative kernels (the fetch kernel needs it)");
     fp_.ctl = ctl_dev_;
     fp_.plan = reinterpret_cast<const PlanCmd*>(static_cast<uint8_t*>(dp) + off_plan);
-    fp_.done_host = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dp) + off_plan + sizeof(PlanCmd) * plan_n_);
+    fp_.done_host = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(dp) + off_plan + sizeof(PlanCmd) * plan_n_);
     fp_.dring = dev.dring;
     fp_.ddone = dev.ddone;
     fp_.dcnt = dev.dcnt;
@@ -484,8 +612,23 @@ TierGpu::TierGpu(const PolicyConfig& pc, int64_t layers, int64_t experts, int po
     fp_.deterministic = gc_.deterministic ? 1 : 0;
     plan_.reset(new PlanCopier(plan_ring_, plan_done_, ctl_, plan_n_, gc_.pool, gc_.staging, gc_.staging_per_half));
     plan_->set_abort(&failed_);
+    uint64_t* ld_dev = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(ctl_dev_) + offsetof(TierCtl, layer_done));
+    layer_.reset(new LayerCopier(gc_.device, &ctl_->layer_done, ld_dev, gc_.pool, gc_.staging, gc_.staging_per_half));
+    layer_->set_abort(&failed_);
+    layer_->set_other(plan_.get());
+    plan_->set_other(layer_.get());
+    layer_state();
     publish_p();
     upload();
+    if (!gc_.trace_path.empty())
+    {
+        trace_file_ = std::fopen(gc_.trace_path.c_str(), "w");
+        if (!trace_file_)
+            fail_tier("EXL3_MOE_TIER_TRACE: cannot open " + gc_.trace_path + " for writing: " + std::strerror(errno));
+        std::fprintf(trace_file_, "{\"format\": \"exl3-tier-trace\", \"version\": 1, \"device\": %d, \"layers\": %lld, "
+                     "\"experts\": %lld, \"slots\": %d, \"pins\": %d, \"ram_slots\": %lld, \"spare\": %d}\n",
+                     gc_.device, (long long) layers, (long long) experts, S, pins, (long long) ram_slots, pc.spare);
+    }
 }
 
 TierGpu::~TierGpu()
@@ -494,7 +637,14 @@ TierGpu::~TierGpu()
     if (ctl_) __atomic_store_n(&ctl_->abort, 1u, __ATOMIC_RELEASE);
     failed_ = true;
     stop();
+    if (trace_file_) std::fclose(trace_file_);
+    trace_file_ = nullptr;
     cudaDeviceSynchronize();
+    layer_.reset();
+    for (auto& e : lready_) if (e) cudaEventDestroy(e);
+    for (auto& e : ltab_ev_) if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : { lconsumed_[0], lconsumed_[1], lpass_, lcopies_, dir_ev_ }) if (e) cudaEventDestroy(e);
+    if (ltab_) cudaFreeHost(ltab_);
     if (copier_) copier_->sync();
     if (copier_) copier_->unpin_all();              // before the host unmaps the RAM tier
     host_.reset();
@@ -561,12 +711,212 @@ void TierGpu::cold_fill(const std::vector<int32_t>& order, const std::vector<int
 void TierGpu::lookup(int lc, const int64_t* ids, int n, int mode, uint32_t seq, uint64_t tokens, cudaStream_t stream)
 {
     check_ok();
+    if (mode != kDecode && mode != kRouted) fail_tier("lookup: decode or routed mode");
     DeviceGuard g(gc_.device);
+    // after a layer-mode pass: its copy stream may still write the staging halves this call's
+    // transients use (a pass that ended before its last planned layer)
+    if (lcopies_pending_)
+    {
+        cuda_ok(cudaStreamWaitEvent(stream, lcopies_, 0), "ordering after the layer-mode copies");
+        lcopies_pending_ = false;
+    }
     last_seq_ = seq;
     kicks_.fetch_add(1, std::memory_order_relaxed);
     if (running_) cv_.notify_one();
     tier_lookup_launch(kp_, ids, n, lc, mode, seq, tokens, stream);
     cuda_ok(tier_fetch_launch(fp_, seq, stream), "launching the expert cache's fetch kernel");
+    // this call may change the directory: a layer-mode pass that follows waits until the host has it
+    cuda_ok(cudaEventRecord(dir_ev_, stream), "expert cache call event");
+    dir_dirty_ = true;
+}
+
+// ---------------------------------------------------------------------------------------- layer mode
+
+void TierGpu::layer_state()
+{
+    const int L = kp_.L, P = kp_.P, E = kp_.E;
+    DeviceGuard g(gc_.device);
+    void* p = nullptr;
+    cuda_ok(cudaHostAlloc(&p, sizeof(int64_t) * (size_t) L * P * E, cudaHostAllocPortable), "layer-mode pointer tables");
+    ltab_ = static_cast<int64_t*>(p);
+    std::memset(ltab_, 0, sizeof(int64_t) * (size_t) L * P * E);
+    auto ev = [](cudaEvent_t* e) { cuda_ok(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "expert cache event"); };
+    lready_.assign((size_t) L, nullptr);
+    ltab_ev_.assign((size_t) L, nullptr);
+    for (int i = 0; i < L; ++i)
+    {
+        ev(&lready_[(size_t) i]);
+        ev(&ltab_ev_[(size_t) i]);
+    }
+    ev(&lconsumed_[0]);
+    ev(&lconsumed_[1]);
+    ev(&lpass_);
+    ev(&lcopies_);
+    ev(&dir_ev_);
+    ltab_used_.assign((size_t) L, 0);
+    lhalf_.assign((size_t) L, 0);
+    lprefetched_.assign((size_t) L, 0);
+}
+
+// Every record published so far has been handled by the host side (the tier thread, or step()
+// without it). Called by the caller's thread, after the GPU ran the calls that published them
+void TierGpu::catch_up()
+{
+    const uint64_t head = __atomic_load_n(&ctl_->rec_head, __ATOMIC_ACQUIRE);
+    if (!running_)
+    {
+        step(false);
+        if (handled_tail_.load(std::memory_order_acquire) < head) fail_tier("layer mode: records left unhandled");
+        return;
+    }
+    kicks_.fetch_add(1, std::memory_order_relaxed);
+    cv_.notify_one();
+    const int64_t t0 = mono_ns();
+    while (handled_tail_.load(std::memory_order_acquire) < head)
+    {
+        check_ok();
+        if (mono_ns() - t0 > 120000000000ll) fail_tier("layer mode: the tier thread did not catch up within 120 s");
+        std::this_thread::yield();
+    }
+}
+
+void TierGpu::layer_begin(cudaStream_t stream)
+{
+    check_ok();
+    if (!host_) fail_tier("layer mode needs the RAM tier's host");
+    DeviceGuard g(gc_.device);
+    if (dir_dirty_)
+    {
+        // decode or routed calls ran since the host mirror last caught up: the plans read the
+        // directory as of them, so the GPU runs them, then the host applies their records (their
+        // copies, demotions included, have landed then)
+        cuda_ok(cudaEventSynchronize(dir_ev_), "layer mode: waiting for the last expert cache call");
+        catch_up();
+        dir_dirty_ = false;
+        ++layer_catch_ups;
+    }
+    // the copy stream writes staging only after everything enqueued before this pass (decode and
+    // routed calls write staging half 0 in their fetch)
+    cuda_ok(cudaEventRecord(lpass_, stream), "layer-mode pass event");
+    cuda_ok(cudaStreamWaitEvent(layer_->stream(), lpass_, 0), "layer-mode pass order");
+    std::fill(lhalf_.begin(), lhalf_.end(), 0);
+    std::fill(lprefetched_.begin(), lprefetched_.end(), 0);
+    lplan_prev_ = 0;
+}
+
+void TierGpu::layer_plan(int lc, int half)
+{
+    check_ok();
+    const int L = kp_.L, P = kp_.P, E = kp_.E;
+    if (lc < 0 || lc >= L) fail_tier("layer mode: layer " + std::to_string(lc) + " out of range");
+    if (half < 0 || half >= gc_.halves) fail_tier("layer mode: staging half " + std::to_string(half));
+    DeviceGuard g(gc_.device);
+    cudaStream_t ls = layer_->stream();
+    // the compute that last read this half, and the upload that last read this layer's table
+    if (lconsumed_used_[half]) cuda_ok(cudaStreamWaitEvent(ls, lconsumed_[half], 0), "layer-mode staging order");
+    if (ltab_used_[(size_t) lc]) cuda_ok(cudaEventSynchronize(ltab_ev_[(size_t) lc]), "layer-mode table reuse");
+    const int64_t now = mono_ns();
+    if (lplan_prev_) lplan_ns_ = lplan_ns_ ? (3 * lplan_ns_ + (now - lplan_prev_)) / 4 : now - lplan_prev_;
+    lplan_prev_ = now;
+    std::vector<int32_t> keys;
+    {
+        std::lock_guard<std::mutex> wk(work_mu_);
+        host_->set_copier(layer_.get());
+        layer_->planning = true;
+        try
+        {
+            host_->stage_layer(lc, half, &keys);
+            // read-ahead (prefetch=layer:D) of the layers whose depth reaches this far back, deadline
+            // their expected start
+            for (int t = lc + 1; t < L; ++t)
+            {
+                const int d = gc_.prefetch_layer.empty() ? 0 : gc_.prefetch_layer[(size_t) t];
+                if (d < t - lc || lprefetched_[(size_t) t]) continue;
+                host_->prefetch_layer(t, lplan_ns_ ? now + (t - lc) * lplan_ns_ : 0);
+                lprefetched_[(size_t) t] = 1;
+            }
+        }
+        catch (...)
+        {
+            layer_->planning = false;
+            host_->set_copier(plan_.get());
+            throw;
+        }
+        layer_->planning = false;
+        host_->set_copier(plan_.get());
+        layer_->close_batch();
+        // the tables: VRAM-held experts (pool, pins) at their slots, the others at their staging slot
+        int64_t* tab = ltab_ + (size_t) lc * P * E;
+        const VramDirectory& v = host_->core.vram;
+        size_t j = 0;
+        for (int e = 0; e < E; ++e)
+        {
+            const int32_t k = lc * E + e;
+            const int32_t s = v.slot_of[(size_t) k];
+            uint64_t base;
+            if (s >= 0) base = gc_.pool[(size_t) s];
+            else
+            {
+                if (j >= keys.size() || keys[j] != k) fail_tier("layer mode: the staging order and the directory disagree");
+                base = gc_.staging[(size_t) (half * gc_.staging_per_half) + j];
+                ++j;
+            }
+            for (int q = 0; q < P; ++q) tab[(size_t) q * E + e] = (int64_t) (base + (uint64_t) gc_.proj_off[q]);
+        }
+        if (j != keys.size()) fail_tier("layer mode: staged experts the directory holds");
+    }
+    cuda_ok(cudaEventRecord(lready_[(size_t) lc], ls), "layer-mode copies event");
+    cuda_ok(cudaEventRecord(lcopies_, ls), "layer-mode copies event");
+    lcopies_pending_ = true;
+    lhalf_[(size_t) lc] = (int8_t) (half + 1);
+    ++layer_plans;
+}
+
+void TierGpu::layer_run(int lc, const int64_t* ids, int n, uint32_t seq, uint64_t tokens, cudaStream_t stream)
+{
+    check_ok();
+    const int P = kp_.P, E = kp_.E;
+    if (lc < 0 || lc >= kp_.L || !lhalf_[(size_t) lc]) fail_tier("layer mode: layer " + std::to_string(lc) + " runs before its plan");
+    DeviceGuard g(gc_.device);
+    last_seq_ = seq;
+    kicks_.fetch_add(1, std::memory_order_relaxed);
+    if (running_) cv_.notify_one();
+    cuda_ok(cudaStreamWaitEvent(stream, lready_[(size_t) lc], 0), "waiting for the layer's staging copies");
+    for (int q = 0; q < P; ++q)
+        cuda_ok(cudaMemcpyAsync(reinterpret_cast<void*>(gc_.tables[(size_t) (lc * P + q)]), ltab_ + ((size_t) lc * P + q) * E,
+                                sizeof(int64_t) * (size_t) E, cudaMemcpyHostToDevice, stream), "layer-mode table upload");
+    cuda_ok(cudaEventRecord(ltab_ev_[(size_t) lc], stream), "layer-mode table event");
+    ltab_used_[(size_t) lc] = 1;
+    tier_lookup_launch(kp_, ids, n, lc, kLayer, seq, tokens, stream);
+    cuda_ok(cudaGetLastError(), "launching the expert cache's lookup kernel");
+    ++layer_calls;
+}
+
+void TierGpu::layer_after(int lc, cudaStream_t stream)
+{
+    if (lc < 0 || lc >= kp_.L || !lhalf_[(size_t) lc]) fail_tier("layer mode: layer " + std::to_string(lc) + " was not planned");
+    DeviceGuard g(gc_.device);
+    const int h = lhalf_[(size_t) lc] - 1;
+    cuda_ok(cudaEventRecord(lconsumed_[h], stream), "layer-mode consumed event");
+    lconsumed_used_[h] = true;
+}
+
+void TierGpu::predict(int lc, const int64_t* ids, int n, uint32_t seq, uint64_t tokens, cudaStream_t stream)
+{
+    check_ok();
+    if (lc < 0 || lc >= kp_.L) fail_tier("predict: layer " + std::to_string(lc) + " out of range");
+    DeviceGuard g(gc_.device);
+    kicks_.fetch_add(1, std::memory_order_relaxed);
+    if (running_) cv_.notify_one();
+    tier_lookup_launch(kp_, ids, n, lc, kPredict, seq, tokens, stream);
+    cuda_ok(cudaGetLastError(), "launching the expert cache's lookup kernel");
+}
+
+int64_t TierGpu::layer_addr(int lc, int e, int q) const
+{
+    if (lc < 0 || lc >= kp_.L || e < 0 || e >= kp_.E || q < 0 || q >= kp_.P || !lhalf_[(size_t) lc])
+        fail_tier("layer mode: no planned address for layer " + std::to_string(lc) + " expert " + std::to_string(e));
+    return ltab_[((size_t) lc * kp_.P + q) * kp_.E + e];
 }
 
 bool TierGpu::next_record(Record& rec, bool& needs_host, uint64_t& tokens)
@@ -628,6 +978,14 @@ void TierGpu::push_returns(const std::vector<int32_t>& slots)
 void TierGpu::handle(const Record& rec, bool needs_host, uint64_t tokens)
 {
     int64_t t0 = mono_ns();
+    if (rec.mode == kPredict)
+    {
+        // prefetch=router: disk read-ahead only; the policy never sees a prediction
+        if (host_) host_->read_ahead(rec);
+        ++stats.predictions;
+        stats.work_ns += mono_ns() - t0;
+        return;
+    }
     TierCore& c = core();
     c.heat.tokens = tokens;
     std::vector<int32_t> returns;
@@ -647,8 +1005,8 @@ void TierGpu::handle(const Record& rec, bool needs_host, uint64_t tokens)
     if (!returns.empty()) push_returns(returns);
     publish_p();
     // the call's fetch runs the commands above until this (an all-hit call's fetch does not wait,
-    // except in deterministic mode)
-    if (gc_.deterministic || needs_host) plan_->end(rec.seq);
+    // except in deterministic mode; a layer-mode call has no fetch: its copies were the plan's)
+    if ((gc_.deterministic && rec.mode != kLayer) || needs_host) plan_->end(rec.seq);
     ++stats.records;
     if (needs_host) ++stats.host_records;
     if (gc_.trace > 0)
@@ -656,6 +1014,19 @@ void TierGpu::handle(const Record& rec, bool needs_host, uint64_t tokens)
         std::lock_guard<std::mutex> lk(trace_mu);
         trace.push_back(rec);
         while ((int64_t) trace.size() > gc_.trace) trace.pop_front();
+    }
+    if (trace_file_)
+    {
+        // one JSON line per record: its entries as [key, kind, count, dst, victim key, victim slot]
+        std::fprintf(trace_file_, "{\"seq\": %u, \"lc\": %d, \"mode\": %d, \"tokens\": %llu, \"e\": [",
+                     rec.seq, rec.lc, rec.mode, (unsigned long long) tokens);
+        for (size_t j = 0; j < rec.entries.size(); ++j)
+        {
+            const Entry& x = rec.entries[j];
+            std::fprintf(trace_file_, "%s[%d, %d, %u, %d, %d, %d]", j ? ", " : "", x.key, (int) x.kind, x.cnt, x.dst,
+                         x.vkey, x.vslot);
+        }
+        std::fputs("]}\n", trace_file_);
     }
     stats.work_ns += mono_ns() - t0;
 }
@@ -672,10 +1043,12 @@ int TierGpu::step(bool wait)
     int64_t t0 = mono_ns();
     while (true)
     {
+        std::unique_lock<std::mutex> wk(work_mu_);
         if (next_record(rec, nh, tk))
         {
             try { handle(rec, nh, tk); }
             catch (const std::exception& e) { fail(e.what()); throw; }
+            handled_tail_.store(rec_tail_, std::memory_order_release);
             ++done;
             continue;
         }
@@ -684,6 +1057,7 @@ int TierGpu::step(bool wait)
             auto r = host_->return_landed();
             if (!r.empty()) push_returns(r);
         }
+        wk.unlock();
         if (done || !wait) break;
         if (mono_ns() - t0 > 30000000000ll) fail_tier("no call record arrived within 30 s");
         cpu_relax();
@@ -715,39 +1089,49 @@ void TierGpu::loop()
         {
             bool did = false;
             int64_t lag = 0;
-            while (next_record(rec, nh, tk))
-            {
-                if (!did)
-                {
-                    uint64_t head = __atomic_load_n(&ctl_->rec_head, __ATOMIC_ACQUIRE);
-                    lag = (int64_t) (head - rec_tail_);
-                }
-                handle(rec, nh, tk);
-                did = true;
-            }
-            if (lag > stats.max_lag) stats.max_lag = lag;
             bool busy = false;
-            if (host_ && !gc_.deterministic)
             {
-                auto r = host_->return_landed();
-                if (!r.empty())
+                std::lock_guard<std::mutex> wk(work_mu_);
+                while (next_record(rec, nh, tk))
                 {
-                    push_returns(r);
+                    if (!did)
+                    {
+                        uint64_t head = __atomic_load_n(&ctl_->rec_head, __ATOMIC_ACQUIRE);
+                        lag = (int64_t) (head - rec_tail_);
+                    }
+                    handle(rec, nh, tk);
+                    handled_tail_.store(rec_tail_, std::memory_order_release);
                     did = true;
                 }
-                busy = !host_->core.pending.empty();
+                if (lag > stats.max_lag) stats.max_lag = lag;
+                if (host_ && !gc_.deterministic)
+                {
+                    auto r = host_->return_landed();
+                    if (!r.empty())
+                    {
+                        push_returns(r);
+                        did = true;
+                    }
+                    busy = !host_->core.pending.empty();
+                }
             }
             if (drain_req_.load())
             {
-                while (next_record(rec, nh, tk)) handle(rec, nh, tk);
-                if (host_)
                 {
-                    host_->drain();
-                    copier_->sync();
-                    if (!gc_.deterministic)
+                    std::lock_guard<std::mutex> wk(work_mu_);
+                    while (next_record(rec, nh, tk))
                     {
-                        auto r = host_->return_landed();
-                        if (!r.empty()) push_returns(r);
+                        handle(rec, nh, tk);
+                        handled_tail_.store(rec_tail_, std::memory_order_release);
+                    }
+                    if (host_)
+                    {
+                        host_->drain();
+                        if (!gc_.deterministic)
+                        {
+                            auto r = host_->return_landed();
+                            if (!r.empty()) push_returns(r);
+                        }
                     }
                 }
                 {
@@ -821,10 +1205,10 @@ void TierGpu::drain()
     else
     {
         step(false);
+        std::lock_guard<std::mutex> wk(work_mu_);
         if (host_)
         {
             host_->drain();
-            copier_->sync();
             if (!gc_.deterministic)
             {
                 auto r = host_->return_landed();
@@ -877,6 +1261,7 @@ void TierGpu::verify()
 {
     DeviceGuard g(gc_.device);
     cuda_ok(cudaDeviceSynchronize(), "verify");
+    std::lock_guard<std::mutex> wk(work_mu_);
     const size_t n = (size_t) (S + pins);
     std::vector<uint8_t> st(n);
     std::vector<int32_t> key(n), slot_of((size_t) K);

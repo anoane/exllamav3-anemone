@@ -276,15 +276,21 @@ __global__ void __launch_bounds__(T) tier_lookup_kernel(const TierKParams p, con
 
     // Heat, then the protection phase: every hit of a decode call is stamped before any miss looks
     // for a victim, so a call never evicts an expert it uses
+    // (a prediction, mode 3, reads the heat and changes nothing)
     const uint32_t inc = mode == 0 ? (1u << 16) : p.prefill_inc;
     for (int j = tid; j < nu; j += T)
     {
         const int e = s_u[j];
         const int32_t k = lc * E + e;
-        uint64_t x = (uint64_t) heat_read(p, k, epoch) + (uint64_t) s_cnt[e] * inc;
-        uint32_t hv = x > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t) x;
-        p.heat_v[k] = hv;
-        p.heat_ep[k] = epoch;
+        uint32_t hv;
+        if (mode == 3) hv = heat_read(p, k, epoch);
+        else
+        {
+            uint64_t x = (uint64_t) heat_read(p, k, epoch) + (uint64_t) s_cnt[e] * inc;
+            hv = x > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t) x;
+            p.heat_v[k] = hv;
+            p.heat_ep[k] = epoch;
+        }
         s_heat[j] = hv;
         int32_t s = p.slot_of[k];
         s_slot[j] = s;
@@ -302,7 +308,25 @@ __global__ void __launch_bounds__(T) tier_lookup_kernel(const TierKParams p, con
     }
     __syncthreads();
 
-    if (mode != 0)
+    if (mode >= 2)
+    {
+        // Layer mode: the host planned the staging and wrote the tables; heat and the record only.
+        // A prediction (mode 3, prefetch=router): the record only, listing which of the experts a
+        // later layer's router picks VRAM holds
+        if (tid == 0)
+        {
+            for (int j = 0; j < nu; ++j)
+                if (s_kind[j] != K_HIT)
+                {
+                    s_kind[j] = K_TRANSIENT;
+                    s_slot[j] = -1;
+                }
+            s_nh = 0;
+            s_stg = 0;
+        }
+        __syncthreads();
+    }
+    else if (mode != 0)
     {
         // Routed (prefill below the layer mode): no admission, misses stage as transients
         if (tid == 0)
@@ -433,8 +457,9 @@ __global__ void __launch_bounds__(T) tier_lookup_kernel(const TierKParams p, con
     if (tid == 0 && s_stg > p.nstage) first_error(&s_err, kErrStaging);
     __syncthreads();
 
-    // The layer's pointer tables: every expert of the call at its slot (or staging slot)
-    for (int j = tid; j < nu; j += T)
+    // The layer's pointer tables: every expert of the call at its slot (or staging slot); layer mode
+    // uploaded the whole tables already
+    for (int j = tid; j < nu && mode < 2; j += T)
     {
         const int e = s_u[j];
         int64_t base;
@@ -559,21 +584,57 @@ __device__ __forceinline__ uint4 shift16(const uint4& a, const uint4& b, uint32_
     return make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+// Words each thread of a copying CTA has in flight: loads are issued back to back before the first
+// result is used, so a CTA keeps kCopyU x 4 KiB of host reads outstanding (the link's latency, not
+// the issue rate, bounds a CTA's copy rate)
+constexpr uint32_t kCopyU = 4;
+constexpr uint32_t kCopyTile = kCopyU * kFetchThreads;     // 16-byte words per CTA per tile
+
 // Copy n bytes (a multiple of 16) from src (any alignment; host memory is read uncached, so a slot
-// the host rewrote is never served stale) to dst (16-byte aligned), by one CTA
-__device__ void cta_copy(const uint8_t* src, uint8_t* dst, uint32_t n)
+// the host rewrote is never served stale) to dst (16-byte aligned), by one CTA. A source at an odd
+// offset (the extent layout of an SSD fill) is read as aligned words once each, through shared
+// memory (s_w: kCopyTile + 1 words), and each output word is assembled from two neighbours: every
+// source byte crosses the link once, as in the aligned case. Reads up to 15 bytes past the end of
+// the source, inside its 16-byte word (slots are padded to whole pages)
+__device__ void cta_copy(const uint8_t* src, uint8_t* dst, uint32_t n, uint4* s_w)
 {
     const uint32_t mis = (uint32_t) ((uintptr_t) src & 15);
+    const uint32_t nw = n / 16;
+    const uint32_t T = blockDim.x;
+    const uint32_t t = threadIdx.x;
     uint4* d = reinterpret_cast<uint4*>(dst);
     if (!mis)
     {
         const uint4* s = reinterpret_cast<const uint4*>(src);
-        for (uint32_t i = threadIdx.x; i < n / 16; i += blockDim.x) d[i] = ld_cv(s + i);
+        uint32_t i = t;
+        for (; i + (kCopyU - 1) * T < nw; i += kCopyU * T)
+        {
+            uint4 v[kCopyU];
+            #pragma unroll
+            for (uint32_t u = 0; u < kCopyU; ++u) v[u] = ld_cv(s + i + u * T);
+            #pragma unroll
+            for (uint32_t u = 0; u < kCopyU; ++u) d[i + u * T] = v[u];
+        }
+        for (; i < nw; i += T) d[i] = ld_cv(s + i);
+        return;
     }
-    else
+    const uint4* a = reinterpret_cast<const uint4*>(src - mis);
+    for (uint32_t base = 0; base < nw; base += kCopyU * T)
     {
-        const uint4* a = reinterpret_cast<const uint4*>(src - mis);
-        for (uint32_t i = threadIdx.x; i < n / 16; i += blockDim.x) d[i] = shift16(ld_cv(a + i), ld_cv(a + i + 1), mis);
+        const uint32_t cnt = min(kCopyU * T, nw - base);
+        uint4 v[kCopyU];
+        #pragma unroll
+        for (uint32_t u = 0; u < kCopyU; ++u)
+            if (t + u * T < cnt) v[u] = ld_cv(a + base + t + u * T);
+        uint4 extra = make_uint4(0, 0, 0, 0);
+        if (t == 0) extra = ld_cv(a + base + cnt);
+        #pragma unroll
+        for (uint32_t u = 0; u < kCopyU; ++u)
+            if (t + u * T < cnt) s_w[t + u * T] = v[u];
+        if (t == 0) s_w[cnt] = extra;
+        __syncthreads();
+        for (uint32_t j = t; j < cnt; j += T) d[base + j] = shift16(s_w[j], s_w[j + 1], mis);
+        __syncthreads();
     }
 }
 
@@ -587,6 +648,11 @@ __device__ __forceinline__ uint32_t ld_volatile_u32(const uint32_t* p)
     return *(const volatile uint32_t*) p;
 }
 
+__device__ __forceinline__ void st_volatile_u64(uint64_t* p, uint64_t v)
+{
+    *(volatile uint64_t*) p = v;
+}
+
 // Workers (blocks 0..G-1) execute the commands in order, each command's 64 KiB chunks spread over the
 // workers by a global chunk counter; the reader (block G) copies commands from the host's plan ring
 // to the device ring. Completion of command i: every worker with a chunk of it is done; the last one
@@ -597,6 +663,7 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
     __shared__ uint64_t s_upto;                 // commands [.., s_upto) known complete (this CTA's view)
     __shared__ FetchCmd s_cmd;
     __shared__ int s_stop;
+    __shared__ uint4 s_w[kCopyTile + 1];        // cta_copy's staging of a source at an odd offset
     const int G = f.workers;
     const uint32_t N = f.plan_n;
     if (!f.deterministic && !ld_volatile_u64(&f.dctr[kDcNeedsHost])) return;
@@ -634,10 +701,11 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
                 FetchCmd c;
                 c.src = (uint64_t) w[0] | ((uint64_t) w[1] << 32);
                 c.dst = (uint64_t) w[2] | ((uint64_t) w[3] << 32);
-                c.bytes = w[4];
-                c.seq = w[5];
-                c.dep = w[6];
-                c.kind = w[7];
+                c.dep = (uint64_t) w[4] | ((uint64_t) w[5] << 32);
+                c.bytes = w[6];
+                c.seq = w[7];
+                c.kind = w[8];
+                c.pad = 0;
                 c.base = chunk;
                 chunk += (c.bytes + kFetchChunk - 1) / kFetchChunk;
                 f.dring[pos & (N - 1)] = c;
@@ -696,6 +764,7 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
                 s_cmd.seq = v->seq;
                 s_cmd.dep = v->dep;
                 s_cmd.kind = v->kind;
+                s_cmd.pad = 0;
             }
         }
         __syncthreads();
@@ -711,10 +780,10 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
             // projection) that a demotion into the same RAM slot must not overtake
             if (c.dep && threadIdx.x == 0)
             {
-                while (s_upto < (uint64_t) c.dep)
+                while (s_upto < c.dep)
                 {
                     const uint64_t k = s_upto;
-                    if (ld_volatile_u32(&f.ddone[k & (N - 1)]) == (uint32_t) (k + 1) ||
+                    if (ld_volatile_u64(&f.ddone[k & (N - 1)]) == k + 1 ||
                         reinterpret_cast<const volatile FetchCmd*>(f.dring)[k & (N - 1)].kind == kPlanEnd)
                     {
                         s_upto = k + 1;
@@ -730,7 +799,7 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
             {
                 const uint32_t off = j * kFetchChunk;
                 const uint32_t n = min(kFetchChunk, c.bytes - off);
-                cta_copy(reinterpret_cast<const uint8_t*>(c.src) + off, reinterpret_cast<uint8_t*>(c.dst) + off, n);
+                cta_copy(reinterpret_cast<const uint8_t*>(c.src) + off, reinterpret_cast<uint8_t*>(c.dst) + off, n, s_w);
             }
             __threadfence_system();
             __syncthreads();
@@ -741,8 +810,8 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
                 {
                     f.dcnt[idx & (N - 1)] = 0;
                     __threadfence();
-                    st_volatile_u32(&f.ddone[idx & (N - 1)], (uint32_t) (idx + 1));
-                    st_release_u32(&f.done_host[idx & (N - 1)], (uint32_t) (idx + 1));
+                    st_volatile_u64(&f.ddone[idx & (N - 1)], idx + 1);
+                    st_release_u64(&f.done_host[idx & (N - 1)], idx + 1);
                 }
             }
         }
@@ -751,12 +820,24 @@ __global__ void __launch_bounds__(kFetchThreads) tier_fetch_kernel(const FetchPa
     }
 }
 
+// One thread: *flag = value (release, system scope), after everything before it on the stream (the
+// layer-mode copies of a batch: the tier thread and the caller read the flag with a plain load)
+__global__ void tier_flag_write_kernel(uint64_t* flag, uint64_t value)
+{
+    st_release_u64(flag, value);
+}
+
 }  // namespace
 
 void tier_lookup_launch(const TierKParams& p, const int64_t* ids, int n, int lc, int mode, uint32_t seq,
                         uint64_t tokens, cudaStream_t stream)
 {
     tier_lookup_kernel<<<1, T, 0, stream>>>(p, ids, n, lc, mode, seq, tokens);
+}
+
+void tier_flag_write_launch(uint64_t* flag, uint64_t value, cudaStream_t stream)
+{
+    tier_flag_write_kernel<<<1, 1, 0, stream>>>(flag, value);
 }
 
 cudaError_t tier_fetch_launch(const FetchParams& f, uint32_t seq, cudaStream_t stream)

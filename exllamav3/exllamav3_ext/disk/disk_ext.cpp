@@ -268,10 +268,12 @@ std::unique_ptr<DiskTicket> disk_gather_rows
     const c10::optional<at::Tensor>& flag,
     int64_t flag_index,
     int64_t flag_value,
-    int64_t deadline_ns
+    int64_t deadline_ns,
+    int64_t direct
 )
 {
     stamp(0);
+    TORCH_CHECK(direct >= -1 && direct <= 1, "disk_gather_rows: direct must be -1, 0 or 1");
     TORCH_CHECK(uids.device().is_cpu() && uids.scalar_type() == at::kLong &&
                 uids.is_contiguous() && uids.dim() == 1,
                 "disk_gather_rows: uids must be a contiguous 1-D int64 CPU tensor");
@@ -296,6 +298,7 @@ std::unique_ptr<DiskTicket> disk_gather_rows
     o.deadline_ns = deadline_ns;
     o.flag = flag_ptr(flag, flag_index, flag_value, &keep);
     o.flag_value = (uint32_t) flag_value;
+    o.direct = (int) direct;
     const int64_t* up = uids.data_ptr<int64_t>();
     int64_t n = uids.numel();
 
@@ -568,6 +571,12 @@ int64_t disk_set_thread_class(int64_t cls)
 {
     TORCH_CHECK(cls >= 0 && cls < exl3_disk::kClasses, "disk engine: class out of range");
     return exl3_disk::set_thread_class((int) cls);
+}
+
+int64_t disk_set_thread_direct(int64_t direct)
+{
+    TORCH_CHECK(direct >= -1 && direct <= 1, "disk engine: direct must be -1, 0 or 1");
+    return exl3_disk::set_thread_direct((int) direct);
 }
 
 std::string disk_ngram_route()

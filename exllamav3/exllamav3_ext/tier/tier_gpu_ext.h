@@ -40,6 +40,13 @@ public:
     void start();
     void stop();
     void lookup(int64_t lc, const at::Tensor& ids, int64_t mode, int64_t seq, int64_t tokens);
+    // layer mode (tier_gpu.h): the caller's current stream is the compute stream
+    void layer_begin();
+    void layer_plan(int64_t lc, int64_t half);
+    void layer_run(int64_t lc, const at::Tensor& ids, int64_t seq, int64_t tokens);
+    void layer_after(int64_t lc);
+    void predict(int64_t lc, const at::Tensor& ids, int64_t seq, int64_t tokens);
+    std::vector<int64_t> layer_addrs(int64_t lc, int64_t e);
     int64_t step(bool wait);
     void drain();
     void verify();

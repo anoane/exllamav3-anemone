@@ -11,14 +11,12 @@ examples of doc/expert_tiers.md and the three test layouts:
 
     python tests/test_expert_tier_config_.py
 
-expert_tier_config.py and placement.py are torch-free and loaded by path; experts=cache, which
-this build refuses at parse time (placement_storage.PENDING), is parsed with that gate lifted.
+expert_tier_config.py and placement.py are torch-free and loaded by path.
 """
 import importlib.util
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,12 +35,11 @@ GiB, MiB = 1 << 30, 1 << 20
 VS, RS = 13_271_040, 13_320_192
 MEM_TOTAL = 140_802_264 * 1024          # MemTotal of the 134.3 GiB VM DESIGN.md sized against
 STAGING = 2 * 384 * VS                  # double staging of one 384-expert layer: 9.49 GiB
-HEADROOM = 1024 * MiB
+HEADROOM = 4096 * MiB
 
 
 def parse(text):
-    with patch.dict(P.storage.PENDING, {}, clear = True):
-        return P.parse(text)
+    return P.parse(text)
 
 
 def layers(which = range(40), hot = 0, device = lambda i: "cuda:0"):
@@ -83,7 +80,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((c.admit_p, c.adapt_every, c.admit_pmin, c.sample, c.ram_admit, c.refill, c.refill_inflight),
                          (None, 2048, 0.05, 16, "always", True, 2))
         self.assertEqual((c.disk_slab, c.headroom_mb, c.min_link_gbs, c.spin_us, c.affinity, c.deterministic,
-                          c.verify, c.trace, c.heat_file), (None, 1024, 2.0, -1, None, False, False, None, None))
+                          c.verify, c.trace, c.heat_file), (None, 4096, 2.0, -1, None, False, False, None, None))
         self.assertEqual(c.changed(), [])
         # SETTINGS and the dataclass agree on every default
         for s in T.SETTINGS:
@@ -161,7 +158,7 @@ class SizingTests(unittest.TestCase):
         self.assertEqual((s.cached, s.tier_slots, s.disk_only, s.slab_slots), (10752, 4207, 0, 0))
         self.assertEqual(s.ram_bytes, 4207 * RS)                                      # 52.2 GiB
         self.assertEqual(s.text.splitlines()[1], "    ram experts 52.2 GiB pinned (static 0 MiB + tier 4207 slots), "
-                                                 "policy lazy-exclusive demote=swap, evict=lfu")
+                                                 "policy exclusive demote=heat, evict=lfu")
         self.assertTrue(s.final)
 
     def test_t6_pro_alone(self):
@@ -169,10 +166,24 @@ class SizingTests(unittest.TestCase):
                  {"cuda:0": room(80)}, ngram_bytes = 6 * GiB)
         self.assertEqual((s.devices[0].slots, s.devices[0].held, s.tier_slots), (6068, 6060, 7738))
         self.assertEqual(s.disk_only, 15360 - 6060 - 7738)                            # 1562 only on the SSD
-        self.assertEqual((s.slab_slots, s.slab_bytes), (8, 8 * RS))
-        self.assertEqual(s.left_unpinned, 126 * GiB - 7738 * RS - 6 * GiB - 8 * RS)
-        self.assertIn("disk experts=model io=auto: 1562 experts on disk only, slab 8 slots (102 MiB); 23.9 GiB of "
+        # the slab (EXL3_MOE_TIER_DISK_SLAB=auto): a decode call's 8, plus prefetch=layer (auto: depth 1)
+        # room for two layers' shares of the disk-only experts, a quarter more for uneven layers
+        # (ceil(1562 x 1.25 / 40) = 49 per layer)
+        self.assertEqual((s.slab_slots, s.slab_bytes), (8 + 2 * 49, 106 * RS))
+        self.assertEqual(s.left_unpinned, 126 * GiB - 7738 * RS - 6 * GiB - 106 * RS)
+        self.assertIn("disk experts=model io=auto: 1562 experts on disk only, slab 106 slots (1.3 GiB); 22.7 GiB of "
                       "RAM left unpinned", s.text)
+        # a deeper read-ahead and the router look-ahead take more; an explicit size, exactly that
+        s = size("*=cuda:0 experts=cache prefetch=layer:3+router:2; cuda:0 cache=75GiB; ram experts=96GiB", layers(),
+                 memory(126), {"cuda:0": room(80)})
+        self.assertEqual(s.slab_slots, 8 + 4 * 49 + 2 * 6)
+        # no read-ahead: the layer a layer-mode prefill stages still reads its disk-only experts through the slab
+        s = size("*=cuda:0 experts=cache prefetch=off; cuda:0 cache=75GiB; ram experts=96GiB", layers(),
+                 memory(126), {"cuda:0": room(80)})
+        self.assertEqual(s.slab_slots, 8 + 49)
+        s = size("*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB", layers(), memory(126),
+                 {"cuda:0": room(80)}, cfg = T.TierConfig(disk_slab = 300))
+        self.assertEqual((s.slab_slots, s.slab_bytes), (300, 300 * RS))
 
     def test_t7_hot_and_pagecache(self):
         lay = layers(hot = 16)
@@ -268,7 +279,7 @@ class SizingTests(unittest.TestCase):
         # (L2) budgets above free RAM; the disk slab is pinned too
         self.assertEqual(refused(self, RuntimeError, "*=cuda:0 experts=cache; cuda:0 cache=75GiB; ram experts=96GiB "
                                  "ngram=6GiB", layers(), memory(53), {"cuda:0": room(80)}, ngram_bytes = 6 * GiB),
-                         "placement: ram experts=96.0 GiB + ngram=6.0 GiB + disk slab=102 MiB need 102.1 GiB of host "
+                         "placement: ram experts=96.0 GiB + ngram=6.0 GiB + disk slab=1.3 GiB need 103.3 GiB of host "
                          "memory, but 53.0 GiB is available and 2.0 GiB is kept free (EXL3_HOST_MEM_RESERVE_MB) (no swap: "
                          "pinned and anonymous memory cannot be reclaimed); lower the budgets or use auto")
         # (L3) cache below its minimum
@@ -281,7 +292,7 @@ class SizingTests(unittest.TestCase):
                                  layers(), memory(126), {"cuda:0": room(80)}),
                          "placement: cuda:0 cache=90GiB does not fit: 80.0 GiB is free on cuda:0 after the placed "
                          "modules, the cache and the margins (the prefill staging, 9.5 GiB with "
-                         "EXL3_MOE_TIER_STAGING=double, and EXL3_MOE_TIER_HEADROOM_MB=1024 are set aside first)")
+                         "EXL3_MOE_TIER_STAGING=double, and EXL3_MOE_TIER_HEADROOM_MB=4096 are set aside first)")
         # (L8) a RAM tier smaller than one decode step
         self.assertEqual(refused(self, ValueError, "*=cuda:0 experts=cache; ram experts=50MiB", layers(), memory(126),
                                  {"cuda:0": room(80)}),

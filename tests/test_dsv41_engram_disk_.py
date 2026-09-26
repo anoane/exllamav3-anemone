@@ -8,7 +8,11 @@ checkpoint: the hash is replaced by a deterministic stand-in, the tables are a s
   - a retired prefetch releases its disk ticket before its staging set is reused;
   - the route comes from the extension (disk_ngram_route), not from the environment: where the
     extension says "original" (Windows), EXL3_DISK_BACKEND=odirect in the environment must not
-    send the gather to the engine.
+    send the gather to the engine;
+  - a placement's disk io= (the module's io_direct): buffered and O_DIRECT row reads, same bytes;
+  - the n-gram budget (--ngram_ram): a table held whole in RAM and a row cache of the streamed ones
+    give the same bytes, inline and through the prefetch worker (the misses land in the cache when
+    the consumer waits), on the engine and on the original route.
 
 The full extension is used by default; EXL3_DISK_TEST_MINI=1 uses the small test build of the
 same sources and bindings (tests/disk_engine/mini_ext.py) in place of exllamav3_ext.
@@ -114,6 +118,8 @@ def _module(table, monkeypatch):
     eg.w_handle = _Handle(path, w_off, HEAD_DIM)
     eg.s_handle = _Handle(path, s_off, HEAD_DIM // 32)
     eg._pins, eg._pending, eg._disk_argv = [], [], None
+    eg.io_direct = -1
+    eg.ram_tables, eg.streamed, eg.row_cache = {}, [0, 1], None
     eg.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
     return eg
 
@@ -214,3 +220,77 @@ def test_route_comes_from_the_extension(table, monkeypatch):
     U, t = eg._stage(hist, pin, False, None, 0, True)
     assert t is None
     _check(pin, U, _expect(table, hist))
+
+
+@pytest.mark.parametrize("cfg", [{"backend": "pread"}, {"backend": "io_uring"}], ids = ["pread", "io_uring"])
+def test_page_cache_modes(table, monkeypatch, cfg):
+    """disk io=buffered / direct: the engram's row gathers in the placement's page-cache mode, the same
+    bytes either way, inline and through the prefetch worker"""
+    ext.disk_engine_configure(cfg)
+    eg = _module(table, monkeypatch)
+    rng = np.random.default_rng(5)
+    for io in (0, 1, -1):
+        eg.io_direct = io
+        hist = torch.from_numpy(rng.integers(0, 1 << 20, size = (1, CTX + 300))).long()
+        want = _expect(table, hist)
+        pin = eg._acquire_pin(300 * N_COLS)
+        U, t = eg._stage(hist, pin, False, None, 0, False)
+        assert t is None
+        _check(pin, U, want)
+        pin.held = False
+        pin = eg._acquire_pin(300 * N_COLS)
+        pin.w.zero_()
+        U, t = eg.engram_ctx.executor.submit(eg._stage, hist, pin, False, eg._fds(), 2, False, False).result()
+        eg._finish(t)
+        _check(pin, U, want)
+        pin.held = False
+
+
+def _whole(table, which):
+    path, rows, w_off, s_off, buf = table
+    if which == 0:
+        return torch.from_numpy(buf[w_off : w_off + rows * HEAD_DIM].reshape(rows, HEAD_DIM).copy())
+    return torch.from_numpy(buf[s_off : s_off + rows * 8].reshape(rows, 8).copy())
+
+
+@pytest.mark.parametrize("cfg", [{"backend": "original"}, {"backend": "pread"}, {"backend": "io_uring"}],
+                         ids = ["original", "pread", "io_uring"])
+@pytest.mark.parametrize("held", [(), (1,), (0, 1)], ids = ["none-whole", "scales-whole", "all-whole"])
+def test_whole_tables_and_row_cache(table, monkeypatch, cfg, held):
+    """--ngram_ram: the tables held whole serve their rows by index; the streamed ones go through a row
+    cache. Repeated gathers hit the cache; every gather, inline or prefetched (the misses land in the
+    staging rows and the cache when the consumer waits), has the table's bytes"""
+    from exllamav3.modules.ngram_row_cache import RowCache
+    ext.disk_engine_configure(cfg)
+    eg = _module(table, monkeypatch)
+    eg.ram_tables = {t: _whole(table, t) for t in held}
+    eg.streamed = [t for t in (0, 1) if t not in held]
+    rbs = (HEAD_DIM, HEAD_DIM // 32)
+    eg.row_cache = RowCache("engram", [rbs[t] for t in eg.streamed], 16 << 20) if eg.streamed else None
+    if not eg.streamed:
+        monkeypatch.setattr(dm, "ext", types.SimpleNamespace(
+            disk_ngram_route = ext.disk_ngram_route,
+            ngram_gather_cpu = lambda *a, **k: pytest.fail("a whole table was read from disk"),
+            disk_gather_rows = lambda *a, **k: pytest.fail("a whole table was read from disk")))
+    rng = np.random.default_rng(6)
+    hists = [torch.from_numpy(rng.integers(0, 1 << 20, size = (1, CTX + L))).long() for L in (1, 300, 2048)]
+    for rep in range(2):
+        for hist in hists:
+            L = hist.shape[1] - CTX
+            want = _expect(table, hist)
+            pin = eg._acquire_pin(L * N_COLS)
+            pin.w.zero_()
+            U, t = eg._stage(hist, pin, False, None, 0, L < dm.PREFETCH_MIN_TOKENS)
+            eg._finish(t)
+            _check(pin, U, want)
+            pin.held = False
+            pin = eg._acquire_pin(L * N_COLS)
+            pin.w.zero_()
+            pin.s.zero_()
+            U, t = eg.engram_ctx.executor.submit(eg._stage, hist, pin, False, eg._fds(), 2, False, False).result()
+            eg._finish(t)
+            _check(pin, U, want)
+            pin.held = False
+    if eg.row_cache is not None:
+        st = eg.row_cache.stats()
+        assert st["hits"] > 0 and st["misses"] > 0, st

@@ -335,8 +335,9 @@ public:
             }
         }
 
-        // Bounce arena for O_DIRECT rows: one slot per ring slot
-        if (cfg.direct_rows)
+        // Bounce arena for O_DIRECT rows: one slot per ring slot (8 MiB at the default depth).
+        // Always there, whatever EXL3_DISK_DIRECT says: a request may ask for O_DIRECT rows itself
+        // (Options::direct, a placement's disk io=direct)
         {
             bounce_total_ = (size_t) main_.entries * kBounceBytes;
             void* p = mmap(nullptr, bounce_total_, PROT_READ | PROT_WRITE,

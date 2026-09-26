@@ -93,8 +93,9 @@ SETTINGS = (
     Setting("EXL3_MOE_TIER_COMPACT", "compact", True, "bool",
             help = "move the cold-filled RAM tier slots to the compact layout (one aligned copy per promotion: "
                    "49 against 40 GB/s from the odd offsets of the extent layout on the AI VM)"),
-    Setting("EXL3_MOE_TIER_HEADROOM_MB", "headroom_mb", 1024, "int", 0, 1 << 20,
-            help = "VRAM (MiB) left free on each GPU after its expert cache"),
+    Setting("EXL3_MOE_TIER_HEADROOM_MB", "headroom_mb", 4096, "int", 0, 1 << 20,
+            help = "VRAM (MiB) left free on each GPU after its expert cache, for what a forward allocates beyond "
+                   "the load's measured transient"),
     Setting("EXL3_MOE_TIER_MIN_LINK_GBS", "min_link_gbs", 2.0, "float", 0.0, 1e6,
             help = "host link (GB/s, measured at load) below which a GPU may not hold an expert cache; 0 allows any"),
     Setting("EXL3_MOE_TIER_SPIN_US", "spin_us", -1, "int", -1, 1 << 30,
@@ -172,7 +173,7 @@ class TierConfig:
     disk_slab: int | None = None
     hugepage: bool = False
     compact: bool = True
-    headroom_mb: int = 1024
+    headroom_mb: int = 4096
     min_link_gbs: float = 2.0
     spin_us: int = -1
     affinity: tuple | None = None
@@ -275,6 +276,35 @@ class TierSizing:
     ram_sized: bool = False         # the RAM tier's size is known (an explicit size, or final)
     counted: bool = False           # the disk-only experts are known (every pool sized)
     text: str = ""
+
+
+def read_ahead_depths(placement, layers: TierLayers) -> tuple:
+    """The deepest prefetch=layer and prefetch=router of the cache layers (auto: layer:1, router off)"""
+    dl = dr = 0
+    for i in layers.experts:
+        pf = placement.experts_for_layer(i).prefetch
+        if pf is None:
+            dl = max(dl, 1)
+            continue
+        depth = dict(pf)
+        dl = max(dl, depth.get("layer", 0))
+        dr = max(dr, depth.get("router", 0))
+    return dl, dr
+
+
+def auto_slab(placement, layers: TierLayers, out: "TierSizing") -> int:
+    """EXL3_MOE_TIER_DISK_SLAB=auto: one decode call's misses (8), plus room for a layer-mode prefill
+    to stage one layer's disk-only experts while the next D layers are read ahead (D + 1 layers' shares
+    of the disk-only experts, D the deepest prefetch=layer, a quarter more for uneven layers), plus
+    the experts prefetch=router predicts (top-k per layer of look-ahead). 8 when the disk holds no
+    expert VRAM and RAM do not (or before the pools are sized)"""
+    if not out.counted or not out.disk_only:
+        return MAX_BSZN
+    dl, dr = read_ahead_depths(placement, layers)
+    n = max(1, len(layers.experts))
+    per_layer = -(-out.disk_only * 5 // (4 * n))
+    per_layer = min(per_layer, max(layers.experts.values()))
+    return min(4096, MAX_BSZN + (dl + 1) * per_layer + dr * layers.top_k)
 
 
 def pagecache_auto(mem_total: int | None) -> int:
@@ -419,8 +449,9 @@ def size_tiers(placement, layers: TierLayers, cfg: TierConfig, memory: HostMemor
                                f"spare ones, {out.tier_slots} RAM slots); raise ram experts= by "
                                f"{human(out.disk_only * rs)} or allow disk reads")
     if disk.experts != "off":
-        out.slab_slots = cfg.disk_slab if cfg.disk_slab is not None else MAX_BSZN
-        out.slab_bytes = out.slab_slots * rs
+        out.slab_slots = cfg.disk_slab if cfg.disk_slab is not None else auto_slab(placement, layers, out)
+        # one slab per cache GPU
+        out.slab_bytes = out.slab_slots * rs * len(layers.devices())
 
     # one host check of everything the component pins
     ledger = HostLedger(memory = memory, reserve = reserve)

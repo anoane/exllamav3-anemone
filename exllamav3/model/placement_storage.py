@@ -12,8 +12,8 @@ much of each level they may take. Three rules, headed by the resource they gover
 
 Also here: the tokenizer shared with the layer rules (double quotes protect a value with spaces,
 ';', '#' or '"'), attribute parsing with did-you-mean hints, the checks that tie storage rules to
-layer rules, and the words a build accepts in the grammar but cannot run yet (PENDING). Sizes and
-their units come from util/host_budget.py. Torch-free.
+layer rules, and what each word needs to run (the checks at parse time; the expert tier's load
+checks the rest). Sizes and their units come from util/host_budget.py. Torch-free.
 """
 
 from __future__ import annotations
@@ -48,24 +48,12 @@ HEADS_HELP = "layers (7, 0-11, 0-3,8-11), '*', 'embed', 'head', 'cuda:<n>', 'ram
 VRAM_EVICT = ("lru", "lfu")
 RAM_EVICT = ("lfu", "lru")
 ADMIT = ("adaptive", "heat", "always")
-POLICIES = ("lazy-exclusive", "exclusive", "inclusive")
-DEMOTE = ("swap", "heat", "all", "off")
+POLICIES = ("exclusive", "lazy-exclusive", "inclusive")    # measured fastest on the test host (doc/expert_tiers.md)
+DEMOTE = ("heat", "swap", "all", "off")
 IO = ("auto", "direct", "buffered")
 DEFAULT_SPARE = 8
 PREFETCH_METHODS = ("layer", "router")
 DEVICE = re.compile(r"^cuda:([0-9]+)$")      # ASCII digits only
-
-# Words the grammar accepts and checks but this build cannot run yet, with what each one needs. A
-# placement using one is refused at parse time (refuse_pending) after every other check, so its
-# text is validated already; the commit that makes a word runnable removes its entry
-PENDING = {
-    "disk experts=<dir>": "expert reads from a copy in another directory (the cache reads the model's own shards)",
-    "prefetch=": "prefill read-ahead of the experts that only the disk holds",
-    "profile=": "expert profiles that seed the hot and cached experts",
-    "disk ngram=<dir>": "n-gram tables read from a copy in another directory",
-    "disk io=": "a forced read mode for expert and n-gram reads",
-}
-
 
 # ---------------------------------------------------------------------------------------- tokens
 
@@ -363,6 +351,12 @@ def check(rules, devices: dict, ram: RamStore | None, disk: DiskStore | None, ti
         if disk.experts != "model" and not cache_devices:
             raise ValueError(f"placement: 'disk experts={disk.experts}' applies to experts=cache layers "
                              f"(stream and cpu layers keep every expert in RAM), and there are none")
+        if disk.experts == "off":
+            ahead = [r.experts.prefetch for r in rules if r.experts.prefetch]
+            if ahead:
+                words = "+".join(m if d == 1 else f"{m}:{d}" for m, d in ahead[0])
+                raise ValueError(f"placement: prefetch={words} reads experts ahead from the disk, which 'disk "
+                                 f"experts=off' never reads; remove it (or write prefetch=off)")
         if disk.experts == "off" and r_eff.demote == "off" and r_eff.policy != "inclusive":
             raise ValueError("placement: 'disk experts=off' keeps no copy of an expert outside VRAM and RAM, so "
                              "demote=off would lose VRAM victims; drop demote=off (with the disk off, every victim "
@@ -423,31 +417,3 @@ def dict_to_text(d) -> str:
         if d.get(key):
             lines.append(" ".join([key] + [f"{k}={quote(str(v))}" for k, v in dict(d[key]).items()]))
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------------------- pending
-
-def pending_words(placement) -> list[str]:
-    """The PENDING words a placement uses, in PENDING's order"""
-    used = set()
-    for r in placement.rules:
-        if r.experts.prefetch is not None:
-            used.add("prefetch=")
-        if r.experts.profile is not None:
-            used.add("profile=")
-    disk = placement.disk
-    if disk is not None:
-        if disk.experts not in ("model", "off"):
-            used.add("disk experts=<dir>")
-        if disk.ngram not in ("model", "off"):
-            used.add("disk ngram=<dir>")
-        if disk.io != IO[0]:
-            used.add("disk io=")
-    return [w for w in PENDING if w in used]
-
-
-def refuse_pending(placement):
-    words = pending_words(placement)
-    if words:
-        raise ValueError(f"placement '{placement}': {words[0]} is not available in this build yet; it needs "
-                         f"{PENDING[words[0]]} (see doc/expert_tiers.md)")

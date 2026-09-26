@@ -1,5 +1,16 @@
 # Expert tiers: implementation plan
 
+**Status.** This is the plan the expert tier was built from, kept for its design reasoning, its
+exact policy semantics (section 3) and the micro-scenarios the tests cite (section 3.7). It is not
+the reference: [expert_tiers.md](expert_tiers.md) describes what the code does, and where the two
+differ, that document is right. The implementation departs from the plan where measurement or
+review said so: the layer-mode staging is planned by the caller's thread one layer ahead (the tier
+thread never calls CUDA), the fetch kernel copies decode and routed misses with the SMs rather than
+the copy engines, `prefetch=router` is implemented (section 0 lists it as deferred), hot pins are
+chosen at load only (T5.1's re-choice between generations is not implemented; the VRAM cache
+adapts instead), and the commit series of section 11 was regrouped. File and line references are
+to the tree the plan was written against.
+
 Date: 2026-09-25. Worktree `dsv41-release/engine-tier`, branch `expert-tier`, based on `disk-pr3`
 at `bfba0e0` (upstream `dev` + PR 1 + PR 2 + the disk engine). Every `file:line` below is at
 `bfba0e0` in this worktree. The branch is rebased onto the final stack later, so the tier lives
@@ -96,7 +107,8 @@ O_DIRECT extents into registered pinned slots through one disk engine (4.2); cop
 
 The duplex measurement now decides DESIGN 6.4's rule: at 1:20 the PRO keeps 0.956-0.959 of its
 H2D rate, above 0.95, so **`demote=swap` stays the default and runs inline** on the low-priority
-stream (1.1).
+stream (1.1). (Superseded by the measurement on the test host: the defaults are now `policy=exclusive`
+and `demote=heat`, see doc/expert_tiers.md, "Tuning".)
 
 ### 1.3 Departures and refinements (each with its reason)
 

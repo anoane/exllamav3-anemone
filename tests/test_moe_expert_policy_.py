@@ -137,8 +137,8 @@ Host = source_class(HOST, "MoeCpuHost", {
     "_ensure_stream_state", "prefill_worst_case_parts",
 })
 Mixin = source_class(MIXIN, "BlockSparseMLP_CPU", {
-    "placement_plan", "cpu_expert_mode", "_cpu_eligible", "cpu_maybe_offload_load", "cpu_maybe_split_load",
-    "cpu_split_submit", "can_defer_load",
+    "placement_layer_index", "placement_plan", "cpu_expert_mode", "_cpu_eligible", "cpu_maybe_offload_load",
+    "cpu_maybe_split_load", "cpu_split_submit", "can_defer_load",
 })
 
 

@@ -85,8 +85,8 @@ class TierError(RuntimeError):
 @dataclass(frozen = True)
 class PolicyConfig:
     """What the tier decides. The placement's words, plus the EXL3_MOE_TIER_* / EXL3_MOE_HEAT_* tuning"""
-    policy: str = "lazy-exclusive"          # ram policy=
-    demote: str = "swap"                    # ram demote=
+    policy: str = "exclusive"               # ram policy=
+    demote: str = "heat"                    # ram demote=
     admit: str = "adaptive"                 # cuda:<n> admit=
     evict: str = "lru"                      # cuda:<n> evict= (the VRAM pool)
     ram_evict: str = "lfu"                  # ram evict=
@@ -593,19 +593,37 @@ class TierCore:
     def layer_call(self, lc: int, ids: list) -> list:
         """A layer-mode prefill call: heat only (no stamps, no admission, no demotion); every
         cached expert of the layer that VRAM does not hold is staged (from RAM, or read from the
-        SSD into the slab). Returns the staging actions, then any refills"""
+        SSD into the slab). Returns the staging actions, then any refills. The same as layer_plan()
+        followed by layer_record() with the call's experts, which the GPU runtime runs apart (the plan
+        before the layer runs, the record once its routing is known)"""
+        if not 0 <= lc < self.L:
+            raise TierError(f"layer call: layer {lc} out of range")
         self.seq += 1
-        self.c["calls"] += 1
-        cnt = {}
+        rec = Record(self.seq, lc, LAYER)
+        at = {}
         for e in ids:
-            cnt[int(e)] = cnt.get(int(e), 0) + 1
-        for e, n in cnt.items():
-            self.heat.add(self.key(lc, e), n * self.cfg.prefill_inc)
-        acts, bypassed, i = [], [], 0
+            e = int(e)
+            if not 0 <= e < self.E:
+                raise TierError(f"layer call: expert {e} out of range")
+            if e not in at:
+                at[e] = len(rec.entries)
+                rec.entries.append(Entry(self.key(lc, e), TRANSIENT, -1, 0, 0))
+            rec.entries[at[e]].cnt += 1
+        acts = self.layer_plan(lc)
+        acts += self.layer_record(rec, log = False)
+        self.log.append((Record(rec.seq, lc, LAYER), acts))
+        return acts
+
+    def layer_plan(self, lc: int) -> list:
+        """Layer mode, first half: the staging of every cached expert of layer lc that VRAM does not
+        hold, in expert order (staging index i): ("stage_ram", key, ram slot, i) or ("stage_ssd",
+        key, i). Needs no routing"""
+        if not 0 <= lc < self.L:
+            raise TierError(f"layer call: layer {lc} out of range")
+        acts, i = [], 0
         for e in range(self.E):
             k = self.key(lc, e)
-            s = self.vram.slot_of[k]
-            if s >= 0:
+            if self.vram.slot_of[k] >= 0:
                 continue
             r = self.ram.of[k]
             if r >= 0:
@@ -616,12 +634,30 @@ class TierCore:
                     raise TierError(f"disk experts=off but key {k} is in neither VRAM nor RAM")
                 self.c["prefill_ssd"] += 1
                 acts.append(("stage_ssd", k, i))
-                if e in cnt:
-                    bypassed.append(k)
             i += 1
-        self.refill(bypassed, acts)
+        return acts
+
+    def layer_record(self, rec: Record, log: bool = True) -> list:
+        """Layer mode, second half, with the call's experts (a LAYER record: key and count per
+        expert used): heat, the call counter, and refills of the used experts that only the disk
+        holds (in expert order)"""
+        lc = rec.lc
+        if not 0 <= lc < self.L:
+            raise TierError(f"layer call: layer {lc} out of range")
+        self.seq = rec.seq
+        self.c["calls"] += 1
+        bypassed = []
+        for x in rec.entries:
+            if not lc * self.E <= x.key < (lc + 1) * self.E:
+                raise TierError(f"layer call: key {x.key} outside layer {lc}")
+            self.heat.add(x.key, x.cnt * self.cfg.prefill_inc)
+            if x.cnt and self.vram.slot_of[x.key] < 0 and self.ram.of[x.key] < 0:
+                bypassed.append(x.key)
+        acts = []
+        self.refill(sorted(bypassed), acts)
         self.maybe_adapt()
-        self.log.append((Record(self.seq, lc, LAYER), acts))
+        if log:
+            self.log.append((Record(rec.seq, lc, LAYER), acts))
         return acts
 
     # ---- the host side of one record (3.2)

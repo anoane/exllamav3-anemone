@@ -25,7 +25,7 @@ enum Evict : int { kLru = 0, kLfu = 1 };
 enum RamAdmit : int { kRamAdmitAlways = 0, kRamAdmitHeat = 1 };
 enum SlotState : uint8_t { kFree = 0, kValid = 1, kRetiring = 2, kPinned = 3 };
 enum Kind : uint8_t { kHit = 0, kAdmitted = 1, kTransient = 2 };
-enum Mode : int { kDecode = 0, kRouted = 1, kLayer = 2 };
+enum Mode : int { kDecode = 0, kRouted = 1, kLayer = 2, kPredict = 3 };
 
 constexpr uint64_t kGolden = 0x9E3779B97F4A7C15ull;      // access draws: seed ^ (access * kGolden)
 constexpr uint64_t kDrawMul = 0xD1B54A32D192ED03ull;     // RAM samples: seed ^ (draw * kDrawMul)
@@ -43,8 +43,8 @@ uint64_t p_q32(double p);
 
 struct PolicyConfig
 {
-    int policy = kLazyExclusive;
-    int demote = kDemoteSwap;
+    int policy = kExclusive;
+    int demote = kDemoteHeat;
     int admit = kAdmitAdaptive;
     int evict = kLru;                   // the VRAM pool
     int ram_evict = kLfu;
@@ -224,9 +224,18 @@ public:
     void host(const Record& rec, std::vector<Action>& acts);
     // A record decided elsewhere (the lookup kernel): its counters and heat, the directory mirror
     // (apply), then host(). Heat is added at the epoch of heat.tokens, which the caller sets to the
-    // tokens the lookup saw
+    // tokens the lookup saw. A layer-mode record (kLayer) goes to layer_record()
     void process(const Record& rec, std::vector<Action>& acts);
+    // A layer-mode prefill call (the CPU replay): layer_plan() then, with the call's experts,
+    // layer_record() (the same actions, the same order)
     void layer_call(int32_t lc, const int32_t* ids, int64_t n, std::vector<Action>& acts);
+    // Layer mode, first half: staging of every cached expert of layer lc that VRAM does not hold
+    // (kActStageRam from its RAM slot, kActStageSsd from the disk, staging index in expert order).
+    // Needs no routing: the GPU runtime plans a layer before it runs
+    void layer_plan(int32_t lc, std::vector<Action>& acts);
+    // Layer mode, second half, once the call's experts are known (the lookup kernel's heat-only
+    // record): heat, the call counter, and refills of the experts it used that only the disk holds
+    void layer_record(const Record& rec, std::vector<Action>& acts);
     void complete(std::vector<Action>& acts);
     // Throws TierError naming the first invariant that fails
     void check(bool deterministic) const;

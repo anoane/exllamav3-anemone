@@ -98,6 +98,7 @@ from ..loader.safetensors import DiskTensorHandle, convert_dtype
 from ..model.math_policy import STABLE_ARITHMETIC
 from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
+from .ngram_row_cache import Landing, CachedTicket
 
 PREFETCH_ENABLED = os.environ.get("EXL3_DSV41_ENGRAM_PREFETCH", "1") != "0"   # A/B switch
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines: decode
@@ -250,6 +251,10 @@ class DSV41Engram(Module):
         self._pins = []
         self._pending = []          # queued prefetches, oldest first: {"hist", "pin", "future"}
         self._disk_argv = None      # (fds, offsets, row_bytes) for disk_gather_rows, per fd pair
+        self.io_direct = -1         # the placement's disk io= (-1 the engine's choice, 0 buffered, 1 O_DIRECT)
+        self.ram_tables = {}        # table index (0 rows, 1 scales) -> the table held whole in RAM
+        self.streamed = [0, 1]      # the tables read from disk
+        self.row_cache = None       # RowCache of the streamed tables' rows
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
 
     @property
@@ -317,6 +322,37 @@ class DSV41Engram(Module):
         stc = self.config.stc
         self.w_handle = stc.get_tensor_handle(f"{self.key}.embed.weight")
         self.s_handle = stc.get_tensor_handle(f"{self.key}.embed.scale")
+        # The placement's disk rule (model/disk_source.py): the rows from a checked copy of the
+        # table's shards (disk ngram=<dir>), and the page-cache mode of the reads (disk io=)
+        from ..model.placement import parse as parse_placement
+        from ..model.disk_source import source_dir, copy_path, io_direct, check_route
+        placement = parse_placement(getattr(self.config.infer_params, "placement", None))
+        copy_dir = source_dir(placement, "ngram")
+        if copy_dir:
+            self.w_handle, self.s_handle = (
+                DiskTensorHandle(h.key, copy_path(h.filename, copy_dir, "ngram"), h.abs_offset, h.shape, h.dtype)
+                for h in (self.w_handle, self.s_handle))
+        self.io_direct = io_direct(placement)
+        if self.io_direct >= 0:
+            check_route(placement, "engine" if _disk_engine() else "original", "DeepSeek-V4.1's engram rows")
+        # The n-gram budget (--ngram_ram, the placement's ram ngram=; model/ram_budget.py): tables
+        # held whole in RAM (smallest first: the scales), a cache of the rows of those that stream
+        from ..model.ram_budget import ngram_in_ram, ngram_row_cache_bytes, register_row_cache
+        from ..util.memory import check_host_memory
+        from .ngram_row_cache import RowCache, read_whole
+        self.ram_tables = {}
+        tables = self.ngram_tables()
+        for t, (name, nbytes, _, _) in enumerate(tables):
+            if ngram_in_ram(self.config, f"{self.key}.{name}", nbytes):
+                check_host_memory(nbytes, f"{self.key}.{name} held in RAM (--ngram_ram)")
+                self.ram_tables[t] = read_whole((self.w_handle, self.s_handle)[t])
+        self.streamed = [t for t in range(len(tables)) if t not in self.ram_tables]
+        self.row_cache = None
+        cache_bytes = ngram_row_cache_bytes(self.config, self.key) if self.streamed else 0
+        if cache_bytes:
+            check_host_memory(cache_bytes, f"the row cache of {self.key} (--ngram_ram)")
+            self.row_cache = RowCache(self.key, [tables[t][2] for t in self.streamed], cache_bytes)
+            register_row_cache(self.config, self.key, self.row_cache)
         # Equal byte widths do not establish the encoding: BF16[D/2] has the
         # same stride as FP8[D], but the raw gather would silently reinterpret it.
         # Check original dtype tags, exact shapes and file ranges without reading
@@ -361,6 +397,9 @@ class DSV41Engram(Module):
                     pass
         self._disk_argv = None
         self.w_handle = self.s_handle = None
+        self.ram_tables = {}
+        self.streamed = [0, 1]
+        self.row_cache = None
         self.q_weight = None
         self.k_weight = None
         super().unload()
@@ -373,6 +412,13 @@ class DSV41Engram(Module):
         }
         t.update(self.wkv.get_tensors())
         return t
+
+    def ngram_tables(self) -> list:
+        """[(name, bytes, row bytes, read by every gathered row)] of the two tables, from the layout (the
+        n-gram budget, model/ram_budget.py): the fp8 rows and their e8m0 scales, gathered together"""
+        n = self.layout.num_embeddings[self.table_index]
+        hd = self.layout.head_dim
+        return [("embed.weight", n * hd, hd, True), ("embed.scale", n * (hd // 32), hd // 32, True)]
 
     def table_numel(self) -> int:
         """Elements of the disk-resident table, weight and scale together."""
@@ -551,18 +597,49 @@ class DSV41Engram(Module):
         U, n = uids.numel(), inv.numel()
         pin.inv[:n].copy_(inv)
         if U:
+            # tables held whole in RAM (--ngram_ram)
+            for t, table in self.ram_tables.items():
+                torch.index_select(table, 0, uids, out = pin.outs[t][:U])
+            if not self.streamed:
+                return U, None
+            # the row cache: hits straight into the staging rows, the misses read into scratch rows
+            # and landed (staging and cache) once the read completes
+            ids, landing = uids, None
+            if self.row_cache is not None:
+                outs = [pin.outs[t] for t in self.streamed]
+                mpos, mslots = self.row_cache.lookup(uids, outs)
+                if not mpos.numel():
+                    return U, None
+                ids = uids.index_select(0, mpos)
+                scratch = [torch.empty((ids.numel(), pin.outs[t].shape[1]), dtype = torch.uint8) for t in self.streamed]
+                landing = Landing(self.row_cache, ids, mslots, mpos, scratch, outs)
             engine = _disk_engine()
             fw, fs = fds if fds is not None else self._fds(engine)
             if engine:
                 # rows land at row i of the whole staging tensors: no slicing in Python, and
                 # positional arguments (pybind's keyword path costs ~1.5 us more per call)
                 fl, offs, rbs = self._disk_args(fw, fs)
-                t = ext.disk_gather_rows(uids, 0, fl, offs, rbs, pin.outs, cls, hold, wait)
-                return U, t
-            ext.ngram_gather_cpu(fw, self.w_handle.abs_offset, self.w_handle.row_bytes,
-                                 uids, 0, pin.w[:U])
-            ext.ngram_gather_cpu(fs, self.s_handle.abs_offset, self.s_handle.row_bytes,
-                                 uids, 0, pin.s[:U])
+                if landing is None and len(self.streamed) == 2:
+                    t = ext.disk_gather_rows(uids, 0, fl, offs, rbs, pin.outs, cls, hold, wait, None, 0, 1, 0,
+                                             self.io_direct)
+                    return U, t
+                sel = self.streamed
+                outs = landing.scratch if landing is not None else [pin.outs[t] for t in sel]
+                t = ext.disk_gather_rows(ids, 0, [fl[i] for i in sel], [offs[i] for i in sel], [rbs[i] for i in sel],
+                                         outs, cls, hold, wait, None, 0, 1, 0, self.io_direct)
+                if landing is None:
+                    return U, t
+                if t is None:
+                    landing.land()
+                    return U, None
+                return U, CachedTicket(t, landing)
+            handles = (self.w_handle, self.s_handle)
+            fdl = (fw, fs)
+            for j, t in enumerate(self.streamed):
+                out = landing.scratch[j] if landing is not None else pin.outs[t][:U]
+                ext.ngram_gather_cpu(fdl[t], handles[t].abs_offset, handles[t].row_bytes, ids, 0, out)
+            if landing is not None:
+                landing.land()
         return U, None
 
     @staticmethod

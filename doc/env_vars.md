@@ -1307,11 +1307,15 @@ registers. A draft model or MTP head has its own cap, `-der` / `--draft_expert_r
 
 Default for `Config.infer_params.ngram_ram`, which `-ngr` / `--ngram_ram [SIZE]` sets in
 `model_init`-based scripts: the system RAM for n-gram embedding tables (PLE models, e.g.
-Qwen3.8-Flash-Next). `0` (the default) streams every row from disk; `all` (and a bare `-ngr`)
-holds every table whole; a size holds the tables that fit, whole, smallest first, and streams the
-others. The tables are checked against the host memory with the rest of the load before anything
-loads (`EXL3_HOST_MEM_RESERVE_MB`). DeepSeek-V4.1's engram tables are always read from disk
-whatever the budget. Full description: [expert_tiers.md](expert_tiers.md).
+Qwen3.8-Flash-Next) and DeepSeek-V4.1's engram tables. `0` (the default) streams every row from
+disk; `all` (and a bare `-ngr`) holds every table whole; a size holds the tables that fit, whole,
+smallest first (tables every gathered row reads first: the engram's 2.86 GiB scale tables), and
+gives what is left to a RAM cache of the rows of the tables that stream, split evenly over their
+modules (a direct-mapped cache of whole rows, none below 64 MiB; a row enters it only once its read
+completed, so the cache never changes a row's bytes). For DeepSeek-V4.1, `16GiB` holds both scale
+tables and caches about 20 million fp8 rows per engram layer; `100GiB` holds one layer's tables
+whole. The tables and caches are checked against the host memory with the rest of the load before
+anything loads (`EXL3_HOST_MEM_RESERVE_MB`). Full description: [expert_tiers.md](expert_tiers.md).
 
 ### `EXL3_NGRAM_STREAM` (default: `1`)
 
@@ -1545,7 +1549,8 @@ keep-alive (decided 2026-09-25; a decode engram call at 75% cached took 267 us a
 ### `EXL3_DISK_DIRECT` (default: `auto`)
 
 Which reads bypass the page cache: `none`, `rows`, `extents` or `all`; `auto` follows the backend
-(`pread` none, `odirect` all, `io_uring` extents).
+(`pread` none, `odirect` all, `io_uring` extents). A placement's `disk io=direct|buffered`
+overrides it for that model's expert and n-gram reads ([disk_engine.md](disk_engine.md)).
 
 ### `EXL3_DISK_QD` (default: `128` for `io_uring`, threads + 8 for the pools)
 
@@ -1685,19 +1690,24 @@ cache layer on the GPU), so the copies of the next layer's experts overlap the c
 compute (whole-layer double buffering); `single` keeps E - hot, without that overlap, and gives
 the other half to the cache pool. DeepSeek-V4.1 3.0 bpw: 9.49 GiB (`double`) or 4.75 GiB. The
 staging is set aside before the pool is sized; when it leaves too little for the smallest cache,
-the refusal names this variable. **This build** has no whole-layer prefill yet: it allocates and
-sizes one half (E - hot slots) whatever the value, used by the transients of routed calls.
+the refusal names this variable. In layer mode (`EXL3_MOE_TIER_PREFILL_ROWS`) the caller's thread
+copies the next cache layer's experts into one half on the copy engines while the current layer
+computes from the other; with `single` those copies wait for the current layer's compute. Decode
+and routed calls put their transients in the first half. `double` or `single`.
 
 ### `EXL3_MOE_TIER_PREFILL_ROWS` (default: `256`), `EXL3_MOE_TIER_DECODE_ROWS` (default: `8`)
 
 The row counts that decide how a call of a cache layer runs. Up to `DECODE_ROWS` (1-8, the largest
 decode-shaped MoE call) a call is a decode call: misses may be admitted into the cache and the
 use stamps are updated. From `PREFILL_ROWS` (2 to 1,048,576, above `DECODE_ROWS`) a call runs in
-layer mode: every expert of the next layer that VRAM does not hold is copied into the staging
-while the current one computes. Between the two, a call copies only the experts it touches
-(routed mode). Neither mode admits, stamps or demotes during prefill, so a long prompt never
-flushes the decode working set. **This build** runs every call above `DECODE_ROWS` in routed mode
-(the layer mode is not in it yet), so `PREFILL_ROWS` has no effect beyond its check.
+layer mode: every expert of the layer that VRAM does not hold was copied into a staging half on the
+copy engines while the previous layer computed (planned by the caller's thread right after that
+layer's compute was enqueued; its disk-only experts read ahead `prefetch=layer:D` layers earlier),
+the layer's pointer tables come from the host, and the call only adds heat. Between the two, a call
+copies only the experts it touches with the SMs before its compute (routed mode). Neither admits,
+stamps or demotes, so a long prompt never flushes the decode working set. A chunk of a few thousand
+rows touches nearly every expert of a layer, so layer mode copies little more than routed mode would
+and hides it behind compute; `1048576` keeps every prefill call routed.
 
 ### `EXL3_MOE_HEAT_HALFLIFE` (default: `256`), `EXL3_MOE_HEAT_PREFILL` (default: `0.0625`)
 
@@ -1710,8 +1720,14 @@ heat file.
 
 ### `EXL3_MOE_HEAT_FILE` (default: unset)
 
-A file the heat is saved to at unload and between generations, and read at load to seed the cold
-fill and the first decisions, so a restart warms from the last run. Unset: no file.
+A file the tier's heat (each expert's decayed routing count) is written to at unload and between
+generations (the generator's queue drained, at most once a minute), atomically (a temporary file
+renamed), in the `.exl3moe` profile format (`counts` in decode-assignment units, `layer_keys` of the
+cache layers, the model's fingerprint). A load whose placement names no `profile=` reads it back as
+its seed: the cold-fill order (every expert by its share of its layer's heat), the `hot=` pins (the
+hottest per layer) and the heat itself, so a restart warms from the last run. A file that does not
+exist yet is no seed; one that cannot be read, or that was written for another model, is reported
+and ignored. Unset: no file.
 
 ### `EXL3_MOE_TIER_ADMIT_P` (default: unset), `EXL3_MOE_TIER_ADAPT_EVERY` (default: `2048`), `EXL3_MOE_TIER_ADMIT_PMIN` (default: `0.05`)
 
@@ -1740,10 +1756,14 @@ that are dropped, never queued. `0` turns them off.
 
 ### `EXL3_MOE_TIER_DISK_SLAB` (default: `auto`)
 
-Pinned slots (one RAM tier slot each) for SSD reads that bypass the RAM tier: decode misses the
-RAM tier does not admit, and the prefill read-ahead. `auto` = 8 plus what the read-ahead needs;
-a number (1-4096) fixes it. Counted in the load's host-memory check (`disk slab=` in its
-message). None with `disk experts=off`.
+Pinned slots per GPU with cache layers (one RAM tier slot each, 13.3 MB for DeepSeek-V4.1) for SSD
+reads that bypass the RAM tier: a call's misses read together, the experts a layer-mode prefill
+stages from the disk, the layer read-ahead (`prefetch=layer:D`) and the router's predictions
+(`prefetch=router:D`); a slot keeps its expert after its copy until it is needed for another read,
+so a repeated miss copies it again without a read. `auto` = 8 + (D + 1) x a layer's share of the
+disk-only experts (a quarter more than the average) + Dr x top-k (D and Dr the deepest `prefetch=`
+depths), 8 when VRAM and RAM hold every cached expert; a number (1-4096) fixes it. Counted in the
+load's host-memory check (`disk slab=` in its message). None with `disk experts=off`.
 
 ### `EXL3_MOE_TIER_HUGEPAGE` (default: `0`)
 
@@ -1759,16 +1779,21 @@ At the end of the cold fill, move every RAM tier slot from the extent layout (th
 read put it: the three trellis tensors at odd offsets, in the checkpoint's tensor order) to the
 compact layout (the trellis tensors back to back from the slot's start, as in a VRAM slot), several
 threads at once, before the tier is page-locked for the copy engines. A promotion from a compact
-slot is one aligned copy instead of three unaligned ones: on the AI VM (RTX PRO 6000) 4.4 MB copies
-from page-locked memory run at 49.2 GB/s from an aligned source and at 39.9 GB/s (0.81x) from an
-odd offset. Slots filled later (SSD misses admitted into RAM, refills) keep the extent layout, and
+slot is one aligned copy instead of three at odd offsets (the fetch kernel reads an odd source as
+aligned words through shared memory, every byte once, but three copies of a third each cost more
+than one). Slots filled later (SSD misses admitted into RAM, refills) keep the extent layout, and
 demoted victims arrive compact. `0` keeps the extent layout. `0` or `1`.
 
-### `EXL3_MOE_TIER_HEADROOM_MB` (default: `1024`)
+### `EXL3_MOE_TIER_HEADROOM_MB` (default: `4096`)
 
-VRAM (MiB) each GPU keeps free after its expert cache, for the generator's statics and later
-allocations. An `auto` cache takes the rest of the device's `-gs` budget after the placed
-modules, the Cache, the margins, the prefill staging and this headroom.
+VRAM (MiB) each GPU keeps free after its expert cache, for what the forwards allocate beyond the
+largest transient the load measured: workspaces a first forward creates, transients that grow with
+the context (attention and index scores at later positions), and CUDA's own allocations. An `auto`
+cache takes the rest of the device's `-gs` budget after the placed modules, the Cache, the margins,
+the prefill staging and this headroom, so without it nothing else fits on the device afterwards. On
+the AI VM, DeepSeek-V4.1 on the PRO 6000 with every layer cached and 1024 MiB of headroom ran out of
+memory in the first prefill of a 16K-token prompt (allocated 1.1 GiB above the load's figure, the
+device full); resident and streamed layouts of the same model peak 1.4-1.7 GiB above theirs.
 
 ### `EXL3_MOE_TIER_MIN_LINK_GBS` (default: `2.0`)
 
@@ -1787,14 +1812,26 @@ at the cost of a wake-up on the first miss after a pause). It then sleeps in ste
 
 ### `EXL3_MOE_TIER_DETERMINISTIC` (default: `0`), `EXL3_MOE_TIER_VERIFY` (default: `0`), `EXL3_MOE_TIER_TRACE` (default: unset)
 
-`DETERMINISTIC=1`: the tier thread applies every call (copies, demotions, returned slots) before
-the call's stream may continue, and the lookup kernel never releases a call itself, so the cache's
-state follows the reference policy exactly after every call (replays, debugging; it changes timing
-only, never logits). Default: the kernel releases all-hit calls itself and demoted slots return
-when their copy lands. `VERIFY=1`: after every call of a cache layer the GPU is synchronized, the
-tier thread drains, and the device directory is compared with the tier thread's mirror (a
-difference raises; tests and debugging, slow). `TRACE=<path>`: reserved for a trace of every call
-record; this build accepts the value and does not write the file yet.
+`DETERMINISTIC=1`: the tier thread applies every decode and routed call (copies, demotions,
+returned slots) before the call's stream may continue, and the lookup kernel never releases a call
+itself, so the cache's state follows the reference policy exactly after every call (replays,
+debugging; it changes timing only, never logits). Default: the kernel releases all-hit calls
+itself and demoted slots return when their copy lands. `VERIFY=1`: after every call of a cache
+layer the GPU is synchronized, the tier thread drains, and the device directory is compared with
+the tier thread's mirror (a difference raises; tests and debugging, slow). `TRACE=<path>`: the tier
+thread writes every call record it handles to this file, one JSON line each after a header line
+(`{"seq", "lc", "mode", "tokens", "e": [[key, kind, count, dst, victim key, victim slot], ...]}`;
+key = cache layer index x experts + expert; kind 0 hit, 1 admitted, 2 transient or staged; mode 0
+decode, 1 routed, 2 layer); with cache layers on several GPUs, `.cuda<n>` is appended per GPU. A
+trace replays through the policy cores (the routing of every call, the working set of a workload).
+
+### `EXL3_MOE_PROFILE_DIR` (default: unset)
+
+Directories (separated by `os.pathsep`, `:` on Linux) searched for the expert profiles a
+placement's `profile=` names, after `<model dir>/moe_profiles/` and before
+`~/.cache/exllamav3/moe_profiles/`; in each, `<name>.exl3moe`, `.safetensors`, `.npz` and `.json`
+are tried in that order. A path in `profile=` is used as it is. Formats, weights, the model check
+and what a profile seeds: [expert_tiers.md](expert_tiers.md), "Profiles and the heat file".
 
 ## Multi-GPU
 

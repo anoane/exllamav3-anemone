@@ -6,7 +6,7 @@ The expert tier's reference policy (exllamav3/model/expert_tier_policy.py), torc
   2. invariants after every call on random configurations (every policy x demote x admit x evict x
      RAM admission, disk on and off where the RAM tier allows, spare 0-8, deterministic and
      production-like deferred returns);
-  3. agreement with the policy simulator the defaults were chosen on (tests/expert_tier/
+  3. agreement with the policy simulator the first defaults were chosen on (tests/expert_tier/
      sim_presets_ref.py) on scaled-down cases of its grid: VRAM misses, SSD reads and demotions per
      token (EXL3_TIER_SIM_FULL=1 runs the 24 full-size cases, minutes);
   4. the adaptive admission rule on scripted cache lives, exactly;
@@ -331,6 +331,40 @@ class Semantics(unittest.TestCase):
         c2.layer_call(0, [4, 5, 6])
         self.assertEqual(c2.c["refills"], 0)
 
+    def test_layer_mode_halves(self):
+        """layer_plan (the staging, before the layer's routing is known) then layer_record (heat, refills,
+        with the call's experts) equal layer_call: the same actions, counters and state, on random
+        traces over every policy"""
+        rng = random.Random(17)
+        for pol in P.POLICIES:
+            cfg = P.PolicyConfig(spare = 2, admit = "always", policy = pol, demote = "off" if pol == "inclusive" else "heat",
+                                 halflife = 64, refill_inflight = 2)
+            a, b = P.TierCore(cfg, 3, 16, 8, 20), P.TierCore(cfg, 3, 16, 8, 20)
+            a.cold_fill(P.round_robin_order(3, 16))
+            b.cold_fill(P.round_robin_order(3, 16))
+            for i in range(300):
+                lc = rng.randrange(3)
+                ids = [rng.randrange(16) for _ in range(rng.randrange(1, 40))]
+                if rng.random() < 0.5:
+                    self.assertEqual([x.astuple() for x in a.call(lc, ids)[0].entries],
+                                     [x.astuple() for x in b.call(lc, ids)[0].entries])
+                    continue
+                if i % 7 == 0:
+                    a.tick()
+                    b.tick()
+                want = a.layer_call(lc, ids)
+                got = b.layer_plan(lc)
+                b.seq += 1
+                rec = P.Record(b.seq, lc, P.LAYER)
+                for e in dict.fromkeys(ids):
+                    rec.entries.append(P.Entry(lc * 16 + e, P.TRANSIENT, -1, ids.count(e), 0))
+                got += b.layer_record(rec)
+                self.assertEqual(got, want, (pol, i))
+                self.assertEqual((a.vram.key, a.ram.key, a.heat.v, a.seq), (b.vram.key, b.ram.key, b.heat.v, b.seq))
+            self.assertEqual(a.c, b.c, pol)
+        with self.assertRaisesRegex(P.TierError, "key 40 outside layer 0"):
+            a.layer_record(P.Record(1, 0, P.LAYER, [P.Entry(40, P.TRANSIENT, -1, 1, 0)]))
+
     def test_mirror_apply(self):
         """A mirror that applies the records reaches the same directory as the one that decided them"""
         rng = random.Random(3)
@@ -364,12 +398,10 @@ class Semantics(unittest.TestCase):
 
     def test_from_placement(self):
         """The placement's words and the tuning map onto the policy's settings"""
-        from unittest.mock import patch
         T = load("_etc_for_policy", ROOT / "exllamav3/model/expert_tier_config.py")
         PL = load("_placement_for_policy", ROOT / "exllamav3/model/placement.py")
-        with patch.dict(PL.storage.PENDING, {}, clear = True):
-            pl = PL.parse("*=cuda:0 experts=cache; cuda:0 spare=12 evict=lfu admit=heat; "
-                          "ram experts=64GiB policy=exclusive demote=heat evict=lru; disk experts=off")
+        pl = PL.parse("*=cuda:0 experts=cache; cuda:0 spare=12 evict=lfu admit=heat; "
+                      "ram experts=64GiB policy=exclusive demote=heat evict=lru; disk experts=off")
         tc = T.TierConfig.from_env({"EXL3_MOE_TIER_ADMIT_P": "0.25", "EXL3_MOE_HEAT_PREFILL": "0.125",
                                     "EXL3_MOE_TIER_RAM_ADMIT": "heat", "EXL3_MOE_TIER_REFILL": "0"})
         cfg = P.PolicyConfig.from_placement(pl.device_store("cuda:0"), pl.ram_store(), pl.disk_store(), tc, seed = 7)
@@ -521,7 +553,7 @@ def core_on_trace(policy, demote, admit, trace, warm, vs, rs):
 
 class Simulator(unittest.TestCase):
     """
-    The reference core against the simulator the defaults were chosen on (same traces). The core is
+    The reference core against the simulator the first defaults were chosen on (same traces). The core is
     per call with protection, fixed-point lazily decayed heat, its own draws and tie-breaks; the
     simulator per access with float heat. Per token they agree within 3 % or 0.2 per token scaled to
     the layers (0.2 at 28 layers). admit=adaptive presets get 5 % or twice that margin, and their SSD

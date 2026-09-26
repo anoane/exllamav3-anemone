@@ -14,7 +14,7 @@ m.def("disk_gather_rows", &disk_gather_rows, "disk_gather_rows",
       py::arg("uids"), py::arg("uid_base"), py::arg("fds"), py::arg("offsets"),
       py::arg("row_bytes"), py::arg("outs"), py::arg("cls") = -1, py::arg("hold") = false,
       py::arg("wait") = true, py::arg("flag") = py::none(), py::arg("flag_index") = 0,
-      py::arg("flag_value") = 1, py::arg("deadline_ns") = 0);
+      py::arg("flag_value") = 1, py::arg("deadline_ns") = 0, py::arg("direct") = -1);
 m.def("disk_read_extents", &disk_read_extents, "disk_read_extents",
       py::arg("fds"), py::arg("offsets"), py::arg("lengths"), py::arg("dst"),
       py::arg("dst_offsets"), py::arg("slot_bytes"), py::arg("payload_offsets") = py::none(),
@@ -31,6 +31,7 @@ m.def("disk_engine_configure", &disk_engine_configure, "disk_engine_configure",
 m.def("disk_engine_shutdown", &disk_engine_shutdown, "disk_engine_shutdown");
 m.def("disk_engine_forget", &disk_engine_forget, "disk_engine_forget", py::arg("path"));
 m.def("disk_set_thread_class", &disk_set_thread_class, "disk_set_thread_class", py::arg("cls"));
+m.def("disk_set_thread_direct", &disk_set_thread_direct, "disk_set_thread_direct", py::arg("direct"));
 m.def("disk_ngram_route", &disk_ngram_route, "disk_ngram_route");
 m.def("disk_register_buffer", &disk_register_buffer, "disk_register_buffer", py::arg("t"));
 m.def("disk_unregister_buffer", &disk_unregister_buffer, "disk_unregister_buffer",

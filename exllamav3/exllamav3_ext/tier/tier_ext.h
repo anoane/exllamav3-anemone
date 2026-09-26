@@ -55,6 +55,8 @@ public:
     py::list call(int64_t lc, const std::vector<int32_t>& ids, int64_t mode);
     void process(const py::tuple& record);
     void layer(int64_t lc, const std::vector<int32_t>& ids, int64_t half);
+    std::vector<int32_t> stage(int64_t lc, int64_t half);
+    void read_ahead(const py::tuple& record);
     void prefetch(int64_t lc, int64_t deadline_ns);
     void promote(int64_t lc);
     void tick(int64_t tokens);

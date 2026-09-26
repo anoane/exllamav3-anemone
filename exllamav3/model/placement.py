@@ -35,7 +35,8 @@ protect a value with spaces, ';', '#' or '"':
            share of the layer's experts ('10%'). stream / cpu with hot=<k> run as a split with
            E - k experts in RAM (as -mcs E-k, with -mcm stream_only for stream)
   cpu      split only, required: routed experts per layer held in system RAM, 1 .. E - 1
-  prefetch cache / stream: read-ahead of experts ('off', 'auto', 'layer[:<d>]', 'router[:<d>]')
+  prefetch cache: disk read-ahead of experts ('off', 'auto', 'layer[:<d>]', 'router[:<d>]';
+           doc/expert_tiers.md, "Read-ahead")
   profile  not vram: an expert profile that seeds the hot and cached experts
 
 No placement is one value, None: the variable unset or empty (or holding only whitespace, ';' and
@@ -50,8 +51,7 @@ there as well). A placement replaces -mcl, -mcs, -mcm and EXL3_MOE_CPU_SPLIT_LAY
 refused together with any of them at load. GPU budgets (-gs / use_per_device / reserve_per_device)
 still cap memory but never move a layer: a layer that does not fit its device fails the load.
 DeepSeek-V4.1 reads the placement when the model object is built and adds rules of its own
-(doc/placement.md, "DeepSeek-V4.1"). Words this build cannot run yet are refused after every other
-check (placement_storage.PENDING).
+(doc/placement.md, "DeepSeek-V4.1"). Every word of the grammar runs.
 
 Torch-free, so it can be parsed and tested anywhere.
 """
@@ -325,12 +325,17 @@ def _layer_rule(chunk: str, where: str) -> Rule:
                          (" (experts=vram keeps every routed expert in VRAM)" if mode == "vram" else
                           " (experts=split counts the other side: cpu=<k>)"))
     prefetch = _parse_prefetch(attrs["prefetch"].lower(), where) if "prefetch" in attrs else None
-    if "prefetch" in attrs and _HOST_KIND[mode] != "gpu":
-        raise ValueError(f"{where}: prefetch= applies to experts=cache and stream (experts={mode} "
-                         f"{'fetches nothing' if mode == 'vram' else 'computes on the CPU worker'})")
+    if "prefetch" in attrs and mode != "cache":
+        why = {"vram": "keeps every routed expert in VRAM", "stream": "holds every routed expert in RAM and "
+               "streams each call's experts, with nothing to read ahead from the disk"}.get(mode, "computes on "
+               "the CPU worker")
+        raise ValueError(f"{where}: prefetch= applies to experts=cache (experts={mode} {why})")
     profile = attrs.get("profile")
     if profile is not None and mode == "vram":
         raise ValueError(f"{where}: profile= chooses hot or cached experts; experts=vram has none to choose")
+    if profile is not None and mode in ("stream", "cpu") and hot is None:
+        raise ValueError(f"{where}: profile= chooses which routed experts stay in VRAM, and experts={mode} without "
+                         f"hot= keeps none there; add hot=<k> (or use experts=cache)")
     if head in ("embed", "head"):
         if attrs:
             raise ValueError(f"{where}: experts= applies to decoder layers, not to {head}")
@@ -438,7 +443,6 @@ def _parse_text(text: str, value) -> Placement | None:
     kept, ram, disk = storage.check(rules, devices, ram, disk, tier_keys)
     # Canonical rule order, so equal placements compare equal however they were written
     placement = Placement(tuple(sorted(rules, key = _rule_order)), kept, ram, disk)
-    storage.refuse_pending(placement)
     return placement
 
 

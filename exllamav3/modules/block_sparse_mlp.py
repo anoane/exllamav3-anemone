@@ -1092,8 +1092,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
         cpu_partial = None
         cpu_pending = None
         # Expert cache (experts=cache): the call's experts into VRAM, the pointer tables at them
+        # (and with prefetch=router, a later cache layer's experts predicted from this router input)
         if self.tier is not None:
             self.tier_resolve(selected_experts, bsz, params)
+            self.tier_predict(z, bsz, params)
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
@@ -1390,6 +1392,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
+
+        # Expert cache: the routed compute is enqueued (a layer-mode prefill plans the next cache layer)
+        if self.tier is not None:
+            self.tier_after_compute(params)
 
         # Independent shared-expert work can cover the CPU job (split tail or whole layer)
         # before collect enqueues its stream wait. Fused shared experts have already run

@@ -64,6 +64,8 @@ struct HostConfig
     bool deterministic = true;                  // finish every read and copy before a call returns
     bool compact_fill = false;                  // move the cold-filled RAM slots to the compact layout (one
                                                 // aligned copy per promotion instead of three unaligned ones)
+    int io_direct = -1;                         // expert reads: -1 as EXL3_DISK_DIRECT says, 0 buffered,
+                                                // 1 O_DIRECT (the placement's disk io=)
 };
 
 // Device-side copies. dst / src device addresses are uint64_t (HostCopier: host pointers). `after`:
@@ -77,6 +79,8 @@ public:
     virtual uint64_t d2d(uint64_t dst, uint64_t src, int64_t n, uint64_t after) = 0;
     virtual bool done(uint64_t token) = 0;
     virtual void wait(uint64_t token) = 0;
+    // Whether copies with tokens a and b complete in order (the later token covers the earlier one)
+    virtual bool same_order(uint64_t a, uint64_t b) { (void) a; (void) b; return true; }
     // A RAM arena chunk has been filled (the GPU runtime registers it with CUDA: pin after fill)
     virtual void chunk_filled(uint8_t* p, size_t n) { (void) p; (void) n; }
     // Addresses of the pool slots (pool, then hot pins) and staging slots (half 0, then half 1)
@@ -131,6 +135,11 @@ struct HostStats
     int64_t h2d = 0, d2h = 0, d2d = 0;          // copies issued (a 3-piece promotion counts once)
     int64_t staged = 0;                         // layer-mode staging copies
     int64_t prefetch_issued = 0, prefetch_used = 0, prefetch_starved = 0, prefetch_dropped = 0;
+    int64_t presubmitted = 0;                   // SSD reads of a record submitted before its first copy
+    int64_t predicted_reads = 0;                // prefetch=router reads into the slab
+    int64_t slab_to_vram = 0;                   // misses served from the slab (read ahead), their RAM
+                                                // slot then filled by a background read
+    int64_t slab_reused = 0;                    // SSD reads saved: the slab still held the expert
     int64_t refill_reads = 0;
     int64_t hazard_waits = 0;                   // a write into a slot waited for a read or write of it
     int64_t slab_waits = 0;                     // the slab was full and a read waited for a slot
@@ -167,8 +176,15 @@ public:
     // A layer-mode prefill call: stage every cached expert of the layer that the pool does not
     // hold into staging half `half` (RAM copies, prefetched or fresh SSD reads), then refills
     void layer_call(int32_t lc, const int32_t* ids, int64_t n, int half);
+    // Layer mode on the GPU: stage every cached expert of layer lc that the pool does not hold into
+    // staging half `half` (the policy's layer_plan, executed through the current Copier: the copy
+    // engines of the caller's thread). keys (optional) receives the staged keys in staging order
+    void stage_layer(int32_t lc, int half, std::vector<int32_t>* keys);
     // Class-2 reads of the layer's SSD-only experts into the slab, ahead of its layer call
     void prefetch_layer(int32_t lc, int64_t deadline_ns);
+    // prefetch=router: class-2 reads into the slab of the experts a prediction record lists (a later
+    // layer's router applied to an earlier layer's state) that neither VRAM nor RAM holds
+    void read_ahead(const Record& rec);
     // Promote the layer's prefetch reads still queued to class 1 (its call is next)
     void promote_layer(int32_t lc);
     void tick(uint64_t tokens) { core.tick(tokens); }
@@ -208,11 +224,19 @@ private:
         int layout = 0;                         // 0 empty, 1 extent of layout_key, 2 compact
         int32_t layout_key = -1;
     };
+    // A disk slab slot: FREE; READING / READY for a demand read of `key` (submitted ahead of its
+    // copy); PREFETCH (a read-ahead of layer `lc`, dropped first when the slab runs out); COPIED (its
+    // copy to VRAM was issued, SlotIo::read_tok; the bytes stay valid and are reused by a later read
+    // of the same expert until the slot is reclaimed, oldest first)
+    enum SlabKind : int { kSlabFree = 0, kSlabDemand = 1, kSlabPrefetch = 2, kSlabCopied = 3 };
     struct Slab
     {
         int32_t key = -1;                       // the expert read (or being read) into it
-        bool prefetch = false;
+        int kind = kSlabFree;
         int32_t lc = -1;
+        uint64_t age = 0;                       // COPIED: order of its copy (reclaim oldest first)
+        bool pinned = false;                    // an action of the record being executed reads it:
+                                                // never reclaimed or dropped until that action runs
     };
 
     void execute(const Record* rec, std::vector<Action>& acts);
@@ -221,12 +245,15 @@ private:
     void promote_from_ram(int32_t r, uint64_t dst, uint64_t after, bool staging);
     void stage_from_ssd(int32_t key, uint64_t dst, uint64_t after, bool staging, int cls);
     void read_into(int32_t key, uint8_t* slot, int cls, int64_t deadline, exl3_disk::TicketId* ticket);
+    void presubmit(const std::vector<Action>& acts);
+    bool slab_submit(int32_t key, int cls, int64_t deadline, int kind, int32_t lc, bool may_wait);
     void finish_read(int32_t key, uint8_t* slot, exl3_disk::TicketId t);
     void pread_extent(int32_t key, uint8_t* slot);
     void ram_ready_for_write(int32_t r);
     void compact_ram(const std::vector<int32_t>& slots);
     void ram_ready_for_read(int32_t r);
-    int32_t slab_take();
+    int32_t slab_take(bool may_wait, int32_t lc);
+    uint64_t later(uint64_t a, uint64_t b);
     void slab_release(int32_t i);
     int32_t slab_of(int32_t key) const;
     std::string where(int32_t key) const;
@@ -242,6 +269,8 @@ private:
     std::vector<SlotIo> ram_io_, slab_io_;
     std::vector<Slab> slab_state_;
     std::vector<int32_t> slab_free_;
+    uint64_t slab_age_ = 0;
+    std::vector<int32_t> presub_ram_;           // RAM slot -> key whose read presubmit() started, -1
     std::vector<uint64_t> pool_busy_;           // a demotion reading a pool slot
     std::vector<std::pair<int32_t, exl3_disk::TicketId>> refills_;  // RAM slot, ticket
     std::string error_;

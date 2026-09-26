@@ -4,18 +4,22 @@ layers (DSV41_MODEL_DIR; layer 1 hash-routed, 12, 25, 39), loaded once resident 
 VRAM expert cache, give bit-identical outputs (torch.equal on the fp32 outputs viewed as int32) for
 the same inputs:
   - rows 1, 2, 5, 8 (decode: the fused decode kernels, admission), 9, 33, 200 (routed: transients in
-    staging), 1024 and a skewed 2048 (one row repeated, one token for the hash layer: six experts with
-    2,048 rows each, above the batched reconstruct tier's row cap, take the per-expert dequant path with
-    the cache's trellis views);
+    staging), 1024 and a skewed 2048 (layer mode: the whole layer staged on the copy engines; one row
+    repeated, one token for the hash layer: six experts with 2,048 rows each, above the batched
+    reconstruct tier's row cap, take the per-expert dequant path with the cache's trellis views);
   - inputs randn scaled to RMS 1, and one row repeated with 1e-3 noise (heavy experts);
   - pools of 16 slots (almost every call misses; spare 8) and 512, over a RAM tier holding every other
     expert (disk experts=off) or a small one over the SSD, under every policy x demote, admit=always /
     heat / adaptive, evict=lru / lfu, deterministic and production (tier thread) modes;
   - the arithmetic mode of the process (run once more with EXL3_STABLE_ARITHMETIC=1).
 Then a churn run: thousands of decode calls with random batch sizes over the four layers on a 16-slot
-pool in production mode, a 200-row routed call every 500 calls, every output compared with the resident
-reference, the directory verified at the end. (run_single_expert_dq_views itself:
-tests/expert_tier/dq_views_gpu_.py.)
+pool in production mode, a 200-row routed call every 500 calls and a layer-mode pass over the four
+layers (in forward order, each planned one layer ahead) every 700, every output compared with the
+resident reference, the directory verified at the end. And layer-mode passes on their own: double and
+single staging, pools of 16 and 512 over RAM, over the SSD with the read-ahead of prefetch=layer:1 and
+:2, spare=0, layer mode from 33 rows; decode and routed calls between the passes. And prefetch=router:1
+over the SSD: decode passes whose calls predict the next cache layer's experts, layer-mode passes between.
+(run_single_expert_dq_views itself: tests/expert_tier/dq_views_gpu_.py.)
 
     DSV41_MODEL_DIR=... python -m pytest -q -s tests/expert_tier/tier_bitwise_gpu_.py   (a GPU window)
 """
@@ -111,10 +115,17 @@ def resident_reference(rig, cases):
 
 
 def tiered(rig, text, sizes, policy = None, cfg_kw = None):
+    """The layers through the cache: `text` a placement whose storage rules and prefetch= the tier
+    reads (the layers' own placement stays the rig's), sizes (pool slots, RAM slots)"""
     from exllamav3.model.expert_tier import ExpertTierSet
     from exllamav3.model.expert_tier_config import TierConfig
+    from exllamav3.model.placement import parse
     cfg = TierConfig(**(cfg_kw or {}))
-    tiers = ExpertTierSet(rig.config, rig.placement, None, tier_config = cfg)
+    placement = rig.placement
+    if text:
+        placement = parse(text)
+        placement.layer_map(m.layer_idx for m in rig.model.modules if m.layer_idx is not None and m.layer_idx >= 0)
+    tiers = ExpertTierSet(rig.config, placement, None, tier_config = cfg)
     rig.config.expert_tiers = tiers
     for m in rig.mods:
         m.load(DEV)
@@ -197,8 +208,18 @@ class Bitwise(unittest.TestCase):
             rnd = random.Random(99)
             dec = [i for i, c in enumerate(self.cases) if c[0] <= 8]
             pre = [i for i, c in enumerate(self.cases) if c[0] == 200]
+            big = [i for i, c in enumerate(self.cases) if c[0] >= 1024]
             calls = int(os.environ.get("EXL3_TIER_CHURN_CALLS", 3000))
             for k in range(calls):
+                if k % 700 == 699:
+                    # a layer-mode pass: the layers in forward order, each planned one ahead
+                    ci = rnd.choice(big)
+                    for m in rig.mods:
+                        rows, x, ids = self.cases[ci]
+                        got = rig.run(m, rows, x, ids)
+                        self.assertTrue(torch.equal(got.view(torch.int32), self.ref[m.layer_idx][ci].view(torch.int32)),
+                                        f"churn call {k}: layer-mode pass, layer {m.layer_idx} rows {rows}")
+                    continue
                 ci = rnd.choice(pre) if k % 500 == 499 else rnd.choice(dec)
                 li = rnd.randrange(len(rig.mods))
                 m = rig.mods[li]
@@ -216,6 +237,93 @@ class Bitwise(unittest.TestCase):
             self.assertLessEqual(s["policy_d2h"], s["policy_retires"])
             print(f"\n  churn: {calls} calls identical; {s['records']} records, {s['host_records']} with host work, "
                   f"{s['policy_admits']} admits, {s['policy_d2h']} D2H, max lag {s['max_lag']}", end = "")
+        finally:
+            drop(rig)
+
+
+    def test_layer_mode(self):
+        rig = self.rig
+        n = len(LAYERS) * rig.E
+        big = [i for i, c in enumerate(self.cases) if c[0] >= 1024]
+        small = [i for i, c in enumerate(self.cases) if c[0] in (1, 5, 33, 200)]
+        ssd = "*=cuda:0 experts=cache prefetch=layer:{d}; ram experts=1GiB"
+        runs = [
+            ("double staging, pool 16 over RAM", None, (16, n - 8), None, {}),
+            ("single staging, pool 16 over RAM", None, (16, n - 8), None, {"staging": "single"}),
+            ("double staging, pool 512 over RAM", None, (512, n - 504), None, {}),
+            ("double staging, pool 16 over the SSD, RAM 64, prefetch=layer:1", ssd.format(d = 1), (16, 64),
+             {"disk_off": False}, {}),
+            ("double staging, pool 16 over the SSD, RAM 64, prefetch=layer:2, slab 24", ssd.format(d = 2), (16, 64),
+             {"disk_off": False}, {"disk_slab": 24}),
+            ("single staging, pool 24 spare 0 over the SSD, RAM 100", ssd.format(d = 1), (24, 100),
+             {"spare": 0, "demote": "off", "disk_off": False}, {"staging": "single"}),
+            ("layer mode from 33 rows, pool 16 over RAM", None, (16, n - 8), None, {"prefill_rows": 33}),
+        ]
+        only = os.environ.get("EXL3_TIER_TEST_LAYER_RUNS")
+        for i, (what, text, sizes, policy, cfg_kw) in enumerate(runs):
+            if only and str(i) not in only.split(","):
+                continue
+            t0 = time.monotonic()
+            tiers = tiered(rig, text, sizes, policy, cfg_kw)
+            try:
+                for rep in range(3):
+                    for ci in big:
+                        for m in rig.mods:                  # one pass, forward order
+                            rows, x, ids = self.cases[ci]
+                            got = rig.run(m, rows, x, ids)
+                            self.assertTrue(torch.equal(got.view(torch.int32), self.ref[m.layer_idx][ci].view(torch.int32)),
+                                            f"{what}: pass {rep}, layer {m.layer_idx} rows {rows}")
+                    for ci in small:                        # decode and routed calls between passes
+                        for m in rig.mods:
+                            rows, x, ids = self.cases[ci]
+                            got = rig.run(m, rows, x, ids)
+                            self.assertTrue(torch.equal(got.view(torch.int32), self.ref[m.layer_idx][ci].view(torch.int32)),
+                                            f"{what}: rep {rep}, layer {m.layer_idx} rows {rows}")
+                td = next(iter(tiers.devices.values()))
+                torch.cuda.synchronize()
+                td.handle.drain()
+                td.handle.verify()
+                s = td.stats()
+                self.assertGreater(s["layer_plans"], 0)
+                print(f"\n  {what}: identical; {s['layer_plans']} plans, {s['layer_h2d_bytes'] / 1e9:.2f} GB staged "
+                      f"on the copy engines, {s['ssd_reads']} SSD reads, read-ahead {s['prefetch_issued']} issued "
+                      f"{s['prefetch_used']} used {s['prefetch_dropped']} dropped, {s['policy_refills']} refills "
+                      f"({time.monotonic() - t0:.1f} s)", end = "")
+            finally:
+                drop(rig)
+
+    def test_router_read_ahead(self):
+        """prefetch=layer:1+router:1 over the SSD: every decode call predicts the next cache layer's experts
+        from its own router input and reads the disk-only ones into the slab ahead (a prediction record of
+        the lookup kernel); layer-mode passes in between read ahead by layer. Every output identical"""
+        rig = self.rig
+        dec = [i for i, c in enumerate(self.cases) if c[0] <= 8]
+        big = [i for i, c in enumerate(self.cases) if c[0] >= 1024]
+        tiers = tiered(rig, "*=cuda:0 experts=cache prefetch=layer:1+router:1; ram experts=1GiB", (16, 64),
+                       {"disk_off": False}, {})
+        try:
+            t0 = time.monotonic()
+            rnd = random.Random(7)
+            passes = int(os.environ.get("EXL3_TIER_ROUTER_PASSES", 60))
+            for k in range(passes):
+                ci = rnd.choice(big) if k % 20 == 19 else rnd.choice(dec)
+                for m in rig.mods:                          # one pass, forward order
+                    rows, x, ids = self.cases[ci]
+                    got = rig.run(m, rows, x, ids)
+                    self.assertTrue(torch.equal(got.view(torch.int32), self.ref[m.layer_idx][ci].view(torch.int32)),
+                                    f"router pass {k}: layer {m.layer_idx} rows {rows}")
+            td = next(iter(tiers.devices.values()))
+            torch.cuda.synchronize()
+            td.handle.drain()
+            td.handle.verify()
+            s = td.stats()
+            self.assertEqual(s["overflow"], 0)
+            self.assertGreater(s["predictions"], 0)
+            self.assertGreater(s["predicted_reads"], 0)
+            self.assertGreater(s["layer_plans"], 0)
+            print(f"\n  router read-ahead: {passes} passes identical; {s['predictions']} prediction records, "
+                  f"{s['predicted_reads']} predicted reads, {s['slab_to_vram']} misses served from the slab, "
+                  f"{s['ssd_reads']} SSD reads ({time.monotonic() - t0:.1f} s)", end = "")
         finally:
             drop(rig)
 

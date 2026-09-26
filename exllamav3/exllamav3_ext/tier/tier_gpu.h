@@ -48,6 +48,7 @@ public:
     uint64_t d2d(uint64_t dst, uint64_t src, int64_t n, uint64_t after) override;
     bool done(uint64_t token) override;
     void wait(uint64_t token) override;
+    bool same_order(uint64_t a, uint64_t b) override { return (a >> 62) == (b >> 62); }
     void chunk_filled(uint8_t* p, size_t n) override;
     uint64_t pool_addr(int32_t slot) override;
     uint64_t staging_addr(int half, int32_t i) override;
@@ -81,23 +82,29 @@ private:
     std::vector<std::pair<uint8_t*, size_t>> pinned_;
 };
 
+// Tokens of the layer-mode copies carry this bit; the fetch kernel's plan tokens (command index + 1)
+// never reach it. Each Copier hands a token of the other kind to the other one
+constexpr uint64_t kLayerTag = 1ull << 63;
+
 // The fetch kernel as the host's Copier: every copy is a command appended to the plan ring (plain
 // stores into mapped memory, no CUDA call); a token is the command's index + 1; done() reads the
 // completion flags the fetch kernel writes. The commands of a call run while that call's fetch runs
 class PlanCopier : public Copier
 {
 public:
-    PlanCopier(PlanCmd* ring, uint32_t* done_flags, TierCtl* ctl, uint32_t n, std::vector<uint64_t> pool,
+    PlanCopier(PlanCmd* ring, uint64_t* done_flags, TierCtl* ctl, uint32_t n, std::vector<uint64_t> pool,
                std::vector<uint64_t> staging, int64_t staging_per_half);
     uint64_t h2d(uint64_t dst, const uint8_t* src, int64_t n, uint64_t after) override;
     uint64_t d2h(uint8_t* dst, uint64_t src, int64_t n, uint64_t after) override;
     uint64_t d2d(uint64_t dst, uint64_t src, int64_t n, uint64_t after) override;
     bool done(uint64_t token) override;
     void wait(uint64_t token) override;
+    bool same_order(uint64_t a, uint64_t b) override { return ((a ^ b) & kLayerTag) == 0; }
     uint64_t pool_addr(int32_t slot) override;
     uint64_t staging_addr(int half, int32_t i) override;
     void end(uint32_t seq);
     void set_abort(const std::atomic<bool>* a) { abort_ = a; }
+    void set_other(Copier* c) { other_ = c; }
     uint64_t tail() const { return tail_; }
 
     int64_t h2d_bytes = 0, d2h_bytes = 0, d2d_bytes = 0;
@@ -108,7 +115,7 @@ private:
     uint64_t push(uint64_t src, uint64_t dst, int64_t n, uint64_t after, uint32_t kind, uint32_t seq);
     void scan();
     PlanCmd* ring_;
-    uint32_t* done_;
+    uint64_t* done_;
     TierCtl* ctl_;
     uint32_t n_;
     uint64_t tail_ = 0;
@@ -116,6 +123,49 @@ private:
     std::vector<uint64_t> pool_, staging_;
     int64_t staging_per_half_;
     const std::atomic<bool>* abort_ = nullptr;
+    Copier* other_ = nullptr;
+};
+
+// The copy engines of a layer-mode prefill (whole-layer staging, doc/expert_tiers.md "Prefill"),
+// driven by the caller's thread only: copies on one copy stream; a token is kLayerTag | batch, and a
+// batch's completion is TierCtl::layer_done, written by a one-thread kernel after the batch's copies
+// on the same stream, so done() and wait() are plain loads (the tier thread calls them too, and
+// never a CUDA function)
+class LayerCopier : public Copier
+{
+public:
+    LayerCopier(int device, uint64_t* done_host, uint64_t* done_dev, std::vector<uint64_t> pool,
+                std::vector<uint64_t> staging, int64_t staging_per_half);
+    ~LayerCopier() override;
+    uint64_t h2d(uint64_t dst, const uint8_t* src, int64_t n, uint64_t after) override;
+    uint64_t d2h(uint8_t* dst, uint64_t src, int64_t n, uint64_t after) override;
+    uint64_t d2d(uint64_t dst, uint64_t src, int64_t n, uint64_t after) override;
+    bool done(uint64_t token) override;
+    void wait(uint64_t token) override;
+    bool same_order(uint64_t a, uint64_t b) override { return ((a ^ b) & kLayerTag) == 0; }
+    uint64_t pool_addr(int32_t slot) override;
+    uint64_t staging_addr(int half, int32_t i) override;
+    void set_abort(const std::atomic<bool>* a) { abort_ = a; }
+    void set_other(Copier* c) { other_ = c; }
+    // End the open batch: its completion is published after its copies (returns its number, 0 when
+    // it had no copy)
+    uint64_t close_batch();
+    cudaStream_t stream() const { return s_; }
+
+    bool planning = false;              // the caller's thread is running a plan (may close the batch)
+    int64_t h2d_bytes = 0, h2d_copies = 0, batches = 0;
+
+private:
+    int device_;
+    cudaStream_t s_ = nullptr;
+    uint64_t* done_host_;
+    uint64_t* done_dev_;
+    uint64_t batch_ = 1;                // the open batch; batch b is complete when *done_host_ >= b
+    bool open_copies_ = false;
+    std::vector<uint64_t> pool_, staging_;
+    int64_t staging_per_half_;
+    const std::atomic<bool>* abort_ = nullptr;
+    Copier* other_ = nullptr;
 };
 
 struct GpuConfig
@@ -134,11 +184,15 @@ struct GpuConfig
     int64_t plan_n = 1 << 16;                   // plan ring commands (a power of two)
     int workers = 0;                            // fetch worker CTAs; 0: half the SMs
     int64_t trace = 0;                          // keep the last N processed records (tests)
+    std::string trace_path;                     // EXL3_MOE_TIER_TRACE: write every record to this file
+    int halves = 1;                             // staging halves: 2 overlaps layer-mode copies with compute
+    std::vector<int> prefetch_layer;            // per cache layer: read its disk-only experts this many
+                                                // layers ahead in layer mode (0: off)
 };
 
 struct GpuStats
 {
-    int64_t records = 0, host_records = 0, returns = 0;
+    int64_t records = 0, host_records = 0, returns = 0, predictions = 0;
     int64_t max_lag = 0;                        // records waiting when the thread picked one up
     int64_t idle_sleeps = 0;
     int64_t work_ns = 0;                        // tier thread time spent on records
@@ -158,6 +212,8 @@ public:
     TierHost* host() { return host_.get(); }
     CudaCopier* copier() { return copier_.get(); }
     PlanCopier* plan() { return plan_.get(); }
+    LayerCopier* layer_copier() { return layer_.get(); }
+    int projections() const { return kp_.P; }
 
     // Load: fill the pool, the pins and the RAM tier, then the device directory from the result
     void cold_fill(const std::vector<int32_t>& order, const std::vector<int32_t>& pins);
@@ -168,6 +224,24 @@ public:
 
     // One MoE call of cache layer lc on `stream` (the caller's): the lookup, then the wait
     void lookup(int lc, const int64_t* ids, int n, int mode, uint32_t seq, uint64_t tokens, cudaStream_t stream);
+
+    // Layer mode (prefill calls of at least EXL3_MOE_TIER_PREFILL_ROWS rows), from the caller's thread.
+    // layer_begin: the first layer-mode call of a forward pass (after decode or routed calls, wait
+    // until the host mirror has applied them). layer_plan: stage every expert of layer lc that VRAM
+    // does not hold into staging half `half` on the copy stream, once the compute that last read that
+    // half is done; build the layer's pointer tables. layer_run: the compute stream waits for the
+    // layer's copies, uploads its tables, and records the call (heat). layer_after: the compute that
+    // read the layer's half is enqueued (its end is what the next plan into that half waits for)
+    void layer_begin(cudaStream_t stream);
+    void layer_plan(int lc, int half);
+    void layer_run(int lc, const int64_t* ids, int n, uint32_t seq, uint64_t tokens, cudaStream_t stream);
+    void layer_after(int lc, cudaStream_t stream);
+    // The trellis address of projection q of expert e of layer lc as the last layer_plan() placed it
+    int64_t layer_addr(int lc, int e, int q) const;
+    // prefetch=router: the experts ids (a later cache layer lc's router applied to an earlier layer's
+    // state) that VRAM does not hold are read from the disk into the slab ahead of lc's call, when
+    // neither VRAM nor RAM holds them. Changes nothing on the device (a record only)
+    void predict(int lc, const int64_t* ids, int n, uint32_t seq, uint64_t tokens, cudaStream_t stream);
     // Without the thread: process every record available (wait for at least one when `wait`)
     int step(bool wait);
     // Every record published so far processed, every copy landed, every demoted slot returned
@@ -178,6 +252,9 @@ public:
     std::string error() const;
     uint32_t device_error() const;
     uint32_t overflow() const;
+    // Held by whoever reads or changes the host side (the tier thread while it handles a record or
+    // returns slots; step(); drain(); readers of statistics and state)
+    std::mutex& work_mu() { return work_mu_; }
     GpuStats stats;
     std::deque<Record> trace;
     std::mutex trace_mu;
@@ -197,7 +274,7 @@ public:
         int64_t* staging = nullptr;
         int64_t* tables = nullptr;
         FetchCmd* dring = nullptr;
-        uint32_t* ddone = nullptr;
+        uint64_t* ddone = nullptr;
         uint32_t* dcnt = nullptr;
     } dev;
     int S, pins, K, W;
@@ -226,7 +303,7 @@ private:
     uint32_t* ret_ring_ = nullptr;
     uint8_t* rec_ring_ = nullptr;
     PlanCmd* plan_ring_ = nullptr;
-    uint32_t* plan_done_ = nullptr;
+    uint64_t* plan_done_ = nullptr;
     uint32_t ret_n_ = 0;
     uint32_t plan_n_ = 0;
     uint64_t rec_bytes_ = 0;
@@ -247,6 +324,30 @@ private:
     mutable std::mutex err_mu_;
     std::atomic<bool> failed_ { false };
     std::mutex step_mu_;                        // step() and the thread never run at once
+    std::mutex work_mu_;                        // the host side: TierHost / TierCore, plan, stats
+    FILE* trace_file_ = nullptr;                // EXL3_MOE_TIER_TRACE: every record, one JSON line each
+    std::atomic<uint64_t> handled_tail_ { 0 };  // record ring bytes the host side has handled
+
+    // layer mode (caller's thread only)
+    void layer_state();
+    void catch_up();
+    std::unique_ptr<LayerCopier> layer_;
+    std::vector<cudaEvent_t> lready_;           // per cache layer: its staging copies done (copy stream)
+    std::vector<cudaEvent_t> ltab_ev_;          // per cache layer: its table upload done (compute stream)
+    std::vector<uint8_t> ltab_used_;
+    std::vector<int8_t> lhalf_;                 // per cache layer: its half in this pass + 1, 0 unplanned
+    std::vector<uint8_t> lprefetched_;          // per cache layer: read-ahead issued in this pass
+    cudaEvent_t lconsumed_[2] = { nullptr, nullptr };   // per half: the last compute that read it
+    bool lconsumed_used_[2] = { false, false };
+    cudaEvent_t lpass_ = nullptr;               // the compute stream where a layer-mode pass began
+    cudaEvent_t lcopies_ = nullptr;             // the copy stream after its last batch
+    bool lcopies_pending_ = false;              // a decode / routed call must wait for lcopies_ first
+    int64_t* ltab_ = nullptr;                   // [L][P][E] pinned: the pointer tables layer_plan built
+    bool dir_dirty_ = false;                    // decode / routed calls since the mirror last caught up
+    cudaEvent_t dir_ev_ = nullptr;              // the stream after the last decode / routed call
+    int64_t lplan_ns_ = 0, lplan_prev_ = 0;     // layer time estimate (read-ahead deadlines)
+public:
+    int64_t layer_plans = 0, layer_calls = 0, layer_catch_ups = 0;
 };
 
 }  // namespace exl3_tier

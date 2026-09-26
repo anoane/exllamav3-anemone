@@ -598,9 +598,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         # (model/expert_tier.py)
         if getattr(self, "component", "text") == "text":
             self.config.expert_tiers = None
+            # every MoE layer's key in forward order: expert profiles without layer keys are matched by it
+            from ..modules.block_sparse_mlp import BlockSparseMLP
+            self.config.moe_layer_keys = [m.key for m in self if isinstance(m, BlockSparseMLP)]
             if budget.tier is not None:
                 from .expert_tier import ExpertTierSet
-                self.config.expert_tiers = ExpertTierSet(self.config, placement, budget)
+                self.config.expert_tiers = ExpertTierSet(self.config, placement, budget,
+                                                         moe_keys = self.config.moe_layer_keys)
 
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."

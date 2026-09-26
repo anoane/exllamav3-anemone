@@ -234,8 +234,9 @@ the rows: speculative until needed, then at full depth ahead of bulk.
   `span = roundup(payload_offset + length, G)` bytes, whatever the backend, so one slot geometry
   serves every backend; bytes of the slot outside the payload are scratch.
 - **Bounce buffers belong to the engine.** `O_DIRECT` rows are read into aligned bounce slots
-  (one per pool thread, or one per ring slot for `io_uring`, registered as fixed buffer 0) and the
-  payload is copied to the destination.
+  (one per pool thread, or one per ring slot for `io_uring`, registered as fixed buffer 0; 64 KiB
+  each, allocated whatever `EXL3_DISK_DIRECT` says, since a request may ask for direct rows) and
+  the payload is copied to the destination.
 - **Files.** The engine never reads through a caller's descriptor. It keys files by
   `(st_dev, st_ino)`, reopens each once through `/proc/self/fd` (buffered, and `O_DIRECT` on first
   direct use), applies its `posix_fadvise` policy to its own descriptors, and closes them at
@@ -292,6 +293,15 @@ extent reads drop their pages afterwards (`EXL3_DISK_EXTENT_DONTNEED`). When a f
 page cache and a message names it. Change it to `all` with `io_uring` when RAM for the page cache
 is scarce (every row read then costs a device read), or to `none` to measure the page cache's
 share.
+
+A request may set its own mode, which overrides this variable for its reads only: `Options::direct`
+(`-1` this variable's choice for its kind of read, `0` buffered, `1` `O_DIRECT`), the `direct=`
+argument of `ext.disk_gather_rows`, and, for `ngram_gather_cpu` (whose signature is the original
+one), the calling thread's mode (`ext.disk_set_thread_direct(-1|0|1)`, which returns the previous
+one). A placement's `disk io=direct|buffered` sets it for the expert tier's reads and the n-gram /
+engram rows of that model, so two models in one process may read differently
+([expert_tiers.md](expert_tiers.md)). A file opened buffered is reopened `O_DIRECT` on the first
+direct request, as for this variable.
 
 ### `EXL3_DISK_QD` (default: `128` for `io_uring`, threads + 8 for the pools)
 

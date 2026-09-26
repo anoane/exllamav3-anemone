@@ -1574,6 +1574,7 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
     std::unique_ptr<Ticket> t = new_ticket(o);
     RefGuard guard { t };
     int advice = advice_for(c.cfg.fadvise, true);
+    const bool want_direct = o.direct < 0 ? c.cfg.direct_rows : o.direct == 1;
 
     std::vector<FileRef> refs((size_t) ntables);
     std::vector<std::pair<uintptr_t, uintptr_t>> outs;
@@ -1591,7 +1592,7 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
             throw Error(EINVAL, "disk engine: " + what + ": output holds " +
                                 std::to_string(tb.out_bytes) + " bytes, " + std::to_string(n) +
                                 " rows need more");
-        refs[(size_t) k] = c.files.acquire(tb.fd, c.cfg.direct_rows, advice, c.cfg, c.ex.get());
+        refs[(size_t) k] = c.files.acquire(tb.fd, want_direct, advice, c.cfg, c.ex.get());
         t->files.push_back(refs[(size_t) k].ent);
         if (n > 0)
             outs.push_back({ reinterpret_cast<uintptr_t>(tb.out),
@@ -1606,7 +1607,7 @@ static TicketId submit_rows_impl(Core& c, const int64_t* uids, int64_t n, int64_
         const RowTable& tb = tables[k];
         const FileRef& r = refs[(size_t) k];
         size_t first_op = t->ops.size();
-        bool direct = c.cfg.direct_rows && r.fd_dir >= 0;
+        bool direct = want_direct && r.fd_dir >= 0;
         if (direct && (r.off_align > kBounceBytes / 4 || r.mem_align > 4096))
         {
             direct = false;
@@ -1655,6 +1656,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
     std::unique_ptr<Ticket> t = new_ticket(o);
     RefGuard guard { t };
     int advice = advice_for(c.cfg.fadvise, false);
+    const bool want_direct = o.direct < 0 ? c.cfg.direct_extents : o.direct == 1;
 
     std::vector<std::pair<int, FileRef>> seen;    // per-call cache: fd -> file
     std::vector<std::pair<uintptr_t, uintptr_t>> slots;
@@ -1668,8 +1670,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
         for (auto& s : seen) if (s.first == e.fd) { r = &s.second; break; }
         if (!r)
         {
-            seen.push_back({ e.fd, c.files.acquire(e.fd, c.cfg.direct_extents, advice, c.cfg,
-                                                   c.ex.get()) });
+            seen.push_back({ e.fd, c.files.acquire(e.fd, want_direct, advice, c.cfg, c.ex.get()) });
             t->files.push_back(seen.back().second.ent);
             r = &seen.back().second;
         }
@@ -1697,7 +1698,7 @@ static TicketId submit_extents_impl(Core& c, const ExtentReq* ex, int64_t n, con
         size_t first_op = t->ops.size();
         t->dst.push_back({ first_op, first_op, e.slot, (size_t) span });   // end set below
 
-        bool direct = c.cfg.direct_extents && r->fd_dir >= 0;
+        bool direct = want_direct && r->fd_dir >= 0;
         if (!direct)
         {
             // same geometry as O_DIRECT, so the payload offset does not depend on the backend
@@ -2146,6 +2147,18 @@ int set_thread_class(int cls)
     return prev;
 }
 
+static thread_local int t_direct = -1;
+
+int thread_direct() { return t_direct; }
+
+int set_thread_direct(int direct)
+{
+    if (direct < -1 || direct > 1) throw Error(EINVAL, "disk engine: direct must be -1, 0 or 1");
+    int prev = t_direct;
+    t_direct = direct;
+    return prev;
+}
+
 int ngram_gather(int fd, int64_t base_offset, int64_t row_bytes, const int64_t* uids, int64_t n,
                  int64_t uid_base, uint8_t* out, int64_t out_bytes)
 {
@@ -2153,6 +2166,7 @@ int ngram_gather(int fd, int64_t base_offset, int64_t row_bytes, const int64_t* 
     RowTable tb { fd, base_offset, row_bytes, out, out_bytes };
     Options o;
     o.cls = t_class;
+    o.direct = t_direct;
     return e->gather_rows(uids, n, uid_base, &tb, 1, o);
 }
 
@@ -2213,6 +2227,15 @@ int set_thread_class(int cls)
     if (cls < 0 || cls >= kClasses) throw Error(EINVAL, "disk engine: class out of range");
     int p = t_class;
     t_class = cls;
+    return p;
+}
+static thread_local int t_direct = -1;
+int thread_direct() { return t_direct; }
+int set_thread_direct(int direct)
+{
+    if (direct < -1 || direct > 1) throw Error(EINVAL, "disk engine: direct must be -1, 0 or 1");
+    int p = t_direct;
+    t_direct = direct;
     return p;
 }
 int ngram_gather(int, int64_t, int64_t, const int64_t*, int64_t, int64_t, uint8_t*, int64_t)

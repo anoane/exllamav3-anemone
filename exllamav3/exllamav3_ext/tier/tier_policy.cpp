@@ -349,6 +349,7 @@ Record VramDirectory::lookup(int32_t lc, const int32_t* ids, int64_t n, int mode
 
 void VramDirectory::apply(const Record& rec)
 {
+    if (rec.mode == kLayer) return;             // layer mode never changes the directory
     for (const Entry& x : rec.entries)
     {
         if (x.kind == kHit)
@@ -552,6 +553,11 @@ Record TierCore::lookup(int32_t lc, const int32_t* ids, int64_t n, int mode)
 void TierCore::process(const Record& rec, std::vector<Action>& acts)
 {
     if (rec.lc < 0 || rec.lc >= L) fail("record of layer " + std::to_string(rec.lc) + " out of range");
+    if (rec.mode == kLayer)
+    {
+        layer_record(rec, acts);
+        return;
+    }
     seq = rec.seq;
     const uint32_t inc = rec.mode == kDecode ? kQ16 : cfg.prefill_inc;
     ++c[kCalls];
@@ -575,21 +581,9 @@ void TierCore::process(const Record& rec, std::vector<Action>& acts)
     host(rec, acts);
 }
 
-void TierCore::layer_call(int32_t lc, const int32_t* ids, int64_t n, std::vector<Action>& acts)
+void TierCore::layer_plan(int32_t lc, std::vector<Action>& acts)
 {
     if (lc < 0 || lc >= L) fail("layer call: layer " + std::to_string(lc) + " out of range");
-    ++seq;
-    ++c[kCalls];
-    std::vector<uint32_t> cnt((size_t) E, 0);
-    std::vector<int32_t> order;
-    for (int64_t i = 0; i < n; ++i)
-    {
-        int32_t e = ids[i];
-        if (e < 0 || e >= E) fail("layer call: expert " + std::to_string(e) + " out of range");
-        if (cnt[(size_t) e]++ == 0) order.push_back(e);
-    }
-    for (int32_t e : order) heat.add(lc * E + e, (uint64_t) cnt[(size_t) e] * cfg.prefill_inc);
-    std::vector<int32_t> bypassed;
     int32_t i = 0;
     for (int32_t e = 0; e < (int32_t) E; ++e)
     {
@@ -612,13 +606,55 @@ void TierCore::layer_call(int32_t lc, const int32_t* ids, int64_t n, std::vector
             a.op = kActStageSsd;
             a.a = k;
             a.b = i;
-            if (cnt[(size_t) e]) bypassed.push_back(k);
         }
         acts.push_back(a);
         ++i;
     }
+}
+
+void TierCore::layer_record(const Record& rec, std::vector<Action>& acts)
+{
+    if (rec.lc < 0 || rec.lc >= L) fail("layer call: layer " + std::to_string(rec.lc) + " out of range");
+    seq = rec.seq;
+    ++c[kCalls];
+    std::vector<int32_t> bypassed;
+    for (const Entry& x : rec.entries)
+    {
+        if (x.key < rec.lc * E || x.key >= (rec.lc + 1) * E)
+            fail("layer call: key " + std::to_string(x.key) + " outside layer " + std::to_string(rec.lc));
+        heat.add(x.key, (uint64_t) x.cnt * cfg.prefill_inc);
+        // used, and staged from the disk (neither VRAM nor RAM holds it now): a refill candidate
+        if (x.cnt && vram.slot_of[(size_t) x.key] < 0 && ram.of[(size_t) x.key] < 0) bypassed.push_back(x.key);
+    }
+    std::sort(bypassed.begin(), bypassed.end());
     refill(bypassed, acts);
     maybe_adapt();
+}
+
+void TierCore::layer_call(int32_t lc, const int32_t* ids, int64_t n, std::vector<Action>& acts)
+{
+    if (lc < 0 || lc >= L) fail("layer call: layer " + std::to_string(lc) + " out of range");
+    ++seq;
+    Record rec;
+    rec.seq = seq;
+    rec.lc = lc;
+    rec.mode = kLayer;
+    std::vector<int32_t> slot((size_t) E, -1);
+    for (int64_t i = 0; i < n; ++i)
+    {
+        int32_t e = ids[i];
+        if (e < 0 || e >= E) fail("layer call: expert " + std::to_string(e) + " out of range");
+        if (slot[(size_t) e] < 0)
+        {
+            slot[(size_t) e] = (int32_t) rec.entries.size();
+            Entry x;
+            x.key = (int32_t) (lc * E + e);
+            rec.entries.push_back(x);
+        }
+        ++rec.entries[(size_t) slot[(size_t) e]].cnt;
+    }
+    layer_plan(lc, acts);
+    layer_record(rec, acts);
 }
 
 void TierCore::release(int32_t vslot, std::vector<Action>& acts, bool demoted, int entry)
