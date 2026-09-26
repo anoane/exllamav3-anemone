@@ -11,6 +11,8 @@ extension_name = "exllamav3_ext"
 precompile = "EXLLAMA_NOCOMPILE" not in os.environ
 verbose = "EXLLAMA_VERBOSE" in os.environ
 ext_debug = "EXLLAMA_EXT_DEBUG" in os.environ
+# Leave out the fused MoE kernel's whole-K instances (*_wk.cu), which only EXL3_STABLE_ARITHMETIC uses
+no_whole_k_moe = "EXLLAMA_NO_WHOLE_K_MOE" in os.environ
 
 if precompile and not torch:
     print("Cannot precompile unless torch is installed.")
@@ -49,6 +51,9 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
+if no_whole_k_moe:
+    extra_cuda_cflags += ["-DEXLLAMA_NO_WHOLE_K_MOE"]
+
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,
@@ -61,6 +66,7 @@ sources = [
     for root, _, files in os.walk(sources_dir)
     for file in files
     if file.endswith(('.c', '.cpp', '.cu'))
+    and not (no_whole_k_moe and file.startswith("exl3_moe_inst_") and file.endswith("_wk.cu"))
 ]
 
 setup_kwargs = (

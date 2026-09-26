@@ -19,8 +19,9 @@
 // warrants them ([count_lo, count_hi], see exl3_moe). Separate instances rather than one
 // kernel with a runtime tier switch: the tiers' register frames would otherwise share one
 // 128-register budget and the 16-row path pays for tiles it never runs (measured +60-70% on
-// Ada/Ampere for that arrangement)
-template<int t_bits, int cb, int MT, int N_TILE>
+// Ada/Ampere for that arrangement). whole_k selects the GEMM's whole-column partition
+// (EXL3_STABLE_ARITHMETIC, see exl3_gemm_kernel_inner); the default instances keep the split-K one
+template<int t_bits, int cb, int MT, int N_TILE, bool whole_k>
 __device__ __forceinline__
 void moe_gemm_tile
 (
@@ -41,20 +42,20 @@ void moe_gemm_tile
     // Runtime K arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
     // half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks)
     if constexpr (t_bits)
-        exl3_gemm_kernel_inner<t_bits, false, false, cb, SHAPE_ARGS, false>(ARGS);
+        exl3_gemm_kernel_inner<t_bits, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS);
     else switch(K)
     {
-        case 2:  exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 4:  exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 6:  exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 8:  exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 10: exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 12: exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 14: exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 16: exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 2:  exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 4:  exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 6:  exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 8:  exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 10: exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 12: exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 14: exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 16: exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
+        case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false, whole_k>(ARGS); break;
     };
     #undef ARGS
     #undef SHAPE_ARGS
@@ -62,11 +63,15 @@ void moe_gemm_tile
 
 // tile_rows: row-striped instances (fused-only prefill, EXL3_MOE_FUSED_PREFILL). An expert with more rows
 // than the group's temp buffers hold (max_tokens_per_expert) is not skipped but runs in stripes of at most that
-// many rows. A compile-time option, like M_TILE, so the default instances compile without the stripe code
-template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool tile_rows = false>
+// many rows. A compile-time option, like M_TILE, so the default instances compile without the stripe code.
+// whole_k: whole-column GEMM partition (EXL3_STABLE_ARITHMETIC, see moe_gemm_tile); these instances always run
+// in row stripes, and the launcher caps an unstriped launch's row limit at the buffers' capacity instead
+template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool tile_rows = false, bool whole_k = false>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
+    static_assert(tile_rows || !whole_k, "the whole-K instances run in row stripes");
+
     const int group_idx = blockIdx.z;
     const int block_idx = blockIdx.x;
     const int group_size = gridDim.x;  // SMs per expert, set at launch
@@ -182,18 +187,18 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 int tm;
                 if constexpr (M_TILE >= 64)
                 {
-                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
-                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, whole_k>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, whole_k>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, whole_k>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
                 else if constexpr (M_TILE == 32)
                 {
-                    if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, whole_k>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, whole_k>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
                 else
                 {
-                    moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
+                    moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, whole_k>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
                 }
                 in_addr += tm * size_k;
                 out_addr += tm * size_n;

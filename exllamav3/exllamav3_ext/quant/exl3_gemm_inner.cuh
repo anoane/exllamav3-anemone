@@ -26,7 +26,9 @@
 // is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
 // dequantized B fragment instead of re-running the whole B pipeline per 16 rows, with A
 // single-buffered so the row fragments fit alongside the prefetched B fragments.
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+// whole_k (fused MoE under EXL3_STABLE_ARITHMETIC only): partition the work by whole output columns,
+// see the slice partition below.
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool whole_k = false>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -109,8 +111,24 @@ void exl3_gemm_kernel_inner
 
     // Start and end index of current slice, must span at least one tile
     int num_slices = gridDim.x;
-    int slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
-    int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    int slice_beg, slice_end;
+    if constexpr (whole_k)
+    {
+        // Whole-K partition: each block takes whole output columns and keeps every dot product in
+        // its FP32 accumulators until the one final store. The default split of the flattened
+        // (N, K) tiles can divide a column's K reduction between blocks, which then pass partial
+        // sums through the output (FP16 in the fused MoE, rounding or even overflowing before the
+        // dot product is complete), and where it divides depends on the grid width, which the
+        // fused MoE kernel varies with the number of active experts. Blocks left without a
+        // column return at once (to their caller's group synchronization)
+        slice_beg = (tiles_n * blockIdx.x / num_slices) * tiles_k;
+        slice_end = (tiles_n * (blockIdx.x + 1) / num_slices) * tiles_k;
+    }
+    else
+    {
+        slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
+        slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    }
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 
@@ -812,8 +830,9 @@ void exl3_gemm_kernel_inner
     auto reduce = [&] ()
     {
         #if EXL3_GEMM_H_ACC
-            // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice
-            if constexpr (TILEBLOCKS_M == 1)
+            // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice (the
+            // whole-K partition accumulates in fp32 directly, see matmul)
+            if constexpr (!whole_k && TILEBLOCKS_M == 1)
             {
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -824,7 +843,7 @@ void exl3_gemm_kernel_inner
                     frag_c[0][n][2] += f1.x; frag_c[0][n][3] += f1.y;
                 }
             }
-            else
+            else if constexpr (!whole_k)
             {
                 #pragma unroll
                 for (int m = 0; m < TILEBLOCKS_M; ++m)
@@ -901,8 +920,14 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
+                // sm_86 accumulates in fp16 per k-slice (EXL3_GEMM_H_ACC), except in the whole-K
+                // partition: its slices span all of K, and fp16 partial sums over the whole
+                // reduction would give up the precision and range the partition keeps
                 #if EXL3_GEMM_H_ACC
-                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[0][n]);
+                    if constexpr (whole_k)
+                        ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[0][n]);
+                    else
+                        ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[0][n]);
                 #else
                     ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[0][n]);
                 #endif
@@ -916,7 +941,10 @@ void exl3_gemm_kernel_inner
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
                     #if EXL3_GEMM_H_ACC
-                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c_h[m][n]);
+                        if constexpr (whole_k)
+                            ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c[m][n]);
+                        else
+                            ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c_h[m][n]);
                     #else
                         ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c[m][n]);
                     #endif

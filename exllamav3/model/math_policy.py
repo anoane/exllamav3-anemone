@@ -75,6 +75,20 @@ def fused_prefill_enabled(environ = None) -> bool:
     return enabled
 
 
+def require_whole_k_moe(key: str, built: bool, stable: bool = None):
+    """
+    EXL3_STABLE_ARITHMETIC runs every fused MoE launch through the kernel's whole-K instances, which
+    an extension built with EXLLAMA_NO_WHOLE_K_MOE leaves out: an MoE layer that would need them is
+    refused when it loads (built: exllamav3_ext.exl3_moe_whole_k_built())
+    """
+    stable = STABLE_ARITHMETIC if stable is None else stable
+    if stable and not built:
+        raise ValueError(f"{key}: EXL3_STABLE_ARITHMETIC=1 computes MoE experts with the whole-K fused "
+                         f"MoE kernels, which this build of exllamav3_ext leaves out (it was built with "
+                         f"EXLLAMA_NO_WHOLE_K_MOE set); rebuild the extension without "
+                         f"EXLLAMA_NO_WHOLE_K_MOE, or unset EXL3_STABLE_ARITHMETIC")
+
+
 # Fused-only prefill: the fused tier's row limit. A selection bound, not a buffer size (the
 # kernel stripes rows through its temp buffers and checks its int32 addressing itself)
 FUSED_COUNT_LIMIT = (1 << 31) - 1

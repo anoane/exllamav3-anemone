@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
-from ..model.math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC
+from ..model.math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC, require_whole_k_moe
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
@@ -555,6 +555,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                  f"infer_params.no_reconstruct disables")
             raise ValueError(f"{self.key}: EXL3_MOE_FUSED_PREFILL=1 but these experts are not supported by the "
                              f"fused MoE kernel (quantization, codebook, activation, biases or padded dims)")
+        # ... and EXL3_STABLE_ARITHMETIC runs it as the whole-K instances, which the build may leave out
+        if STABLE_ARITHMETIC:
+            require_whole_k_moe(self.key, ext.exl3_moe_whole_k_built())
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok

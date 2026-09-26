@@ -273,6 +273,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
+    m.def("exl3_moe_whole_k_built", &exl3_moe_whole_k_built, "exl3_moe_whole_k_built");
     m.def("exl3_moe", &exl3_moe, "exl3_moe",
         py::arg("hidden_state"), py::arg("output_state"), py::arg("expert_count"),
         py::arg("token_sorted"), py::arg("weight_sorted"),

@@ -859,7 +859,8 @@ in an sm_80 + sm_120a build.
 Determinism: removes the tier boundaries, so an expert's arithmetic no longer depends on which
 tier its row count selects. On its own it does not make results independent of the row count:
 the fused kernel splits each dot product's K reduction over the SMs of its expert group, and the
-group width follows the number of active experts in the call. Row stripes themselves do not
+group width follows the number of active experts in the call (`EXL3_STABLE_ARITHMETIC` also
+switches the kernel to whole-column partitions, which removes that). Row stripes themselves do not
 change results: `tests/test_moe_stripe_layout_.py` checks bitwise that 64-, 128- and 256-row
 buffers in stripes give the same slots as buffers holding all 700 rows of an expert. Real
 DeepSeek-V4.1-Flash experts (17 to 1025 input rows, 16/64/256-row buffers, both supported row
@@ -1051,6 +1052,18 @@ With `1` each operation below takes one arithmetic path at every row count, the 
 - Block-sparse MoE layers send every row count, decode included, to the fused routed-expert path
   instead of the 1-8-row decode kernels, and apply a shared-expert gate as its own linear instead
   of the fused gate projection used up to 32 rows.
+- The fused MoE kernel partitions its GEMMs by whole output columns: every block of an expert
+  group keeps a column's complete K reduction in FP32 registers until the one final FP16 store.
+  The default partition splits the flattened (N, K) tiles evenly over the group's blocks, which
+  can cut a column's K reduction between blocks that then pass partial sums through the FP16
+  intermediate; where it cuts depends on the group width, which the kernel sets from the number
+  of active experts in the call (and so from the prompt and the chunk size). On sm_86 the
+  whole-column instances also skip the FP16-accumulation shortcut of that architecture. These are
+  separate kernel instances (a whole-column twin of each of the 54 default instances, which runs
+  in row stripes like the twins of `EXL3_MOE_FUSED_PREFILL`), selected on the host, so the default
+  instances are unchanged by them. They are compiled by default; a build with
+  `EXLLAMA_NO_WHOLE_K_MOE` set leaves them out (see that entry for the cost), and the profile then
+  refuses MoE layers at load (below).
 - Experts held in system RAM must be computed on the GPU: offloaded layers must register in
   stream mode (`-mcm stream_only` / `EXL3_MOE_CPU_MODE=stream_only`, or `experts=stream` in a
   placement). The CPU worker's arithmetic depends on the host and on how rows split between CPU and
@@ -1077,7 +1090,11 @@ Refused, as an error rather than a partial profile:
 - at load, an EXL3 linear with `infer_params.no_reconstruct` set or dims that are not multiples
   of 128, an offloaded MoE layer whose experts would be computed by the CPU worker (before the
   worker starts; this includes `-dmcl` layers next to an explicit placement), and everything
-  `EXL3_MOE_FUSED_PREFILL` refuses.
+  `EXL3_MOE_FUSED_PREFILL` refuses;
+- at load, with an extension built with `EXLLAMA_NO_WHOLE_K_MOE` set, every MoE layer whose
+  experts the fused kernel computes (GPU-resident or streamed from system RAM; dense models are
+  not affected): a `ValueError` names the layer, the whole-K kernels this build lacks and the build
+  option, and the launcher refuses the same call with a `RuntimeError` if it is reached another way.
 
 What it does not cover: operations not listed above keep their row-count-dependent dispatch,
 among them the attention kernels of most architectures (prefill and decode kernels differ); the
@@ -1099,18 +1116,31 @@ allocates and the autosplit already measures.
 
 Performance: slower, in prefill and much more in decode. Every decoded token reconstructs the
 weights of every EXL3 linear that `LinearEXL3.forward` dispatches and runs the MoE layers through
-the prefill kernels, without native CUDA graphs; prefill pays the fixed-row GEMM tiles (2.6x-3.1x on
-a large projection, see `EXL3_HGEMM_FIXED_ROWS`) and fused-only experts. On DeepSeek-V4.1-Flash on
-two GPUs with the experts of 11 layers in system RAM, a 64K-token scoring pass ran at 796 tok/s with
-the complete profile (experts streamed) against 1040 tok/s with the default arithmetic (experts
-computed by the CPU), so the two runs differ in more than this setting; decode speed was not
-measured. Use it for validation and reproducibility work, not for serving.
+the prefill kernels, without native CUDA graphs; prefill pays the fixed-row GEMM tiles (2.6x-3.1x
+on a large projection, see `EXL3_HGEMM_FIXED_ROWS`), fused-only experts, and the whole-column MoE
+partition. There each block of an expert's group owns whole output column tiles, so the group
+takes as long as its busiest block, `ceil(column tiles / group width)` whole columns, where the
+default partition splits the K reduction evenly over the group; blocks sit idle when a group has
+more blocks than column tiles. On DeepSeek-V4.1-Flash that bounds the expert GEMMs (derived, not
+measured, and not an end-to-end figure): in decode (groups of 8 blocks, 256-column tiles) about
+1.8x on gate/up (9 column tiles) and 1.2x on down (20), in prefill (128-column tiles) 1.33x on
+gate/up (18) and none on down (40); launches with few active experts run wider groups, up to 32
+blocks, where the bound reaches about 1.8x on gate/up and 1.6x on down. A traced 4096-token
+DeepSeek-V4.1-Flash prefill took 4.20 s against 3.96 s, one trial; models with small expert
+intermediate sizes lose more; sm_86 is compiled but was never run. On DeepSeek-V4.1-Flash on two
+GPUs with the experts of 11 layers in system RAM, a 64K-token scoring pass ran at 796 tok/s with the
+complete profile (experts streamed) against 1040 tok/s with the default arithmetic (experts computed
+by the CPU), so the two runs differ in more than this setting; decode speed was not measured. Use it
+for validation and reproducibility work, not for serving.
 
 Determinism: within the operations above, a row's result no longer depends on the row count of
 the call, on the chunk boundaries or on decode versus prefill (for a given GPU type, model and
-placement). Combined with `EXL3_MOE_FUSED_DET` (on by default), identical calls are also bitwise
-repeatable. Whether a whole model becomes chunk-size invariant depends on every operation it uses
-being covered, see above.
+placement). For the fused MoE kernel alone: two real DeepSeek-V4.1-Flash experts at 17 to 256
+rows, all row tiles and both active-count hints on two GPU types differed in 40 of 48 launch
+geometry comparisons with the default partition, and in none with whole columns. Combined with
+`EXL3_MOE_FUSED_DET` (on by default), identical calls are also bitwise repeatable. Whether a
+whole model becomes chunk-size invariant depends on every operation it uses being covered, see
+above.
 
 ```sh
 EXL3_STABLE_ARITHMETIC=1 python eval/ppl.py -m /path/to/model
@@ -1980,6 +2010,43 @@ installed CUDA toolkit.
 
 Standard PyTorch variable; overrides the compute architectures the extension is built for. When
 unset, ExLlamaV3 derives the list from the GPUs present in the system.
+
+### `EXLLAMA_NO_WHOLE_K_MOE` (default: unset)
+
+Build option that leaves the whole-K instances of the fused MoE kernel out of the extension. They
+are the whole-column twins of the 54 `exl3_moe_kernel` instances, in the 38 compilation units
+`exllamav3_ext/quant/comp_units/exl3_moe_inst_*_wk.cu`, and only `EXL3_STABLE_ARITHMETIC` uses them.
+Unlike the other entries of this section it applies to every build: `setup.py` (`pip install .`,
+`python setup.py build_ext`) and the JIT build in `exllamav3/ext.py`, which compiles the extension
+at import when no prebuilt one is installed. It has no effect on an extension that is already
+built.
+
+Values: set to anything, the empty string and `0` included, to leave them out (the variable is
+tested for presence, like `EXLLAMA_NOCOMPILE`); unset (the default) compiles them. The build then
+skips those units and passes `-DEXLLAMA_NO_WHOLE_K_MOE` to nvcc, so the launcher
+(`quant/exl3_moe.cu`) compiles without them. A JIT build keys its cache on the sources and flags,
+so setting or unsetting the variable triggers a rebuild.
+
+Cost of the default: the 54 instances take about as much to compile as the 54 default fused MoE
+instances: about 10 s of compiler CPU time per compilation unit for sm_80, sm_86 and sm_120 (38
+units, about 6 minutes) and 133 MiB of objects, 93 MiB in an sm_80 + sm_120a build.
+
+Effect of leaving them out: the default arithmetic and `EXL3_MOE_FUSED_PREFILL` are unchanged.
+`EXL3_STABLE_ARITHMETIC=1` refuses every MoE layer whose experts the fused kernel computes
+(GPU-resident, or held in system RAM and streamed) when the layer loads: a `ValueError` names the
+layer, the missing whole-K kernels and this variable. The launcher refuses such a call with a
+`RuntimeError` if it is reached another way, never running other kernels in their place. Dense
+models under the profile are not affected. `ext.exl3_moe_whole_k_built()` reports the build:
+`False` with the variable set, `True` otherwise.
+
+```sh
+EXLLAMA_NO_WHOLE_K_MOE=1 pip install .
+```
+
+```python
+from exllamav3.ext import exllamav3_ext as ext
+print(ext.exl3_moe_whole_k_built())       # False for a build with EXLLAMA_NO_WHOLE_K_MOE set
+```
 
 ## `EXL3_DSA_DEBUG_BOUNDS`
 

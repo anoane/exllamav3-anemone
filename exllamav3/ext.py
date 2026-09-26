@@ -118,6 +118,12 @@ else:
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
+    # Leave out the fused MoE kernel's whole-K instances (*_wk.cu), which only EXL3_STABLE_ARITHMETIC
+    # uses (as in setup.py)
+    no_whole_k_moe = "EXLLAMA_NO_WHOLE_K_MOE" in os.environ
+    if no_whole_k_moe:
+        extra_cuda_cflags += ["-DEXLLAMA_NO_WHOLE_K_MOE"]
+
     if verbose:
         extra_cuda_cflags += ["--ptxas-options=-v"]
 
@@ -139,6 +145,7 @@ else:
         for root, _, files in os.walk(sources_dir)
         for file in files
         if file.endswith(('.c', '.cpp', '.cu'))
+        and not (no_whole_k_moe and file.startswith("exl3_moe_inst_") and file.endswith("_wk.cu"))
     ]
 
     # Load extension

@@ -5,6 +5,8 @@
 
 int exl3_moe_max_concurrency(int device);
 
+bool exl3_moe_whole_k_built();
+
 void exl3_moe
 (
     const at::Tensor& hidden_state,

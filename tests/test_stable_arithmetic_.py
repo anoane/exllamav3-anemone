@@ -125,8 +125,13 @@ class MoeDispatchTests(unittest.TestCase):
 
 class CpuHostTests(unittest.TestCase):
 
-    def register(self, stable, mode):
-        ns = dict(torch = torch, STABLE_ARITHMETIC = stable, validate_streaming = Mock())
+    def register(self, stable, mode, whole_k_built = True):
+        spec = importlib.util.spec_from_file_location("math_policy_under_test", ROOT / "exllamav3/model/math_policy.py")
+        policy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(policy)
+        ns = dict(torch = torch, STABLE_ARITHMETIC = stable, validate_streaming = Mock(),
+                  require_whole_k_moe = lambda key, built: policy.require_whole_k_moe(key, built, stable = stable),
+                  ext = NS(exl3_moe_whole_k_built = lambda: whole_k_built))
         register_layer = method("exllamav3/model/moe_cpu_host.py", "MoeCpuHost", "register_layer", ns)
         host = NS(by_key = {}, specs = [], started = False, _spawn = Mock(), live_layers = 0, aux = {},
                   conn = NS(send = Mock()), wslot_size = 1 << 30, num_wslots = 2)
@@ -144,6 +149,13 @@ class CpuHostTests(unittest.TestCase):
         self.assertIn("stream_only", str(cm.exception))
         # next to a placement -mcm is refused, so the message also names the way out for -dmcl layers
         self.assertIn("keep those layers' experts in VRAM", str(cm.exception))
+
+    def test_streamed_experts_refused_by_a_build_without_whole_k_kernels(self):
+        # EXLLAMA_NO_WHOLE_K_MOE leaves out the whole-K fused kernels the profile runs streamed experts with
+        self.assertEqual(self.register(False, "stream", whole_k_built = False)[0], 0)
+        with self.assertRaisesRegex(ValueError, "EXLLAMA_NO_WHOLE_K_MOE") as cm:
+            self.register(True, "stream", whole_k_built = False)
+        self.assertIn("model.layers.3.mlp", str(cm.exception))
 
 
 def _extension_missing():

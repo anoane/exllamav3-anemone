@@ -8,7 +8,7 @@ import torch
 from ..ext import exllamav3_ext as ext
 from .moe_expert_policy import validate_streaming, streamed_experts
 from .moe_stream_slots import slot_layout, slot_rows_bound
-from .math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC
+from .math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC, require_whole_k_moe
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
@@ -737,6 +737,9 @@ class MoeCpuHost:
                                f"(EXL3_MOE_CPU_MODE=stream_only) or experts=stream in a placement. Next to a "
                                f"placement, which refuses -mcm and does not cover -dmcl layers (an MTP head or "
                                f"a draft model), keep those layers' experts in VRAM")
+        if STABLE_ARITHMETIC:
+            # Streamed experts run through the fused kernel's whole-K instances
+            require_whole_k_moe(key, ext.exl3_moe_whole_k_built())
         index = None
         if device is not None:
             dev = torch.device(device)
