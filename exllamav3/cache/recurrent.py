@@ -36,6 +36,7 @@ class RecurrentCache(OrderedDict):
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
             "stash_evictions_live_kv": 0,   # of those, checkpoints whose anchor KV page was still cached
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
+            "stash_too_large": 0,           # checkpoints larger than the whole cache, not stored
         }
 
 
@@ -58,6 +59,16 @@ class RecurrentCache(OrderedDict):
         else:
             stashed_state = state.stash()
             state_size = stashed_state["checkpoint_size"]
+            # A checkpoint larger than the whole cache (every checkpoint, when the cache size is 0) can never be
+            # held: evicting everything else would not make room, and popping from the then empty cache raised a
+            # KeyError. Drop it instead. Checkpoints only save work: if the conversation returns, the replay
+            # prefill recreates this one
+            if state_size > self.max_size:
+                self.metrics["stash_too_large"] += 1
+                note_freed(state_size)
+                if self.model.loaded_tp:
+                    self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), stashed_state["tp_handle"]))
+                return
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
                 pt = self.pagetable
