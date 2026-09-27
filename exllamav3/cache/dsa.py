@@ -24,10 +24,13 @@ framework's paged/recurrent line:
 
     - SWA ring: shifting linear buffer of raw roped K=V rows, page-aligned window_beg
       carried on the job state (identical mechanism to SWALayerState; window +
-      overprovision slack gives guaranteed_rollback = PAGE_SIZE).
+      overprovision slack gives guaranteed_rollback = PAGE_SIZE for tokens processed since
+      the last window rebase, which keeps only the trailing window of a chunk that
+      overflows the ring).
     - Compressor sub-window buffers: rings of the last (PAGE_SIZE + m) PROJECTED (kv, gate)
       rows, indexed by absolute token position % ring size. Rewind = cursor move; the rows
-      for the new partial window are still present for any rollback <= PAGE_SIZE.
+      for the new partial window are still present for any rewind landing within PAGE_SIZE
+      of the furthest position written.
     - CSA overlap (previous window's Ca slice): ring of the last few window-boundary
       snapshots indexed by (entry number - 1) % depth, depth sized for PAGE_SIZE worth of
       windows.
@@ -229,11 +232,13 @@ class DSV4State:
         self.last_history = 0
         self.window_beg = position // PAGE_SIZE * PAGE_SIZE
         self.wshift = 0
+        self.high_water = position
         if stashed is not None:
             self.unstash(stashed)
         self.checkpoint_size = sum(
             l.get_checkpoint_size() for l in cache.get_all_recurrent_layers().values()
         )
+        self.window = max((l.window for l in cache.get_all_recurrent_layers().values()), default = 1)
         if clear and stashed is None:
             for l in cache.get_all_recurrent_layers().values():
                 l.clear(slot)
@@ -248,16 +253,27 @@ class DSV4State:
         self.last_history = 0
 
     def rollback_capacity(self):
-        return self.position - self.window_beg
+        """
+        Number of tokens the state can rewind in place. A rewound query needs its w - 1 window rows at or
+        above window_beg (a window rebase keeps as few as w - 1), and the compressor rings only hold the open
+        window of positions within PAGE_SIZE of the furthest position written (high_water).
+        """
+        cap = self.position - self.window_beg
+        if self.window_beg > 0:
+            cap -= self.window - 1
+        cap = min(cap, PAGE_SIZE - (self.high_water - self.position))
+        return max(cap, 0)
 
     def post_advance(self):
         self.window_beg += self.wshift
         self.wshift = 0
+        self.high_water = max(self.high_water, self.position)
 
     def stash(self):
         stashed = {
             "position": self.position,
             "window_beg": self.window_beg,
+            "high_water": self.high_water,
             "checkpoint_size": self.checkpoint_size,
         }
         if not self.cache.model.loaded_tp:
@@ -273,6 +289,7 @@ class DSV4State:
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
+        self.high_water = stashed["high_water"]
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
                 l.unstash(self.slot, stashed[k], self.position)
@@ -298,6 +315,7 @@ class DSV4State:
         self.position = 0
         self.window_beg = 0
         self.wshift = 0
+        self.high_water = 0
         self.last_history = 0
 
 
