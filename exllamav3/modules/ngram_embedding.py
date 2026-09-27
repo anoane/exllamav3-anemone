@@ -239,8 +239,11 @@ class NGramEmbedding(Module):
                 for h in set(h.filename for h in self.handles):
                     stc.release_file(h)
         else:
-            self.mode = "trellis_ram" if quantized else "fp16_ram"
+            from ..util.memory import check_host_memory
             if len(keys) == 1:
+                # Stored size is the RAM footprint (no dtype conversion here)
+                check_host_memory(stc.get_tensor_meta(keys[0])[keys[0]]["n_bytes"],
+                                  f"n-gram table {self.key} held in RAM (--ngram_ram)")
                 self.tables = [stc.get_tensor(keys[0], "cpu", allow_bf16 = not quantized, no_defer = True)]
             else:
                 # Sharded table: one contiguous slab, each shard copied into its slice as it loads
@@ -248,7 +251,6 @@ class NGramEmbedding(Module):
                 for s_i, k in enumerate(keys):
                     t = stc.get_tensor(k, "cpu", allow_bf16 = not quantized, no_defer = True)
                     if slab is None:
-                        from ..util.memory import check_host_memory
                         check_host_memory(self.num_rows * t[0].numel() * t.element_size(),
                                           f"n-gram table {self.key} held in RAM (--ngram_ram)")
                         slab = torch.empty((self.num_rows, *t.shape[1:]), dtype = t.dtype)
@@ -257,6 +259,7 @@ class NGramEmbedding(Module):
                     del t
                 self.tables = [slab]
                 self.rows_per_shard = self.num_rows
+            self.mode = "trellis_ram" if quantized else "fp16_ram"
             if not quantized:
                 self._row_dtype = self.tables[0].dtype
 
