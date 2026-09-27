@@ -4,9 +4,11 @@ match an fp32 reference to half-output tolerance over row counts, expert counts 
 non-multiples of the tile) and K values, be bit-reproducible, agree bit for bit across every
 visible GPU (the point of the int8 scheme: fp16 tensor cores do not across architectures), and
 feed ext.routing_std so that multi-row routing selects the same experts as the reference on rows
-that are not near-ties. Also checks the FMA-only transcendentals the routing activations use.
+that are not near-ties. Also checks the FMA-only transcendentals the routing activations use, and
+EXL3_ROUTING_ROW_INVARIANT: off, single rows keep the GEMV; on, a row's logits are bitwise the same
+in calls of any row count, one included.
 """
-import sys, os, unittest
+import sys, os, subprocess, unittest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.ext import exllamav3_ext as ext
@@ -83,6 +85,61 @@ class TestRoutingGemmDet(unittest.TestCase):
         clear = (tv[:, topk - 1] - tv[:, topk]) > 1e-2
         self.assertTrue(agree[clear].all().item())
         self.assertGreater(clear.float().mean().item(), 0.5)
+
+    def test_row_invariant_default_off(self):
+        if os.environ.get("EXL3_ROUTING_ROW_INVARIANT", "0") != "0":
+            self.skipTest("EXL3_ROUTING_ROW_INVARIANT is set")
+        # by default a single row takes the fp16 GEMV whether or not the int8 gate is given
+        torch.manual_seed(4)
+        K, E, topk = 2560, 128, 8
+        gate = (torch.randn(K, E, device = DEVICE) * (1.0 / K ** 0.5)).half()
+        gate_t, g8, sb = quant_gate(gate)
+        x = torch.randn(1, K, device = DEVICE).half()
+        outs = []
+        for q in ((g8, sb), (None, None)):
+            logits = torch.empty(1, E, dtype = torch.half, device = DEVICE)
+            sel = torch.empty(1, topk, dtype = torch.long, device = DEVICE)
+            w = torch.empty(1, topk, dtype = torch.half, device = DEVICE)
+            ext.routing_std(x, gate, logits, sel, w, None, gate_t, None, *q)
+            outs.append(logits)
+        self.assertTrue(torch.equal(outs[0], outs[1]))
+
+    def test_row_invariant(self):
+        if torch.cuda.get_device_capability(DEVICE)[0] < 8:
+            self.skipTest("the int8 projection needs sm_80+")
+        # the switch is read once per process: run this test in a child with it set
+        if os.environ.get("EXL3_ROUTING_ROW_INVARIANT", "0") == "0":
+            env = dict(os.environ, EXL3_ROUTING_ROW_INVARIANT = "1")
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), "TestRoutingGemmDet.test_row_invariant"],
+                               env = env, capture_output = True, text = True, timeout = 1800)
+            self.assertEqual(r.returncode, 0, r.stderr[-4000:])
+            return
+        torch.manual_seed(6)
+        rows = (1, 2, 63, 64, 65, 128, 129, 1024, 1025, 4096)
+        for K, E in ((2560, 512), (2048, 128), (4096, 256), (1040, 200)):
+            gate = (torch.randn(K, E, device = DEVICE) * (1.0 / K ** 0.5)).half()
+            gate_t, g8, sb = quant_gate(gate)
+            x = torch.randn(rows[-1], K, device = DEVICE).half()
+            full = torch.empty(rows[-1], E, dtype = torch.half, device = DEVICE)
+            ext.routing_gemm_det(x, g8, sb, full)
+            for R in rows:
+                out = torch.empty(R, E, dtype = torch.half, device = DEVICE)
+                ext.routing_gemm_det(x[:R].contiguous(), g8, sb, out)
+                self.assertTrue(torch.equal(out, full[:R]), (K, E, R))
+            # the full router: one row alone (decode) equals the same row of a multi-row call in
+            # logits, selection and weights
+            def route(xr):
+                n = xr.shape[0]
+                logits = torch.empty(n, E, dtype = torch.half, device = DEVICE)
+                sel = torch.empty(n, 8, dtype = torch.long, device = DEVICE)
+                w = torch.empty(n, 8, dtype = torch.half, device = DEVICE)
+                ext.routing_std(xr, gate, logits, sel, w, None, gate_t, None, g8, sb)
+                return logits, sel, w
+            many = route(x[:257].contiguous())
+            for i in range(0, 257, 8):
+                one = route(x[i:i + 1].contiguous())
+                for a, b in zip(one, many):
+                    self.assertTrue(torch.equal(a, b[i:i + 1]), (K, E, i))
 
     def test_det_transcendentals(self):
         x = torch.cat((torch.linspace(-80, 80, 100001), torch.randn(100000) * 5)).to(DEVICE)

@@ -499,6 +499,28 @@ recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice part
 products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
 models is reproducible as well.
 
+### `EXL3_ROUTING_ROW_INVARIANT` (default: `0`)
+
+Router logits that depend only on the input row, not on the number of rows in the call. By default
+the MoE router projection is run-to-run deterministic and identical across tensor-parallel ranks,
+but a single row (bsz 1 decode) takes the FMA GEMV over the fp16 gate, other row counts the int8
+projection (`routing_gemm.cu`), and that projection uses fewer split-K slices as the row tiles
+grow. With `1`, single rows take the int8 projection too and every call uses the slice count of a
+single row tile (up to 128 rows), so an identical hidden row gets bitwise the same logits,
+selection and weights whether it is routed alone or in a call of any size. The rest of the forward
+pass still depends on the row count, so this alone does not make decode and prefill (or two
+prefill chunkings) of the same tokens route identically: it takes the router out of the variables
+when comparing or replaying identical hidden rows, and is one piece of a row-invariant mode.
+Costs: a decoded token's router runs up to three launches instead of one GEMV, and uses the int8
+scheme (gate and activations quantized to 14-bit fixed point, activations per 128-wide K chunk)
+instead of the GEMV's fp32 dot product of the exact fp16 values; its error against the fp32
+product is the int8 path's (under 2e-3 of the largest logit in `tests/test_routing_gemm_det.py`).
+Large calls do more split-K work and allocate up to 8 x rows x experts x 4 bytes of fp32 partials
+(64 MiB for 4096 rows and 512 experts). Applies to the routers on the ext path (`std`, `std_bias`,
+`dots`, `sqrtsp`, `sqrtsp_hash`) with an fp16 gate, on sm_80+ and K a multiple of 16; the grouped
+`ds3` router, `activate_all_experts` and other devices keep their dispatch. Tensor-parallel ranks
+need sm_80+ and the same setting to agree. Read once per process.
+
 ### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
 
 Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps

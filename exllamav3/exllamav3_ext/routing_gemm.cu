@@ -1,4 +1,6 @@
 #include <cuda_fp16.h>
+#include <cstdlib>
+#include <cstring>
 #include "routing.cuh"
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -230,10 +232,22 @@ void routing_gemm_reduce_kernel(const float* __restrict__ part, half* __restrict
     c[i] = __float2half_rn(v);
 }
 
-// Split-K slices: a function of the shape only
+// EXL3_ROUTING_ROW_INVARIANT (default off): make a row's router logits independent of the number
+// of rows in the call (see rg_slices and routing_gemv in routing.cu). Read once
+bool routing_row_invariant()
+{
+    static const bool on = [] { const char* e = getenv("EXL3_ROUTING_ROW_INVARIANT"); return e && strcmp(e, "0") != 0; }();
+    return on;
+}
+
+// Split-K slices: a function of the shape only. The int32 sums within a 128-wide K chunk are exact,
+// but the fp32 slice partials round where the slices end, and by default the slice count falls as
+// the row tiles grow, so a row's logits depend on the row count. With routing_row_invariant() every
+// call gets the slices of a single row tile (R <= RG_BM: the most there are, so the static workspace
+// stays valid)
 static int rg_slices(int R, int E, int KC)
 {
-    const int tiles = CEIL_DIVIDE(E, RG_BN) * CEIL_DIVIDE(R, RG_BM);
+    const int tiles = CEIL_DIVIDE(E, RG_BN) * (routing_row_invariant() ? 1 : CEIL_DIVIDE(R, RG_BM));
     int S = 1;
     while (tiles * S < 256 && S < 8 && S * 2 <= KC) S *= 2;
     return S;

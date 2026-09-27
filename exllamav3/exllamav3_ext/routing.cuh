@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 // Deterministic int8 router projection (routing_gemm.cu)
+bool routing_row_invariant();
 bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, const at::Tensor& scores);
 void routing_gemm_det_(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, at::Tensor& scores, cudaStream_t stream);
 void routing_gemm_det(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, at::Tensor scores);

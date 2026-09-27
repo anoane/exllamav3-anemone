@@ -256,12 +256,14 @@ void routing_gemv
     // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any sm_80+
     // architecture routing on identical streams select identical experts (the int8 kernels
     // need cp.async and mma.m16n8k32, both sm_80+). Pre-Ampere devices fall back to cuBLAS,
-    // which is device-dependent — uniform per-arch fleets still agree with each other
+    // which is device-dependent — uniform per-arch fleets still agree with each other.
+    // EXL3_ROUTING_ROW_INVARIANT sends single rows to the int8 projection as well, so an identical
+    // hidden row gets the same logits routed alone or in a multi-row call (giving up the GEMV)
     int k = hidden.size(-1);
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
 
-    if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
+    if ((!bsz1 || routing_row_invariant()) && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
