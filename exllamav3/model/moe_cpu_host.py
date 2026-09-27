@@ -1404,7 +1404,8 @@ class MoeCpuHost:
             # Nonzero act_limit clamps up symmetrically and the activated gate from above,
             # before the multiply (mirrors the act_mul kernels; DS4 ships swiglu_limit = 10
             # with plain silu)
-            fn = torch.nn.functional.silu if act == 0 else torch.nn.functional.gelu
+            fn = torch.nn.functional.silu if act == 0 else \
+                lambda x: torch.nn.functional.gelu(x, approximate = "tanh")
             av, uf = fn(g.float()), u.float()
             lim = spec["act_limit"]
             if lim:

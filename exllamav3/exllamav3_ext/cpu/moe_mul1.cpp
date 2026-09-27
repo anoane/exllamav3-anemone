@@ -2135,10 +2135,17 @@ void forward_phase(void* vctx, int worker, int num_workers)
                         }
                         break;
                     case 1:
+                        // Tanh-approximated gelu (gelu_pytorch_tanh), as act_gelu on the GPU, in
+                        // the equivalent form 0.5 * (1 + tanh(t)) = 1 / (1 + exp(-2t)), with
+                        // 2t = 2 * sqrt(2/Pi) * (x + 0.044715 * x^3). 2t is floored at -80 so exp
+                        // stays finite: -Ofast divides through a reciprocal estimate, and
+                        // rcp(inf) = 0 would turn x / inf into NaN. The floor moves the result by
+                        // less than |x| * 2e-35
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
-                            const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                            const float av = std::min(gv * cdf, lim);
+                            const float z = gv + 0.044715f * gv * gv * gv;
+                            const float t2 = std::max(1.595769121606f * z, -80.0f);
+                            const float av = std::min(gv / (1.0f + std::exp(-t2)), lim);
                             g[i] = av * std::clamp(u[i], -lim, lim);
                         }
                         break;
