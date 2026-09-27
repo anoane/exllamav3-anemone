@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 from ..constants import PAGE_SIZE
-from .cache import Cache, CacheLayer
+from .cache import Cache, CacheLayer, check_int32_addressing
 from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash
 
 """
@@ -86,6 +86,11 @@ class CacheLayer_dsa(CacheLayer):
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
         self.G = self.D_c // 32
+        widths = [self.G * k_bits, self.G] if k_bits else [self.D_c]
+        check_int32_addressing(
+            "DSA pool", max_num_tokens,
+            *[(self.num_pages, self.epp, w) for w in widths + [self.D_r, self.D_i]]
+        )
         self.pool_c = None
         self.pool_q = None
         self.pool_s = None
@@ -458,6 +463,7 @@ class CacheLayer_dspark(CacheLayer):
         assert max_num_tokens % PAGE_SIZE == 0
         self.num_pages = max_num_tokens // PAGE_SIZE
         self.width = attention.head_dim
+        check_int32_addressing("DSpark cache", max_num_tokens, (self.num_pages, PAGE_SIZE, self.width))
         self.kv = None
         self.device = None
 

@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Type
 import torch
+import math
+from ..constants import PAGE_SIZE
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..model import Model, Config
@@ -88,6 +90,25 @@ class CacheLayer(ABC):
     @abstractmethod
     def tp_export(self, plan):
         pass
+
+
+def check_int32_addressing(what: str, max_num_tokens: int, *shapes: tuple | None):
+    """
+    Refuse paged cache planes too large for the Triton kernels that address them (attention and
+    indexer reads, MLA appends) with int32 element offsets (row * width + column). Past 2^31
+    elements the offsets wrap and the kernels silently access memory outside the tensor.
+
+    :param shapes:
+        Page-major plane shapes, (num_pages, ...). Dim 0 is ignored, the page count follows from
+        max_num_tokens // PAGE_SIZE. None and zero-size planes are skipped
+    """
+    page_numel = [math.prod(s[1:]) for s in shapes if s]
+    max_pages = min(((1 << 31) // n for n in page_numel if n), default = None)
+    if max_pages is not None and max_num_tokens > max_pages * PAGE_SIZE:
+        raise ValueError(
+            f"max_num_tokens = {max_num_tokens} exceeds the int32 addressing range of the {what} "
+            f"(at most {max_pages * PAGE_SIZE})"
+        )
 
 
 class Cache:

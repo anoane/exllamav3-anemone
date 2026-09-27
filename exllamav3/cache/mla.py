@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..constants import PAGE_SIZE
-from .cache import CacheLayer
+from .cache import CacheLayer, check_int32_addressing
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import MLAttention
@@ -57,6 +57,10 @@ class CacheLayer_MLA_fp16(CacheLayer):
             self.kpool = kpool if (idx_dim and kpool) else 0
             self.shape_p = (pages, PAGE_SIZE // kpool, attention.index_head_dim) \
                 if self.kpool else None
+            check_int32_addressing(
+                "MLA cache", max_num_tokens,
+                self.shape_c, self.shape_r, self.shape_i, self.shape_p
+            )
         else:
             self.kv_lora_rank = None
             self.qk_rope_head_dim = None
@@ -250,6 +254,10 @@ class CacheLayer_MLA_quant(CacheLayer):
             self.kpool = kpool if (idx_dim and kpool) else 0
             self.shape_p = (pages, PAGE_SIZE // kpool, attention.index_head_dim) \
                 if self.kpool else None
+            check_int32_addressing(
+                "MLA cache", max_num_tokens,
+                self.qshape, self.sshape, self.shape_r, self.shape_i, self.shape_p
+            )
         else:
             self.qshape = None
             self.sshape = None
