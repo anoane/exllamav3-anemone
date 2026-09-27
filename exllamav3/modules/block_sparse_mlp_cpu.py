@@ -198,6 +198,11 @@ class BlockSparseMLP_CPU:
              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved
             self._split_saved = None
             self.cpu_split_first = None
+            # Release this layer's slot in the split-layer budget (EXL3_MOE_CPU_SPLIT_LAYERS) so
+            # an autosplit retry or a reload of the same config can claim it again
+            ip = self.config.infer_params
+            if getattr(ip, "moe_cpu_split_assigned", 0) > 0:
+                ip.moe_cpu_split_assigned -= 1
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
