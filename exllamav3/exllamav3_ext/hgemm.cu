@@ -39,16 +39,37 @@ static void hgemm_gemmex_impl
     TORCH_CHECK_SHAPES(a, -1, b, 0, 1);
     TORCH_CHECK_SHAPES(b, 1, c, -1, 1);
     TORCH_CHECK(c.stride(-1) == 1, "c must have contiguous columns");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "a and b must be contiguous");
 
     const half* a_ptr = (const half*) a.data_ptr();
     const half* b_ptr = (const half*) b.data_ptr();
 
-    int size_k = a.size(-1);
-    int size_m = a.numel() / size_k;
-    int size_n = b.size(-1);
+    // Validate in 64 bits before narrowing to cuBLAS' int arguments
+    int64_t size_k64 = a.size(-1);
+    TORCH_CHECK(size_k64 > 0, "a must have a nonzero inner dimension");
+    int64_t size_m64 = a.numel() / size_k64;
+    int64_t size_n64 = b.size(-1);
+    TORCH_CHECK(size_m64 <= std::numeric_limits<int>::max() &&
+                size_k64 <= std::numeric_limits<int>::max() &&
+                size_n64 <= std::numeric_limits<int>::max(), "dimensions are too large");
+    int size_k = (int) size_k64;
+    int size_m = (int) size_m64;
+    int size_n = (int) size_n64;
+
+    // c may be a column slice of a wider tensor, but its leading dims must collapse into rows
+    // c.stride(-2) apart, and it must have a row for every row of a
     int64_t c_stride_m = c.stride(-2);
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
+    if (!size_m || !size_n) return;  // nothing to write
+
+    int64_t c_rows = c.size(-2);
+    for (int64_t d = c.dim() - 3; d >= 0; --d)
+    {
+        TORCH_CHECK(c.size(d) == 1 || c.stride(d) == c_rows * c_stride_m, "c leading dimensions must collapse into rows");
+        c_rows *= c.size(d);
+    }
+    TORCH_CHECK(c_rows >= size_m64, "c has fewer rows than a");
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
