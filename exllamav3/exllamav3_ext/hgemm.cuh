@@ -23,6 +23,9 @@ void hgemm_batched
     at::Tensor w,
     at::Tensor c
 );
+// EXL3_HGEMM_FP32_REDUCTION (read once): fp16-output cuBLAS GEMMs in hgemm.cu disallow
+// reduced-precision split-K reductions. Always false on ROCm
+bool hgemm_fp32_reduction_status();
 
 // fp16-accumulator tensor-core GEMM with fp32 accumulation across K (hgemm_f16acc.cu): full
 // rate on GeForce, where the fp32-accumulator MMA runs at half rate. hgemm_f16acc_try runs it

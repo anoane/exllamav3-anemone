@@ -464,6 +464,23 @@ unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x us
 128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
 each 32-term FP16 partial into FP32.
 
+### `EXL3_HGEMM_FP32_REDUCTION` (default: `0`)
+
+The cuBLAS GEMMs in `hgemm.cu` (`hgemm`, and `hgemm_batched` / `hgemm_recon` when they do not
+take the kernel above) accumulate in fp32, but with an fp16 output cuBLAS may pick a split-K
+algorithm that adds the partial sums in fp16: one extra fp16 rounding per split, and partial
+sums above the fp16 range can overflow even when the result is small. Set to `1` to add
+`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` to the cuBLAS handle for fp16-output calls,
+keeping those reductions in fp32 at the cost of letting cuBLAS choose a possibly slower
+algorithm. cuBLAS still picks the algorithm and split per shape, so results can still depend on
+the number of rows in the call, only less often. fp32-output calls and the fp16-accumulator
+kernel are not affected. CUDA only.
+
+PyTorch's `torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction` does not reach
+these calls. fp16 -> fp16 linears (`LinearFP16`, and `BC_LinearFP16` outside a native graph)
+use `torch.matmul` and follow that setting instead; set it to `False` as well to keep the
+reductions in fp32 everywhere.
+
 ### `EXL3_MOE_COOP_KSPLIT` (default: unset)
 
 Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over

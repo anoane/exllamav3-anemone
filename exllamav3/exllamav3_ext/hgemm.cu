@@ -6,15 +6,56 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 
 /*
 
 Row-major matmul using cuBLAS, a @ b -> c
-- if c is float16, operation is float16 @ float16 -> float16 (float16 accumulate)
+- if c is float16, operation is float16 @ float16 -> float16 (float32 accumulate, but cuBLAS may
+  reduce split-K partial sums in float16 unless EXL3_HGEMM_FP32_REDUCTION is set)
 - if c is float32, operation is float16 @ float16 -> float32 (float32 accumulate)
 */
 
 using bfloat16 = __nv_bfloat16;
+
+// EXL3_HGEMM_FP32_REDUCTION (default 0): CUBLAS_COMPUTE_32F alone lets cuBLAS pick a split-K
+// algorithm that reduces its partial sums in the output type. When set, float16-output GEMMs in
+// this file run with CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION. Read once
+bool hgemm_fp32_reduction_status()
+{
+    #if defined(USE_ROCM)
+        return false;
+    #else
+        static const bool on = [] { const char* e = std::getenv("EXL3_HGEMM_FP32_REDUCTION"); return e && std::strcmp(e, "0") != 0; }();
+        return on;
+    #endif
+}
+
+// Add the flag to the handle's math mode for one call. The handle is PyTorch's (shared), so when
+// this returns true the caller passes *previous to fp32_reduction_end after the call, before
+// checking its status. The mode is kept as an int so that no cuBLAS math-mode type is used
+// outside the CUDA-only branches (hipify has no mapping for them)
+static bool fp32_reduction_begin(cublasHandle_t handle, bool output_fp16, int* previous)
+{
+    #if defined(USE_ROCM)
+        return false;
+    #else
+        if (!output_fp16 || !hgemm_fp32_reduction_status()) return false;
+        cublasMath_t mode;
+        cublas_check(cublasGetMathMode(handle, &mode));
+        *previous = (int) mode;
+        cublas_check(cublasSetMathMode(handle, (cublasMath_t) (mode | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
+        return true;
+    #endif
+}
+
+static void fp32_reduction_end(cublasHandle_t handle, int previous)
+{
+    #if !defined(USE_ROCM)
+        cublas_check(cublasSetMathMode(handle, (cublasMath_t) previous));
+    #endif
+}
 
 static void hgemm_gemmex_impl
 (
@@ -62,6 +103,8 @@ static void hgemm_gemmex_impl
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
+    int math_mode = 0;
+    bool restore_math = fp32_reduction_begin(cublas_handle, output_fp16, &math_mode);
     auto r = cublasGemmEx
     (
         cublas_handle,
@@ -73,6 +116,7 @@ static void hgemm_gemmex_impl
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
+    if (restore_math) fp32_reduction_end(cublas_handle, math_mode);
     cublas_check(r);
     cuda_check(cudaPeekAtLastError());
 }
@@ -149,6 +193,8 @@ void hgemm_batched
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
+    int math_mode = 0;
+    bool restore_math = fp32_reduction_begin(cublas_handle, !output_fp32, &math_mode);
     auto r = cublasGemmStridedBatchedEx
     (
         cublas_handle,
@@ -161,6 +207,7 @@ void hgemm_batched
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
+    if (restore_math) fp32_reduction_end(cublas_handle, math_mode);
     cublas_check(r);
     cuda_check(cudaPeekAtLastError());
 }
