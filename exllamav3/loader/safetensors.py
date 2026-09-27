@@ -438,7 +438,9 @@ class SafetensorsCollection:
             new_tensor_files = [directory]
         else:
             st_pattern = os.path.join(directory, "*.safetensors")
-            new_tensor_files = glob.glob(st_pattern)
+            # glob returns directory enumeration order, which varies by filesystem; sort so that
+            # when two files carry the same key, the one that wins is the same on every host
+            new_tensor_files = sorted(glob.glob(st_pattern))
         self.tensor_files += new_tensor_files
 
         overrides = 0
