@@ -39,9 +39,9 @@ class LinearFP16:
         self.out_dtype = out_dtype
         self.key = key
 
-        if self.weight.shape[0] == full_in_features and self.weight.shape[0] < in_features:
+        if self.weight.shape[0] == full_in_features and in_features < self.weight.shape[0]:
             self.weight = self.weight[first_in_feature : first_in_feature + in_features, :]
-        if self.weight.shape[1] == full_out_features and self.weight.shape[1] < out_features:
+        if self.weight.shape[1] == full_out_features and out_features < self.weight.shape[1]:
             self.weight = self.weight[:, first_out_feature : first_out_feature + out_features]
             if bias is not None:
                 self.bias = self.bias[..., first_out_feature : first_out_feature + out_features]
