@@ -433,6 +433,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
+        # DeepSeek-V4: selection bias is the router's own "gate.bias" (see drop_routing_gate_bias)
+        self.routing_gate_bias_is_e_score_bias = (
+            routing_gate is None and key_routing_gate is not None and
+            key_e_score_bias == f"{key_routing_gate}.bias"
+        )
         self.e_score_bias_vl = None
         self.e_score_bias_vl_key = key_e_score_bias_vl
         self.tid2eid = None
@@ -772,6 +777,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
 
 
+    def drop_routing_gate_bias(self):
+        """The selection bias shares its key with the routing gate's bias (DeepSeek-V4): drop
+        the gate's fp16 copy, which the selection-bias routers never read. Otherwise it would be
+        collected after this module's own tensors in get_tensors() order and overwrite the
+        checkpoint-precision e_score_correction_bias under the same key"""
+        if not self.routing_gate_bias_is_e_score_bias:
+            return
+        inner = self.routing_gate.inner
+        if self.routing_gate.quant_type == "fp16" and inner.bias is not None:
+            inner.bias = None
+            inner.bc = ext.BC_LinearFP16(inner.weight, None)
+
+
     @override
     def load(self, device: torch.Device, **kwargs):
         # CPU expert offload (see block_sparse_mlp_cpu.py): a whole-layer claim replaces the
@@ -780,6 +798,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return
         self.cpu_maybe_split_load(device, **kwargs)
         super().load(device, **kwargs)
+        self.drop_routing_gate_bias()
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:

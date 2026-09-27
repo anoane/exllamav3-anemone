@@ -364,6 +364,7 @@ class BlockSparseMLP_CPU:
         for module in self.modules:
             if module not in expert_set:
                 module.load(device, **kwargs)
+        self.drop_routing_gate_bias()
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
                 # Loaded in its checkpoint precision: GLM-5.2's bias sits near 34.0 where
