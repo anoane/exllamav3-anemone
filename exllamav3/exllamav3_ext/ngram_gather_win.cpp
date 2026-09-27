@@ -35,6 +35,9 @@ namespace py = pybind11;
 #define WG_WORKER_DEPTH 8               // per-worker async depth in the pooled path
 #define WG_SECTOR 4096                  // covers 512e/4Kn drives; NO_BUFFERING alignment unit
 #define WG_BOUNCE_BYTES (64 * 1024)     // per-slot bounce size (VirtualAlloc base is 64K-aligned)
+// largest per-read payload whose sector-aligned span always fits one bounce slot: the payload
+// starts at most WG_SECTOR - 1 bytes into the span, which is rounded up to a whole sector
+#define WG_MAX_PAYLOAD (WG_BOUNCE_BYTES - (WG_SECTOR - 1))
 
 namespace
 {
@@ -115,9 +118,6 @@ static void read_span_async(GatherCtx* c, int64_t i0, int64_t i1, int depth)
     bool failing = false;
     int64_t i = i0;
 
-    // cap each read so its aligned span fits the bounce slot
-    const int64_t max_payload = WG_BOUNCE_BYTES - 2 * WG_SECTOR;
-
     // complete slot s: verify byte count, copy the payload out of the bounce slot
     auto complete = [&](int s) -> bool
     {
@@ -137,10 +137,11 @@ static void read_span_async(GatherCtx* c, int64_t i0, int64_t i1, int depth)
             HANDLE ev = t_events.get(s);
             if (!ev) { failing = true; break; }
 
-            // coalesce a run of consecutive rows into one read
+            // coalesce a run of consecutive rows into one read, capped so its aligned span fits
+            // the bounce slot (a single row fits by the check in ngram_gather_cpu)
             int64_t j = i + 1;
             while (j < i1 && c->up[j] == c->up[j - 1] + 1 &&
-                   (j - i) * c->row_bytes < max_payload) ++j;
+                   (j - i + 1) * c->row_bytes <= WG_MAX_PAYLOAD) ++j;
             uint64_t off = (uint64_t) (c->base_offset + (c->up[i] - c->uid_base) * c->row_bytes);
             int64_t payload = (j - i) * c->row_bytes;
 
@@ -300,6 +301,8 @@ void ngram_gather_cpu
     int64_t U = uids.numel();
     TORCH_CHECK(out.size(0) >= U && out.size(1) * out.element_size() == row_bytes,
                 "ngram_gather_cpu: out shape");
+    TORCH_CHECK(row_bytes <= WG_MAX_PAYLOAD,
+                "ngram_gather_cpu: row_bytes exceeds the unbuffered read bounce slot");
     if (!U) return;
     const int64_t* up = (const int64_t*) uids.data_ptr();
     uint8_t* op = (uint8_t*) out.data_ptr();
