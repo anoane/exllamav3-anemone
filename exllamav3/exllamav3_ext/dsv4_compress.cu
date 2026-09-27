@@ -5,6 +5,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "graph.cuh"
+#include "rope_angle.cuh"
 
 /*
 Fused DeepSeek-V4 compressor step (stateful/cached path, bsz 1). Replaces the torch
@@ -42,6 +43,7 @@ w < nw guard: launches become CUDA-graph-replayable across positions with fixed 
 
 #define NUM_THREADS_STORE 256
 
+template <bool range_reduce>
 __global__ __launch_bounds__(1024)
 void dsv4_compress_windows_kernel
 (
@@ -193,7 +195,7 @@ void dsv4_compress_windows_kernel
     if (c >= c0)
     {
         int p = (c - c0) / 2;
-        float theta = inv_freq[p] * (float) ((ec0 + w) * m);
+        float theta = rope_reduce_angle<range_reduce>(inv_freq[p] * (float) ((ec0 + w) * m));
         float cs = __cosf(theta);
         float sn = __sinf(theta);
         float v_e = sh_comp[c0 + p * 2];
@@ -472,7 +474,8 @@ void dsv4_compress_gr
     {
         int threads = CEIL_DIVIDE(hd, 32) * 32;
         size_t shmem = (hd + threads / 32) * sizeof(float);
-        dsv4_compress_windows_kernel<<<dim3(grid_w, batch), threads, shmem, stream>>>
+        auto kernel = rope_range_reduce() ? dsv4_compress_windows_kernel<true> : dsv4_compress_windows_kernel<false>;
+        kernel<<<dim3(grid_w, batch), threads, shmem, stream>>>
         (
             (const half*) kv_new.data_ptr(),
             (const half*) gate_new.data_ptr(),

@@ -193,6 +193,15 @@ order. flash-attn is an optional dependency; when it is not installed, this swit
 FA2 across supported hardware and cover more cases (quantized caches, head dims > 256,
 attention sinks); this switch exists for A/B comparison.
 
+### `EXL3_ROPE_RANGE_REDUCE` (default: `0`)
+
+The RoPE kernel (and the fused DeepSeek-V4 compressor) takes sin/cos of each fp32 angle with the
+fast hardware intrinsics, whose error grows with the angle: about 1e-3 at 8k positions, 2e-2
+at 128k and 0.14 at 1M on the highest-frequency pair. Set to `1` to reduce the angle
+to about [-pi, pi] first, which keeps the rotation within ~1e-6 of accurate sin/cos of the same
+angle at any practical position (angles below 2^24). Changes outputs slightly at every position
+above a few tokens.
+
 ## EXL3 GEMM / GEMV
 
 ### `EXL3_GEMV` (default: `1`)

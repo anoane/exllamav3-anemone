@@ -287,3 +287,78 @@ def test_rope_llama4_scaling(rope_style, partial):
     assert scale.min() == 1.0 and scale.max() > 1.0
     q_expect = (q0.float() * scale.view(1, seq_len, 1, 1)).half()
     torch.testing.assert_close(q1, q_expect, rtol = 3e-3, atol = 3e-3)
+
+
+long_positions = [0, 1000, 131072, 1048320]
+
+def _long_position_probe(rope_style: str):
+    """Per start position: is ext.rope within the usual tolerance of float64 sin/cos of the
+    kernel's own fp32 angles, and the max abs error. Prints JSON; run in a subprocess since
+    EXL3_ROPE_RANGE_REDUCE is read once per process"""
+    import json
+    style = RopeStyle[rope_style]
+    rope_layer = RoPE(
+        device = device,
+        rope_settings = RopeSettings(
+            rope_theta = 10000.0,
+            head_dim = 128,
+            rope_scaling = None,
+            max_position_embeddings = 1048576,
+            partial_rotary_factor = 1.0,
+            rope_style = style,
+        )
+    )
+
+    # float64 reference on the kernel's own fp32 angles (apply_torch would build a ~1M-row table)
+    def rotate_ref(x, sin, cos):
+        x = x.double()
+        sin = sin[None, :, None, :]
+        cos = cos[None, :, None, :]
+        if style == RopeStyle.NEOX:
+            x1, x2 = x[..., :64], x[..., 64:]
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim = -1)
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        return torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim = -1).flatten(-2)
+
+    result = []
+    with torch.inference_mode():
+        for position in long_positions:
+            torch.manual_seed(0)
+            q = torch.randn((1, 16, 8, 128), dtype = torch.half, device = device)
+            k = torch.randn((1, 16, 2, 128), dtype = torch.half, device = device)
+            q_out, k_out = rope_layer.apply(q, k, position)
+            pos = torch.arange(position, position + 16, dtype = torch.float, device = device)
+            angle = (pos[:, None] * rope_layer.inv_freq[None, :]).double()
+            sin = angle.sin() * rope_layer.attn_factor
+            cos = angle.cos() * rope_layer.attn_factor
+            close, err = True, 0.0
+            for x, x_out in ((q, q_out), (k, k_out)):
+                ref = rotate_ref(x, sin, cos)
+                close &= torch.allclose(x_out.double(), ref, rtol = 3e-3, atol = 3e-3)
+                err = max(err, (x_out.double() - ref).abs().max().item())
+            result.append((position, close, err))
+    print(json.dumps(result))
+
+
+@pytest.mark.parametrize("rope_style", rope_styles)
+@pytest.mark.parametrize("range_reduce", [False, True])
+def test_rope_long_position(rope_style, range_reduce):
+    """Default: the fast sin/cos intrinsics, whose error grows with the angle (fine at short
+    context, far off at 1M). EXL3_ROPE_RANGE_REDUCE=1: within tolerance at every position"""
+    import json, subprocess
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    env = dict(os.environ)
+    env.pop("EXL3_ROPE_RANGE_REDUCE", None)
+    if range_reduce: env["EXL3_ROPE_RANGE_REDUCE"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-c", f"import sys; sys.path.insert(0, {tests_dir!r}); "
+                               f"import test_rope; test_rope._long_position_probe({rope_style.name!r})"],
+        env = env, capture_output = True, text = True, cwd = tests_dir
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    for position, close, err in result:
+        if range_reduce or position <= 1000:
+            assert close, (position, err)
+        elif position >= 1000000:
+            assert not close and err > 1e-2, (position, err)

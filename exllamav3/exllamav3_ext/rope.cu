@@ -6,6 +6,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "reduction.cuh"
+#include "rope_angle.cuh"
 
 #define MAX_NUM_THREADS 1024
 #define MAX_ROTATE_DIMS 4
@@ -13,7 +14,7 @@
 using bfloat16 = __nv_bfloat16;
 using bfloat162 = __nv_bfloat162;
 
-template <int rope_mode, bool norm_bf16>
+template <int rope_mode, bool norm_bf16, bool range_reduce>
 __global__
 void rope_kernel
 (
@@ -73,12 +74,13 @@ void rope_kernel
         {
             float fr = inv_freq[t];
             float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * attn_factor;
-            cos = __cosf(fr * pf) * attn_factor;
+            float a = rope_reduce_angle<range_reduce>(fr * pf);
+            sin = __sinf(a) * attn_factor;
+            cos = __cosf(a) * attn_factor;
         }
         else
         {
-            float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
+            float fr = rope_reduce_angle<range_reduce>(inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t]);
             sin = __sinf(fr) * attn_factor;
             cos = __cosf(fr) * attn_factor;
         }
@@ -410,18 +412,22 @@ void rope_gr
                  &position_ids_ptr, &attn_factor, &q_norm_ptr, &k_norm_ptr, &norm_eps, &norm_constant_bias, &inv_freq_table, \
                  &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride, &rotate_dims, &rotate_offset
 
+    bool range_reduce = rope_range_reduce();
+    #define ROPE_KERNEL(mode, bf16) (range_reduce ? (void*) rope_kernel<mode, bf16, true> : (void*) rope_kernel<mode, bf16, false>)
+
     void* kernel_ptr = nullptr;
     if (norm_fp16)
     {
-        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, false>;
-        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, false>;
+        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = ROPE_KERNEL(ROPESTYLE_GPTJ, false);
+        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = ROPE_KERNEL(ROPESTYLE_NEOX, false);
     }
     else if (norm_bf16)
     {
-        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, true>;
-        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, true>;
+        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = ROPE_KERNEL(ROPESTYLE_GPTJ, true);
+        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = ROPE_KERNEL(ROPESTYLE_NEOX, true);
     }
     TORCH_CHECK(kernel_ptr, "rope: incorrect norm dtype");
+    #undef ROPE_KERNEL
 
     void* kernel_args[] = { ARGPTRS };
     cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
