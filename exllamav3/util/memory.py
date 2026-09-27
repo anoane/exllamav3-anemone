@@ -596,21 +596,72 @@ def host_memory_available() -> int | None:
         return None
 
 
+def cgroup_memory_available(
+    proc_cgroup: str = "/proc/self/cgroup",
+    cgroup_root: str = "/sys/fs/cgroup"
+) -> int | None:
+    """Bytes this process can still charge to its memory cgroup (v2) under the tightest memory.max /
+    memory.high on its path, counting the file LRU as reclaimable; None when no level sets a limit or
+    the hierarchy can't be read (cgroup v1, Windows, macOS)"""
+    import os
+    try:
+        with open(proc_cgroup) as f:
+            path = next((line.rstrip("\n")[3:] for line in f if line.startswith("0::")), None)
+        if path is None or not path.startswith("/"):
+            return None
+        parts = [p for p in path.split("/") if p]
+        # ".." when the cgroup is outside this cgroup namespace: not reachable under cgroup_root
+        if ".." in parts:
+            return None
+
+        def read(level: str, name: str) -> str | None:
+            try:
+                with open(os.path.join(level, name)) as f:
+                    return f.read()
+            except OSError:
+                return None
+
+        room = None
+        for depth in range(len(parts), -1, -1):
+            level = os.path.join(cgroup_root, *parts[:depth])
+            limits = [read(level, "memory.max"), read(level, "memory.high")]
+            limits = [int(v) for v in limits if v is not None and v.strip() != "max"]
+            current = read(level, "memory.current")
+            if not limits or current is None:
+                continue
+            reclaimable = 0
+            for line in (read(level, "memory.stat") or "").splitlines():
+                key, _, value = line.partition(" ")
+                if key in ("active_file", "inactive_file"):
+                    reclaimable += int(value)
+            level_room = max(min(limits) - int(current) + reclaimable, 0)
+            room = level_room if room is None else min(room, level_room)
+        return room
+    except (OSError, ValueError):
+        return None
+
+
 def check_host_memory(nbytes: int, what: str):
-    """Raise before allocating `nbytes` of host memory when it would leave the system with less
-    than the configured reserve"""
+    """Raise before allocating `nbytes` of host memory when it would leave the system, or the
+    process's memory cgroup, with less than the configured reserve"""
     import os
     reserve_mb = int(os.environ.get("EXL3_HOST_MEM_RESERVE_MB", 2048))
     if reserve_mb <= 0:
         return
     avail = host_memory_available()
+    cgroup = cgroup_memory_available()
+    in_cgroup = cgroup is not None and (avail is None or cgroup < avail)
+    if in_cgroup:
+        avail = cgroup
     if avail is None:
         return
     if nbytes + (reserve_mb << 20) > avail:
         raise RuntimeError(
             f"{what} needs {nbytes >> 20} MiB of host memory, but only {avail >> 20} MiB is available "
+            f"{'under the memory cgroup limit ' if in_cgroup else ''}"
             f"and EXL3_HOST_MEM_RESERVE_MB = {reserve_mb} MiB is kept free. Lower the amount of data held "
-            f"in host memory (fewer offloaded experts, no --ngram_ram, ...) or set "
+            f"in host memory (fewer offloaded experts, no --ngram_ram, ...)"
+            f"{', raise the memory cgroup limit' if in_cgroup else ''} or set "
             f"EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
         )
 
