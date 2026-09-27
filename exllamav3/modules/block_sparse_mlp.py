@@ -31,8 +31,8 @@ TEMP_ROWS_GRAPH = 32
 BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
 # Row tiles for the fused kernel: experts with more than MTILE_T1 rows run through a 32-row tile
 # instance, more than MTILE_T2 through a 64-row one (32 for the N = 256 shape), each its own
-# launch over its expert range (mul1 codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row
-# launch
+# launch over its expert range and never taller than the temp buffers (see fused_row_tiers; mul1
+# codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row launch
 MTILE = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
 MTILE_T1, MTILE_T2 = 16, 32
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
@@ -42,6 +42,23 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+
+def fused_row_tiers(counts, rows, mtile):
+    """Fused MoE kernel launches for the fused-tier experts' row counts (each at most `rows`, the
+    temp buffers' row capacity) as (num_active, count_lo, count_hi, m_tile), largest tile first.
+    exl3_moe refuses a tile taller than the temp buffers, so below 64 rows the whole wide range
+    runs on the 32-row tile (which finishes each expert with smaller tiles), and below 32 rows
+    everything is one 16-row launch"""
+    t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
+    t2 = sum(1 for c in counts if c > MTILE_T2)
+    if not (mtile and rows >= 32 and (t1 or t2)):
+        return [(len(counts), 1, rows, 16)]
+    if rows >= 64:
+        tiers = [(t2, MTILE_T2 + 1, rows, 64), (t1, MTILE_T1 + 1, MTILE_T2, 32)]
+    else:
+        tiers = [(t1 + t2, MTILE_T1 + 1, rows, 32)]
+    tiers.append((len(counts) - t1 - t2, 1, MTILE_T1, 16))
+    return [t for t in tiers if t[0]]
 
 @dataclass
 class FusedBuffers:
@@ -1223,20 +1240,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
+                        # One launch per row tile over its expert range, largest first
                         counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
-                        t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
-                        t2 = sum(1 for c in counts if c > MTILE_T2)
-                        if self.mtile_ok and (t1 or t2):
-                            # One launch per row tile over its expert range, largest first
-                            t0 = len(counts) - t1 - t2
-                            if t2:
-                                run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
-                            if t1:
-                                run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
-                            if t0:
-                                run_fused(t0, 1, MTILE_T1, 16)
-                        else:
-                            run_fused(len(counts))
+                        for tier in fused_row_tiers(counts, self.fused_rows, self.mtile_ok):
+                            run_fused(*tier)
 
                 # Batched reconstruct tier (into slots when deterministic, else accumulating)
                 batched = ()

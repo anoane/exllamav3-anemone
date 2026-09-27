@@ -1544,6 +1544,7 @@ class MoeCpuHost:
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
                                  streamed, st, counts_h, flat, shifted, neg):
         from ..modules.moe_batch_recon import plan_groups
+        from ..modules.block_sparse_mlp import fused_row_tiers
         rows = y.shape[0]
         h = y.shape[1]
         E = spec["num_experts"]
@@ -1712,13 +1713,7 @@ class MoeCpuHost:
                 # Row-tile tiers as on the GPU side (block_sparse_mlp): one launch per tile over
                 # its expert range. Streamed experts are mul1 by construction
                 fc = [counts_h[e] for _, e, _, _ in per_e if counts_h[e] <= fused_t]
-                t1 = sum(1 for c in fc if 16 < c <= 32)
-                t2 = sum(1 for c in fc if c > 32)
-                tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
-                    if TUNING.mtile and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
-                for n_act, lo, hi, mt in tiers:
-                    if not n_act:
-                        continue
+                for n_act, lo, hi, mt in fused_row_tiers(fc, fused_t, TUNING.mtile):
                     ext.exl3_moe(
                         y, out, ec, tok, wts,
                         fbufs[0], fbufs[1], fbufs[2], fbufs[3],

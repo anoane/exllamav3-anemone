@@ -343,6 +343,7 @@ regardless of count. The default was 512 while the alternative above it was the 
 loop; with the batched tier there, 128-256 measure best (Qwen3.8 4090 + 3090 split, 4k
 chunks: 512 -> 256 +4%; mistral-small-4 119B full offload on the PRO 6000: +2.8%), and the
 fused temp buffers (concurrency x T x (2 hidden + 2 intermediate) x 2 bytes per device) halve.
+Below 64 rows the row tiles step down (see `EXL3_MOE_MTILE`).
 
 ### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
 
@@ -554,7 +555,10 @@ launch, where it is 10-20% faster). Model level, 4k chunks: Qwen3.8 +10% on the 
 on a 4090 + 3090 split; gemma4-26B +1-4%; Qwen3-30B neutral. Other codebooks and the
 all-fused fast path (no host-side counts) keep the single launch. Outputs are bit-identical to
 the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
-reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
+reorders the fp32 k-slice reduction to rounding level). With `EXL3_MOE_FUSED_ROWS_WIDE` or
+`EXL3_MOE_STREAM_FUSED_T` below 64 rows, every expert above 16 rows runs through the 32-row
+instance, and below 32 rows the single launch stays, since no tile may exceed the temp buffers.
+Set to `0` for the single launch.
 
 ### `EXL3_MOE_TILE_N` (default: `0` = automatic)
 
@@ -568,7 +572,8 @@ Fused-tier row capacity per expert for layers that use the wide tiles (see `EXL3
 `EXL3_MOE_FUSED_ROWS` still applies to every other layer. With the wide tiles the fused kernel
 beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk on the PRO 6000: 6.87k ->
 7.06k tok/s over 128 rows), at 4 x concurrency x rows x (hidden + intermediate) x 2 bytes of
-static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows).
+static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows). Below 64 rows the
+wide tiles step down (see `EXL3_MOE_MTILE`).
 
 ### `EXL3_MOE_BATCH_RECON` (default: `1`), `EXL3_MOE_STREAM_BATCH_RECON` (default: `1`)
 
