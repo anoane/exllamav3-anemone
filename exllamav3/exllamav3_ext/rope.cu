@@ -107,6 +107,10 @@ void rope_kernel
     // Prep
     int head_dim_pad = (head_dim + 63) / 64 * 64;
 
+    // q/k element offsets reach bsz * seq_len * num_heads * head_stride, past int32 from row
+    // 65536 at 64 heads x 512 dim: widen the row term
+    const int64_t row = (int64_t) batch * seq_len + token_pos;
+
     // Loop over heads
     // Heads are distributed over gridDim.z as well as blockDim.y: at decode (seq 1, bsz 1)
     // the per-token grid is otherwise a single block walking every head serially between
@@ -120,14 +124,14 @@ void rope_kernel
         const void* norm_weight;
         if (head_idx < num_heads_q)
         {
-            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
-            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
+            g_head_in_ptr = q + (row * num_heads_q + head_idx) * q_head_stride;
+            g_head_out_ptr = out_q + (row * num_heads_q + head_idx) * q_head_stride;
             norm_weight = q_norm;
         }
         else if (head_idx < num_heads_q + num_heads_k)
         {
-            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
-            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
+            g_head_in_ptr = k + (row * num_heads_k + head_idx - num_heads_q) * k_head_stride;
+            g_head_out_ptr = out_k + (row * num_heads_k + head_idx - num_heads_q) * k_head_stride;
             norm_weight = k_norm;
         }
 

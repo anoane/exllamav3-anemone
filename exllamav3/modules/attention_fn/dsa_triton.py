@@ -105,6 +105,7 @@ def _dsa_attn_kernel(
                                    # weighted sum is never accumulated
     QC: tl.constexpr = 0,          # pool_c is the packed quantized pool (QC bits per
                                    # value, 32-value groups, H32-rotated domain)
+    WIDE_INDEX: tl.constexpr = 0,  # int64 row index math (q/out element offsets past 2^31)
 ):
     """One program per (query row, head block); heads are the MMA M dim. Consecutive
     programs cover one query's head blocks so gathers stay L2-resident. Two KV phases:
@@ -114,6 +115,13 @@ def _dsa_attn_kernel(
     h_blocks = tl.cdiv(H, BLOCK_H)
     row = pid // h_blocks
     h_block = pid % h_blocks
+    # q/out element offsets reach R * H * D, past int32 once that exceeds 2^31 (q from row
+    # 65536 at 64 heads x 512 dim, a group-major out earlier in its last group): widen the
+    # row term. Conditional on the wrapper detecting a tensor past the boundary, so
+    # common geometries keep pure int32 index math
+    if WIDE_INDEX:
+        row = row.to(tl.int64)
+        R = R.to(tl.int64)
 
     offs_h = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
     valid_h = offs_h < H
@@ -1030,6 +1038,10 @@ def dsa_attn(
             n_splits = 1
 
     if n_splits > 1:
+        # Only reached with a handful of query rows (auto split, MULTIROW decode): the split
+        # and combine kernels keep int32 index math
+        assert max(q.numel(), out.numel()) < 1 << 31, \
+            "dsa_attn: split path does not support tensors past 2^31 elements"
         block_h = min(block_h, 16)   # more head-blocks: the split path wants parallelism
         # Head tile and kv tile, then pipeline depth, against the device's shared memory
         # (smem.py); the workspace below follows the picked head tile
@@ -1096,6 +1108,12 @@ def dsa_attn(
             )
         return out
 
+    # int64 row index math only when an element offset can actually cross 2^31 (q, q_pe,
+    # out, and the per-row indices and block table); common geometries keep pure int32 codegen
+    wide_index = max(
+        q.numel(), out.numel(), indices.numel(), block_table.numel(),
+        q_pe.numel() if q_split else 0,
+    ) >= 1 << 31
     m_args = (
         q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
         block_table, indices, sinks_t, derot_t, out,
@@ -1118,6 +1136,7 @@ def dsa_attn(
             NC_CHUNK = 1 if nc_chunk else 0, NC_HIST = nc_hist,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             QC = qc_bits,
+            WIDE_INDEX = 1 if wide_index else 0,
         )
     # Head tile, then kv tile, then pipeline depth (smem.py); the stock config leads
     ladder = [(block_h, block_n, num_stages)]
@@ -1129,7 +1148,7 @@ def dsa_attn(
     with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
         pick_key = (H, D_c, D_r, K_pad, has_window, has_sinks, dense_pool, derotate, hpg, dbg,
                     bool(nc_block), bool(nc_chunk), nc_hist, bool(q_split), bool(out_latent), qc_bits,
-                    num_warps, ladder[0])
+                    wide_index, num_warps, ladder[0])
         block_h, block_n, num_stages = pick_config(
             q.device, "dsa_attn", pick_key, ladder,
             lambda cfg: shared_bytes(_dsa_attn_kernel, m_args, **m_consts(cfg), num_warps = num_warps, num_stages = cfg[2]))
