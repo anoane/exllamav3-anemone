@@ -42,6 +42,7 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+MOE_GATHER_MAX_TOPK = 32  # must match MOE_GATHER_MAX_TOPK in exllamav3_ext/quant/exl3_moe.cu
 
 @dataclass
 class FusedBuffers:
@@ -1146,9 +1147,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # contributions in arrival order. Slot tables come from the host-side counts, the
                 # all-fused fast path builds them on the device. Scratch is prefill-shaped and per
                 # call. Its traffic (written once by the GEMMs, read once by the gather) matches
-                # what the atomic index_add_ path moved
+                # what the atomic index_add_ path moved. Selections wider than the gather's slot
+                # list (activate_all_experts in measure_model.py) skip the slot scratch and
+                # accumulate in place (fused kernel atomics, batched tier per EXL3_MOE_RECON_DET)
                 scratch = tables = inv_order = None
-                if FUSED_DET and (fused_total or groups):
+                if FUSED_DET and top_k <= MOE_GATHER_MAX_TOPK and (fused_total or groups):
                     A = flat_expert_local.shape[0]
                     inv_order = torch.empty_like(order).scatter_(
                         0, order, torch.arange(A, device = order.device))
