@@ -346,7 +346,8 @@ def get_base_model(args):
     print(f"    Architecture: {config.architecture}")
     model = Model.from_config(config)
     use_reference_state = not model.caps.get("uncalibrated_quantize", False)
-    assert model.caps.get("can_quantize", True), "Cannot quantize this model type."
+    if not model.caps.get("can_quantize", True):
+        raise NotImplementedError(f"Cannot quantize this model type: {config.architecture}")
     print(f" -- Created model instance:")
     print(model.get_layout_tree(4))
     mtp_model = model.from_config(config, component = "mtp") if "mtp" in config.model_classes else None
