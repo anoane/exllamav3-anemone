@@ -36,6 +36,7 @@ class RecurrentCache(OrderedDict):
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
             "stash_evictions_live_kv": 0,   # of those, checkpoints whose anchor KV page was still cached
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
+            "stash_too_large": 0,           # checkpoints not stored because they exceed the whole cache
         }
 
 
@@ -55,11 +56,20 @@ class RecurrentCache(OrderedDict):
         """
         if key in self:
             self.move_to_end(key)
+        elif state.checkpoint_size > self.max_size:
+            # A checkpoint larger than the whole cache (any checkpoint, if the size is 0) can never be stored, and
+            # evicting everything else would not make room for it. Skip it before copying it off the device: a
+            # checkpoint only saves work, and without it a returning conversation replays its prefill instead
+            if self.max_size > 0 and not self.metrics["stash_too_large"]:
+                print(f" !! Warning: recurrent checkpoint ({state.checkpoint_size / 1024**2:.1f} MiB) is larger than "
+                      f"the recurrent cache ({self.max_size / 1024**2:.1f} MiB) and will not be stored; increase "
+                      f"recurrent_cache_size to enable prompt reuse")
+            self.metrics["stash_too_large"] += 1
         else:
             stashed_state = state.stash()
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
-                assert self.current_size >= 0, "Not enough space in cache for single state"
+                assert self.current_size > 0, "Not enough space in cache for single state"
                 pt = self.pagetable
 
                 # A checkpoint whose anchor page chain has been broken by KV eviction can never be restored by

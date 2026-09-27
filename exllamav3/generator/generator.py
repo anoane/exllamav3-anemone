@@ -126,6 +126,7 @@ class Generator:
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
+            Checkpoints larger than the whole cache are not stored, so 0 disables recurrent checkpoints.
             Ignored if model doesn't use recurrent states
 
         :param recurrent_checkpoint_interval:
