@@ -173,6 +173,9 @@ class BlockSparseMLP_CPU:
             if self.per_expert_scale is not None:
                 self.per_expert_scale = self.per_expert_scale[
                     perm_t.to(self.per_expert_scale.device)].contiguous()
+            if self.e_score_bias_vl is not None:
+                self.e_score_bias_vl = self.e_score_bias_vl[
+                    perm_t.to(self.e_score_bias_vl.device)].contiguous()
         # Dynamic placement state: router->physical-slot map (identity start), decayed
         # selection counts, and the shared module registry the sweep walks. The first
         # registered module owns the step counter
