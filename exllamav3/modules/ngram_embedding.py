@@ -466,12 +466,14 @@ class NGramEmbedding(Module):
 
     def _retire(self, entry: dict):
         # Drop a queued prefetch that no forward will take. Its worker may still be writing the
-        # staging set, so wait it out (a cold gather, at most) unless it hasn't started
-        self._forget(entry)
-        self.prefetch_stats["retired"] += 1
+        # staging set, so wait it out (a cold gather, at most) unless it hasn't started. No caller
+        # wants its rows, so a failed staging is not raised here: a forward that does want them
+        # stages inline and meets the error itself
         f = entry["future"]
         if not f.cancel():
-            f.result()
+            f.exception()
+        self._forget(entry)
+        self.prefetch_stats["retired"] += 1
         entry["pin"].held = False
 
     def _acquire_pin(self, n: int, row_words: int, row_dtype: torch.dtype) -> _PinSet:
@@ -552,19 +554,24 @@ class NGramEmbedding(Module):
         history = history.to("cpu", torch.int64).contiguous().clone()
         if self._match(history) is not None:
             return
+        for h in self.handles or []:
+            h._ensure_open()        # lazy open isn't thread-safe; do it here, not on the worker
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "ngram_prefetch")
         trellis = self.mode.startswith("trellis")
         pin = self._acquire_pin(
             bsz * out_len * self.num_heads,
             words_per_row(self.K) if trellis else ROW_DIM,
             torch.int16 if trellis else self._row_dtype)
-        for h in self.handles or []:
-            h._ensure_open()        # lazy open isn't thread-safe; do it here, not on the worker
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "ngram_prefetch")
+        try:
+            future = self._executor.submit(self._stage, history, pin)
+        except BaseException:
+            pin.held = False
+            raise
         self._pending.append({
             "history": history,
             "pin": pin,
-            "future": self._executor.submit(self._stage, history, pin),
+            "future": future,
         })
 
     @override
@@ -590,27 +597,34 @@ class NGramEmbedding(Module):
 
         entry = self._match(ids)
         if entry is not None:
-            self._forget(entry)
             self.prefetch_stats["hit"] += 1
             pin = entry["pin"]
-            U = entry["future"].result()
         else:
             self.prefetch_stats["miss"] += 1
             pin = self._acquire_pin(n, row_words, row_dtype)
-            U = self._stage(ids, pin)
 
-        packed_d = pin.packed[:U].to(dev, non_blocking = True)
-        inv_d = pin.inverse[:n].to(dev, non_blocking = True)
-        if trellis:
-            heads_d = pin.heads[:U].to(dev, non_blocking = True)
-            rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = dev)
-            ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
-        else:
-            rows = packed_d.float()
-        if rows.is_cuda:
-            pin.event = torch.cuda.Event()
-            pin.event.record(torch.cuda.current_stream(rows.device))
-        pin.held = False
+        try:
+            U = entry["future"].result() if entry is not None else self._stage(ids, pin)
+            packed_d = pin.packed[:U].to(dev, non_blocking = True)
+            inv_d = pin.inverse[:n].to(dev, non_blocking = True)
+            if trellis:
+                heads_d = pin.heads[:U].to(dev, non_blocking = True)
+                rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = dev)
+                ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
+            else:
+                rows = packed_d.float()
+            if rows.is_cuda:
+                pin.event = torch.cuda.Event()
+                pin.event.record(torch.cuda.current_stream(rows.device))
+        finally:
+            # Release the set on failure too: a set left held is never reused, and once every set
+            # is, _acquire_pin has no prefetch to retire. A prefetch whose worker is still running
+            # (an interrupted wait) stays queued and keeps the set until a forward takes it or
+            # _retire waits it out
+            if entry is None or entry["future"].done():
+                if entry is not None:
+                    self._forget(entry)
+                pin.held = False
         out = rows.index_select(0, inv_d).view(bsz, out_len, H * ROW_DIM)
         dt = out_dtype or self.out_dtype or torch.half
         return out.to(dt)
