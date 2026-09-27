@@ -117,7 +117,10 @@ class SS_Sample(SS_Base):
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits)
-                ext.gumbel_noise_f16(state.in_logits, state.logits, state.rand_u32)
+                if state.in_logits.dtype == torch.float:
+                    ext.gumbel_noise_f32(state.in_logits, state.logits, state.rand_u32)
+                else:
+                    ext.gumbel_noise_f16(state.in_logits, state.logits, state.rand_u32)
                 state.sample = torch.argmax(state.logits, dim = -1)
             case SS.LOGITS:
                 ext.gumbel_noise_f32(state.logits, state.logits, state.rand_u32)
@@ -354,7 +357,7 @@ class SS_Temperature(SS_Base):
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
-                state.logits = state.in_logits.float()
+                state.logits = state.in_logits.to(torch.float, copy = True)
                 state.logits /= self.temperature
                 state.state = SS.LOGITS
             case SS.LOGITS:

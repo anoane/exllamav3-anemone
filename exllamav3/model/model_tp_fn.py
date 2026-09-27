@@ -329,7 +329,9 @@ def mp_model_forward_lm_head_argmax(
             v = torch.full(x.shape[:-1], -float("inf"), dtype = x.dtype, device = x.device)
             i = torch.zeros(x.shape[:-1], dtype = torch.long, device = x.device)
     else:
-        v = torch.empty(*x.shape[:-1], dtype = x.dtype, device = x.device)
+        # No slice here, but the gathered maxima must share the dtype of the ranks' logits
+        dtype = local_context["logits_module"].out_dtype or x.dtype
+        v = torch.empty(*x.shape[:-1], dtype = dtype, device = x.device)
         i = torch.empty(*x.shape[:-1], dtype = torch.long, device = x.device)
 
     if gather_devices is None:

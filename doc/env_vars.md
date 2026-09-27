@@ -708,6 +708,20 @@ weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing 
 a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
 component.
 
+### `EXL3_FP32_LOGITS` (default: `0`)
+
+Default for `Config.infer_params.fp32_logits`: the output layer keeps its result in FP32
+instead of rounding it to FP16 (FP16 rounds a logit between 16 and 32 to a multiple of 2^-6).
+EXL3 heads run the same kernels with an FP32 output; an unquantized FP16 head uses the
+FP32-output cuBLAS GEMM instead of the FP16 one. Meant for log-probability measurements
+(perplexity, KL divergence) that should rule out that rounding; the samplers take FP32 logits
+as they are. The logits tensor doubles in size (e.g. 1 GiB instead of 512 MiB for 2048 rows of
+a 131,072-token vocabulary), and the autosplit and tensor-parallel planners account for it.
+Applies to every model loaded through `Model.load` with this config; drafters that borrow the
+target's head (MTP, DFlash) get FP32 logits from it too, while a drafter's own head outside the
+module list (DeepSeek-V4 MTP) keeps FP16. Set before loading the model; `Model.load` applies
+it, and clearing it before the next load restores FP16.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

@@ -443,6 +443,20 @@ class Model(Model_TPMixin, Model_LSMixin):
                 cache.initialized = False
 
 
+    def _apply_logits_dtype(self):
+        """
+        Apply config.infer_params.fp32_logits to the logits output layer. Runs before any module
+        loads, so the output tensors, the autosplit estimate and the TP export all follow it. The
+        layer's own output dtype is kept, and clearing the flag before the next load restores it
+        """
+        fp32 = self.config.infer_params.fp32_logits
+        for module in self.modules:
+            if module.caps.get("logits_output") and hasattr(module, "out_dtype"):
+                if not hasattr(module, "default_logits_dtype"):
+                    module.default_logits_dtype = module.out_dtype
+                module.out_dtype = torch.float if fp32 else module.default_logits_dtype
+
+
     def load_gen(
         self,
         device: torch.device | str | int | None = None,
@@ -558,6 +572,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
         # shares the config but loads after the main model's worker has already started)
         self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+
+        self._apply_logits_dtype()
 
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."

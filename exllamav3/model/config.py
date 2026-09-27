@@ -57,6 +57,9 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Produce FP32 logits from the output layer instead of rounding them to FP16 (the layer's
+        # default), at twice the size of the output tensor. Set before loading the model
+        self.fp32_logits = os.environ.get("EXL3_FP32_LOGITS", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
