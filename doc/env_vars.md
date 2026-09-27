@@ -282,8 +282,8 @@ biases (all or none; ineligible layers fall back to the GPU as usual). A spawned
 per model component (main / draft / MTP) owns its own expert weights and a job ring in pinned
 shared memory; the parent's forward pass never blocks on the CPU. During prefill, hot experts
 additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
-dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
-thread configuration, and the knobs below for tuning the split.
+dequant, by size) while the CPU works the remaining tail. See `-mct`/`--moe_cpu_threads` below
+for thread configuration, and the knobs below for tuning the split.
 
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
@@ -293,14 +293,17 @@ from the environment at import); for a same-process sweep, mutate fields on the 
 
 Fallback value for when `-mcl` is not set.
 
-### `-mclt` / `--moe_cpu_threads`, `-dmclt` / `--draft_moe_cpu_threads` (CLI, not env)
+### `-mct` / `--moe_cpu_threads` (CLI, not env)
 
-Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
-`draft_moe_cpu_threads`. Takes precedence over `EXL3_MOE_CPU_THREADS` below when set.
+Worker thread count for every offloaded component: written to
+`config.infer_params.moe_cpu_threads` for the main model and a draft model, and to
+`draft_moe_cpu_threads` for an MTP head (set those fields directly for per-component counts).
+Takes precedence over `EXL3_MOE_CPU_THREADS` below when set to a nonzero value.
 
 ### `EXL3_MOE_CPU_THREADS` (default: `cpu_count // 2`)
 
-Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
+Fallback worker thread count when the component's `moe_cpu_threads` / `draft_moe_cpu_threads`
+config value is not set.
 
 ### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
 
