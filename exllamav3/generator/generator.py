@@ -83,7 +83,8 @@ class Generator:
 
         :param num_draft_tokens:
             Number of future tokens to draft. Default is 4 unless the draft model has a preference (e.g.
-            from DFlash block size)
+            from DFlash block size). On recurrent models whose state has no in-place rollback (linear attention,
+            Mamba2, short conv), the cache must be created with max_history of at least this many tokens
 
         :param ngram_match_min:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
@@ -178,6 +179,14 @@ class Generator:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
             self.num_draft_tokens = 0
+
+        # Recurrent states without in-place rollback rewind rejected draft tokens from the past states reserved
+        # by the cache, which needs one per draft position
+        if self.num_draft_tokens and model.caps.get("recurrent_states") and \
+                not getattr(cache.recurrent_state_cls, "guaranteed_rollback", 0):
+            assert cache.max_history >= self.num_draft_tokens, \
+                f"Speculative decoding with {self.num_draft_tokens} draft tokens on a recurrent model requires " \
+                f"Cache(max_history >= {self.num_draft_tokens}), got max_history = {cache.max_history}"
 
         self.ngram_corpus = None
         if ngram_corpus is not None:

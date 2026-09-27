@@ -28,7 +28,8 @@ python eval/spec_decode.py -m /path/to/model -single 'Agentic*' \
 ```
 
 Or pass `ngram_corpus="coding.sam.zst"` to `Generator`, together with
-`ngram_match_min=2` and `num_draft_tokens=15`. Install `zstandard` in the runtime
+`ngram_match_min=2` and `num_draft_tokens=15`. On recurrent models, also create
+the `Cache` with `max_history=15`. Install `zstandard` in the runtime
 environment. The generator decompresses and validates the bank once, checks
 tokenizer file identities, and shares its immutable storage between independent
 job cursors. Each job still builds its live history SAM. Drafting uses the longest
