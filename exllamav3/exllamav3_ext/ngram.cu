@@ -12,6 +12,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <string>
+#include <cerrno>
+#include <cstring>
 #include "util.h"
 #include "util.cuh"
 
@@ -150,7 +153,29 @@ struct GatherCtx
     const int64_t* up;
     uint8_t* op;
     std::atomic<bool> failed { false };
+    std::mutex err_mtx;
+    std::string err;
+
+    // First failure wins: its message is what the caller raises once every span has finished
+    void fail(std::string msg)
+    {
+        std::lock_guard<std::mutex> lock(err_mtx);
+        if (err.empty()) err = std::move(msg);
+        failed.store(true, std::memory_order_release);
+    }
 };
+
+// Message for a failed run read, distinguishing a real I/O error from a range that runs past the
+// end of the file (same wording as stloader's read_error)
+std::string read_error(int64_t file_offset, int64_t bytesize, int errnum)
+{
+    if (!errnum)
+        return "ngram_gather_cpu: unexpected end of file reading " + std::to_string(bytesize) +
+               " bytes at offset " + std::to_string(file_offset) +
+               " (file is truncated, or row index is out of range)";
+    return std::string("ngram_gather_cpu: error reading file: ") + std::strerror(errnum) +
+           " (errno=" + std::to_string(errnum) + ")";
+}
 
 struct GatherPool
 {
@@ -177,9 +202,16 @@ struct GatherPool
             int64_t pos = 0;
             while (pos < nbytes)
             {
+                // Short and interrupted reads (EINTR, e.g. a signal on a FUSE mount) are retried,
+                // so only a hard error or a genuine end of file fails the gather
                 ssize_t got = pread(c->fd, c->op + i * c->row_bytes + pos,
                                     (size_t) (nbytes - pos), (off_t) (off + pos));
-                if (got <= 0) { c->failed.store(true); return; }
+                if (got < 0 && errno == EINTR) continue;
+                if (got <= 0)
+                {
+                    c->fail(read_error(off, nbytes, got < 0 ? errno : 0));
+                    return;
+                }
                 pos += got;
             }
             i = j;
@@ -284,7 +316,7 @@ void ngram_gather_cpu
     {
         // single contiguous read: no pool round trip
         GatherPool::read_span(&ctx, 0, U);
-        TORCH_CHECK(!ctx.failed.load(), "ngram_gather_cpu: short read");
+        TORCH_CHECK(!ctx.failed.load(), ctx.err);
         return;
     }
 
@@ -300,7 +332,7 @@ void ngram_gather_cpu
         tasks.emplace_back(runs[r].first, runs[r1 - 1].first + runs[r1 - 1].second);
     }
     gather_pool()->run(&ctx, tasks);
-    TORCH_CHECK(!ctx.failed.load(), "ngram_gather_cpu: short read");
+    TORCH_CHECK(!ctx.failed.load(), ctx.err);
 }
 
 #endif  // ^ Linux (pread); the Windows version (overlapped ReadFile) is in ngram_gather_win.cpp
