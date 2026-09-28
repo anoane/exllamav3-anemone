@@ -113,8 +113,15 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
+    # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe
     if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+    elif windows and os.environ.get("CUDAHOSTCXX"):
+        print(
+            " !! CUDAHOSTCXX is not used by the JIT build on Windows; "
+            "nvcc uses the same cl.exe as the C++ sources (see doc/env_vars.md)",
+            file = sys.stderr
+        )
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
