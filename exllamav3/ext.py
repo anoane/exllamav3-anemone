@@ -145,12 +145,23 @@ else:
     # Load extension
 
     maybe_set_arch_list_env()
-    exllamav3_ext = load(
-        name = extension_name,
-        sources = sources,
-        extra_include_paths = [sources_dir],
-        verbose = verbose,
-        extra_ldflags = extra_ldflags,
-        extra_cuda_cflags = extra_cuda_cflags,
-        extra_cflags = extra_cflags
-    )
+    try:
+        exllamav3_ext = load(
+            name = extension_name,
+            sources = sources,
+            extra_include_paths = [sources_dir],
+            verbose = verbose,
+            extra_ldflags = extra_ldflags,
+            extra_cuda_cflags = extra_cuda_cflags,
+            extra_cflags = extra_cflags
+        )
+    except IndexError as e:
+        # With no list given (or "native"), torch derives the architectures from the visible GPUs and
+        # fails with an IndexError when there are none
+        if torch.version.cuda and os.environ.get("TORCH_CUDA_ARCH_LIST", "") in ("", "native") and \
+                not torch.cuda.device_count():
+            raise RuntimeError(
+                f"No CUDA device is visible to determine the architectures to build {extension_name} for. "
+                "Set TORCH_CUDA_ARCH_LIST to the target architectures, e.g. TORCH_CUDA_ARCH_LIST=\"8.6;8.9+PTX\""
+            ) from e
+        raise

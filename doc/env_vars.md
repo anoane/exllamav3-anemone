@@ -830,7 +830,8 @@ installed CUDA toolkit.
 ### `TORCH_CUDA_ARCH_LIST` (default: auto)
 
 Standard PyTorch variable; overrides the compute architectures the extension is built for. When
-unset, ExLlamaV3 derives the list from the GPUs present in the system.
+unset, ExLlamaV3 derives the list from the GPUs present in the system, so building the extension
+(JIT or setup.py) on a machine with no visible GPU requires it.
 
 ## `EXL3_DSA_DEBUG_BOUNDS`
 
