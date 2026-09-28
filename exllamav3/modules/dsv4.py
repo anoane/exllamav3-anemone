@@ -25,7 +25,32 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
 # Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
 # runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
 dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
+# Opt-in cap on the lightning indexer's score matrix, in MiB: a prefill selection whose matrix
+# exceeds it scores and selects in row slabs. 0 (default) keeps every selection a single pass
+dsv4_indexer_score_mb = max(0, int(os.environ.get("EXL3_DSV4_INDEXER_SCORE_MB", "0") or "0"))
 from ..constants import PAGE_SIZE
+
+# Fewest query rows per indexer slab: whole 64-row scoring tiles, and well past dsa_topk's split
+# selection (<= 16 rows) and the few-query scoring kernel (<= 4 rows). A selection of at most this
+# many rows never slabs, which the autosplit reservation relies on
+_IDX_SLAB_MIN_ROWS = 512
+
+
+def _idx_score_stride(n_cols: int) -> int:
+    """Row stride of dsa_indexer_scores' own score matrix over n_cols entries: n_cols rounded up
+    to its 128-entry tile, then to a power of two. A slab backing must use the same stride"""
+    return max(128, 1 << (max(n_cols, 1) - 1).bit_length())
+
+
+def _idx_score_slab_rows(n_cols: int) -> int:
+    """Query rows per slab under EXL3_DSV4_INDEXER_SCORE_MB (0 when off): a multiple of the
+    scoring kernel's 64-row tile, so slabbing adds no padded tiles, and at least 512 rows, which
+    keeps the per-slab pool re-read and launch tails small and exceeds the cap only for caps
+    below 512 rows (256 MiB at 1M context)"""
+    if not dsv4_indexer_score_mb:
+        return 0
+    rows = (dsv4_indexer_score_mb << 20) // (2 * _idx_score_stride(n_cols))
+    return max(_IDX_SLAB_MIN_ROWS, rows // 64 * 64)
 
 # Reference: transformers models/deepseek_v4 (paper §2)
 
@@ -1182,6 +1207,11 @@ class DSV4Attention(Module):
             q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, self.index_n_heads, self.index_head_dim).contiguous()
         _ext_rope(q_idx[..., -self.rope_head_dim:], self.inv_freq_compress, position = pos0)
         wts = self.idx_weights.forward(x, params)
+        if dsv4_indexer_score_mb and seq > _IDX_SLAB_MIN_ROWS:
+            rows = _idx_score_slab_rows(ec if block_table is not None else idx_pool.shape[0])
+            if seq > rows:
+                return self._indexer_topk_slabs(q_idx[0], wts[0], idx_pool, ec, pos0, rows,
+                                                block_table, epp)
         scores = dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec,
                                     block_table = block_table, epp = epp)
         k = min(self.index_topk, ec)
@@ -1189,6 +1219,77 @@ class DSV4Attention(Module):
         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
         ext.dsa_topk(scores, indices, k, None, 0)
         return indices, k
+
+
+    def _indexer_topk_slabs(self, q_idx, wts, idx_pool, ec, pos0, rows, block_table, epp):
+        """_indexer_topk's scoring + top-k over slabs of at most `rows` query rows (the
+        EXL3_DSV4_INDEXER_SCORE_MB cap), sharing one score backing at the launcher's own stride.
+        Rows are independent and keep their causal bounds. Full slabs are whole tiles; a final
+        slab of 16 rows or fewer takes a tile from the one before it, so every slab runs the
+        kernels the whole selection runs (never the few-query scoring kernel, <= 4 rows, which
+        reduces over heads in another order, nor dsa_topk's split selection, <= 16 rows) and
+        the selected indices are identical to the single pass"""
+        seq = q_idx.shape[0]
+        k = min(self.index_topk, ec)
+        K_pad = -(-k // 32) * 32
+        indices = torch.empty((seq, K_pad), dtype = torch.int32, device = q_idx.device)
+        s_stride = _idx_score_stride(ec if block_table is not None else idx_pool.shape[0])
+        backing = torch.empty((rows, s_stride), dtype = torch.half, device = q_idx.device)
+        cuts = list(range(0, seq, rows)) + [seq]
+        if cuts[-1] - cuts[-2] <= 16:
+            cuts[-2] -= 64
+        for r0, r1 in zip(cuts[:-1], cuts[1:]):
+            scores = dsa_indexer_scores(q_idx[r0 : r1], wts[r0 : r1], idx_pool, pos0 + r0,
+                                        self.compress_rate, ec, scores = backing[:r1 - r0],
+                                        block_table = block_table, epp = epp)
+            ext.dsa_topk(scores, indices[r0 : r1], k, None, 0)
+        return indices, k
+
+
+    def autosplit_extra_measure(self, params):
+        """Indexer selection at maximum context, which the (1, chunk)-at-context-0 measuring
+        forward does not reach (it enters the top-k regime only for a chunk over compress_rate x
+        index_topk rows, and then over at most chunk / compress_rate entries): allocates (and
+        drops) the largest score matrix any chunk up to this one can reach at the cache's
+        capacity (chunk x capacity rounded up to a power of two, fp16: 1 GiB for a 2048-token
+        chunk at 1M context; with EXL3_DSV4_INDEXER_SCORE_MB, the largest slab), next to the
+        query, query residual, kv, indexer query, head weight and index tensors live around it,
+        so the device budget keeps room for it. The layer's input and output activations are
+        already live in the measuring window; smaller temporaries are left to the autosplit
+        margin"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        cache = params.get("cache")
+        if self.indexer is None or self.num_q_heads == 0 or self.device is None or cache is None:
+            return
+        kl = cache if isinstance(cache, CacheLayer_dsa) else \
+            cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+        ec = kl.capacity
+        if ec <= self.index_topk:
+            return   # cache too small to ever reach the top-k regime
+        seq = params["batch_shape"][1]
+        # Any chunk up to seq rows at any pool width in the top-k regime: the launcher's stride
+        # doubles with the width, and under the cap the slab rows shrink as it does, so the
+        # largest matrix is not necessarily the widest one
+        shape = (0, 0)
+        s = _idx_score_stride(self.index_topk + 1)
+        while s <= _idx_score_stride(ec):
+            rows = _idx_score_slab_rows(s)
+            r = min(seq, rows) if rows else seq
+            if r * s >= shape[0] * shape[1]:
+                shape = (r, s)
+            s *= 2
+        k_pad = -(-self.index_topk // 32) * 32
+        live = [
+            torch.empty((seq, self.num_q_heads * self.head_dim), dtype = torch.half, device = self.device),
+            torch.empty((seq, self.q_a.out_features_unpadded), dtype = torch.half, device = self.device),
+            torch.empty((seq, self.head_dim), dtype = torch.half, device = self.device),
+            torch.empty((seq, self.index_n_heads * self.index_head_dim), dtype = torch.half, device = self.device),
+            torch.empty((seq, self.index_n_heads), dtype = torch.half, device = self.device),
+            torch.empty((seq, k_pad), dtype = torch.int32, device = self.device),
+            torch.empty(shape, dtype = torch.half, device = self.device),
+        ]
+        del live
 
 
     def _forward_cached(self, x, params, out_dtype):

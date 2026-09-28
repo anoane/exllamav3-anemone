@@ -129,6 +129,21 @@ way in the top-k regime: six to eight GEMV launches collapse into two. A/B switc
 eager path only; the graphed path (`EXL3_BC_DSA`) builds its own fan and is not affected.
 Layers whose projections mix quantization formats or bitrates decline the fan by themselves.
 
+### `EXL3_DSV4_INDEXER_SCORE_MB` (default: `0` = off)
+
+Cap, in MiB, on the DeepSeek-V4 lightning indexer's score matrix. In the long-context (top-k)
+regime the indexer scores every query row of a chunk against the whole visible key pool, in one
+fp16 matrix of chunk rows by the pool width rounded up to a power of two: 128 MiB for a
+2048-token chunk at 128K context, 512 MiB just past 256K, 1 GiB at 1M (4 GiB for an 8192-token
+chunk at 1M). The autosplit loader reserves the largest matrix the cache's capacity and the
+chunk size can reach, on each device holding indexer layers (`EXL3_AUTOSPLIT_WORSTCASE`). With a
+cap set, a prefill selection whose matrix exceeds it runs as row slabs of whole 64-row tiles
+within the cap, selecting the same entries, and the loader reserves only the largest slab. Slabs
+are at least 512 rows, so a cap below 512 rows' worth of matrix (256 MiB at 1M context, 32 MiB
+at 128K) behaves as 512-row slabs, and the loader reserves that. This frees VRAM for layers or
+cache at some cost in prefill speed wherever the matrix exceeds the cap, since each slab re-reads
+the key pool. `0` keeps every selection a single pass.
+
 ### `EXL3_QC_STAGING` (default: `1`)
 
 How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only
@@ -671,7 +686,8 @@ unusable). Also settable per load via `config.infer_params.ngram_stream_from_dis
 
 The layer-split autosplit loader measures each module's transient VRAM with one forward of a
 dummy state and keeps that much headroom per device. Some transients don't show in that
-forward: attention/MLA decode statics (QSA/DSA families) and, for block-sparse MoE layers,
+forward: attention/MLA decode statics (QSA/DSA families), the DeepSeek-V4 indexer's score
+matrix at long context (`EXL3_DSV4_INDEXER_SCORE_MB`) and, for block-sparse MoE layers,
 everything that depends on how the real workload routes tokens: the deterministic slot scratch
 (all assignments slotted, `EXL3_MOE_FUSED_DET`), the batched-reconstruct group temporaries,
 and the CPU-offload host's GPU side (per-device weight ring, fused-tier buffers, batched tier
