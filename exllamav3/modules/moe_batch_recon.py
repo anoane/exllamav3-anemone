@@ -48,7 +48,8 @@ PAD_MAX = float(os.environ.get("EXL3_MOE_RECON_PAD", 1.1))
 # Accumulation when the tier is not writing into the layer's slot scratch (the streamed CPU
 # tier, and the GPU path with EXL3_MOE_FUSED_DET=0): one index_add_ per expert (bit-
 # reproducible, up to B launches per group) or a single atomic index_add_ over the padded slab.
-# Follows EXL3_MOE_FUSED_DET unless EXL3_MOE_RECON_DET is set explicitly
+# Unset, follows EXL3_MOE_FUSED_DET only when that is set explicitly: with neither set the
+# streamed tier accumulates atomically (EXL3_MOE_RECON_DET=1 for reproducible groups)
 DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", os.environ.get("EXL3_MOE_FUSED_DET", "0")) != "0"
 
 # act(g, u) -> a kernels; gateless relu2 rides relu_mul(u, u, a) = relu2(u)

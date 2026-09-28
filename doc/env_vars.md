@@ -477,11 +477,11 @@ the narrow tile (32 columns per block, k split 16 ways), `1` the wide one (128 c
 4 x 4 warps). Unset picks per stage: wide on Ampere/Ada at every shape, on Blackwell only for
 k >= 4096 or k >= 2048 with 32 or more (token, expert) slots. Testing knob only.
 
-### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
+### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: `EXL3_MOE_FUSED_DET` if set, else `0`)
 
-Bit-reproducible MoE prefill. By default the fused MoE kernel adds each expert's weighted
-output into the token row with float atomics, in whatever order the expert groups finish, and
-the batched reconstruct tier accumulates its padded slab with one atomic `index_add_`;
+Bit-reproducible MoE prefill. With `EXL3_MOE_FUSED_DET=0` the fused MoE kernel adds each expert's
+weighted output into the token row with float atomics, in whatever order the expert groups
+finish, and the batched reconstruct tier accumulates its padded slab with one atomic `index_add_`;
 together these are the only sources of run-to-run nondeterminism on the GPU prefill path
 (Qwen3.8-Flash-Next KL ~2e-2 between identical 4k-token runs, lfm2.5 ~1e-3, Qwen3-30B-A3B
 ~3e-4). With `EXL3_MOE_FUSED_DET=1` every assignment of the fused and batched tiers gets a
@@ -491,10 +491,13 @@ tier's down-projection GEMMs write straight into their slots, and one `exl3_moe_
 layer sums each token's slots in k order with the routing weights. Identical runs are then
 bit-identical (verified on all three models), and since the GEMM outputs are written once
 and read once either way it costs nothing measurable: Qwen3.8 6198/6219 vs 6164/6178 tok/s,
-lfm2.5 25.9k vs 26.2k, Qwen3-30B-A3B 7304 vs ~7100 (atomic). The remaining atomic user is
-the streamed CPU-offload tier's fused-kernel call. `EXL3_MOE_RECON_DET` only matters where
-the batched tier cannot write into the slot scratch (the streamed tier, or the switch off):
-`1` accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA
+lfm2.5 25.9k vs 26.2k, Qwen3-30B-A3B 7304 vs ~7100 (atomic). The streamed CPU-offload tier
+stays atomic by default: its fused-kernel call always, its batched reconstruct groups unless
+`EXL3_MOE_RECON_DET=1`. `EXL3_MOE_RECON_DET` only matters where the batched tier cannot write
+into the slot scratch (the streamed tier, or the switch off): `1` accumulates one expert at a
+time (up to `EXL3_MOE_RECON_BATCH` `index_add_` launches per group), `0` with one atomic
+`index_add_`. Unset, it takes the value of `EXL3_MOE_FUSED_DET` only when that is set
+explicitly, so with neither set the streamed tier's groups use the atomic mode. The GDN/KDA
 recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice partial dot
 products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
 models is reproducible as well.
