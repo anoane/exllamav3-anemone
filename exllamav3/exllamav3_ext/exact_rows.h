@@ -23,6 +23,7 @@
 // (quant/exl3_gemm.cuh, exl3_gemm_one_row_route_ok and one_row_route). The launch per row everywhere
 // else, and for every call with the int8 path on
 #define EXACT_ROWS_CAP_ONE_LAUNCH 32
+#define EXACT_ROWS_CAP_HGEMM 64     // hgemm_rows
 
 // exl3_gemm_gr and exl3_mgemm_gr with one_row_route: nothing was launched, the caller makes the
 // one-row launches itself. Never a launch tag (those are 0 and up)

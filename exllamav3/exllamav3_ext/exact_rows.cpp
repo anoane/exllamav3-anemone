@@ -7,7 +7,7 @@ static std::atomic<uint64_t> one_launches{0};
 int exact_rows_caps()
 {
     return EXACT_ROWS_CAP_LINEAR | EXACT_ROWS_CAP_MGEMM | EXACT_ROWS_CAP_ROUTER | EXACT_ROWS_CAP_MOE |
-           EXACT_ROWS_CAP_HC | EXACT_ROWS_CAP_ONE_LAUNCH;
+           EXACT_ROWS_CAP_HC | EXACT_ROWS_CAP_ONE_LAUNCH | EXACT_ROWS_CAP_HGEMM;
 }
 
 uint64_t exact_rows_one_launches()

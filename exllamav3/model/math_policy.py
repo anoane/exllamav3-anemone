@@ -160,6 +160,7 @@ EXACT_ROWS_CAP_HC = 16          # hc_collapse_rows, hc_partials_rows
 # on the GPU types that launch was verified on, and count those calls (exact_rows_one_launches).
 # With the int8 path on they launch per row. Tests and tools/dsv41_rowprobe.py read both
 EXACT_ROWS_CAP_ONE_LAUNCH = 32
+EXACT_ROWS_CAP_HGEMM = 64       # hgemm_rows
 
 STABLE_ARITHMETIC = stable_arithmetic_enabled()
 HGEMM_FIXED_ROWS = hgemm_fixed_rows()

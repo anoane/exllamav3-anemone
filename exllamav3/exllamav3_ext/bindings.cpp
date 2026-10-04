@@ -204,6 +204,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_mgemm_rows", &exl3_mgemm_rows, "exl3_mgemm_rows");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
+    m.def("hgemm_rows", &hgemm_rows, "hgemm_rows");
     m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");

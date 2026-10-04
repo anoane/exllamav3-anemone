@@ -8,7 +8,9 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "stable_arithmetic.h"
+#include "exact_rows.h"
 #include <limits>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -198,6 +200,42 @@ void hgemm
 )
 {
     hgemm_gr(a, b, c, nullptr);
+}
+
+// EXL3_EXACT_ROWS (exact_rows.h, EXACT_ROWS_CAP_HGEMM): the rows of a, one hgemm each. Row r is the
+// call a one-row forward makes: a (1, K) row of a (the row's own storage, as the Python row loop
+// passes it), b as it is, a freshly allocated (1, N) output, the same handle modes and workspace
+// (hgemm_gemmex_impl), in stream order. Nothing is shared between the rows but b
+at::Tensor hgemm_rows
+(
+    const at::Tensor& a,                 // (rows, K) half, contiguous
+    const at::Tensor& b,                 // (K, N) half, contiguous
+    bool output_fp32
+)
+{
+    TORCH_CHECK_DIM(a, 2);
+    TORCH_CHECK_DIM(b, 2);
+    TORCH_CHECK_DTYPE(a, kHalf);
+    TORCH_CHECK_DTYPE(b, kHalf);
+    TORCH_CHECK(a.is_cuda() && a.device() == b.device(), "hgemm_rows: a and b must be on one CUDA device");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "hgemm_rows: contiguous a and b required");
+    const int64_t rows = a.size(0);
+    TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
+                "hgemm_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+    TORCH_CHECK(a.size(1) >= 1 && b.size(1) >= 1 && a.size(1) == b.size(0),
+                "hgemm_rows: a must be (rows, K) and b (K, N)");
+    const int64_t size_n = b.size(1);
+    const auto options = a.options().dtype(output_fp32 ? at::kFloat : at::kHalf);
+
+    std::vector<at::Tensor> parts;
+    parts.reserve((size_t) rows);
+    for (int64_t r = 0; r < rows; ++r)
+    {
+        at::Tensor c = at::empty({(int64_t) 1, size_n}, options);
+        hgemm_gr(a.narrow(0, r, 1), b, c, nullptr);
+        parts.push_back(std::move(c));
+    }
+    return at::cat(parts, 0);
 }
 
 /*
