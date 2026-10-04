@@ -3,6 +3,18 @@
 #include <ATen/Tensor.h>
 #include "../graph.cuh"
 
+// Whether exl3_gemm_gr offers a call to the int8-activation GEMV (exl3_gemv_int8.cuh) before any
+// other kernel: the mul1 codebook with EXL3_INT8_GEMV not 0. The variable is read on every call
+bool exl3_gemm_asks_int8(bool mul1);
+
+// one_row_route (EXL3_EXACT_ROWS, exact_rows.h): a call of 2 to EXACT_ROWS_MAX rows is routed as
+// a call of one row is, and launched only where that route is the cooperative kernel with a
+// launch-autotune record already in the process: one launch for all rows under that record (kernel
+// shape, block count, concurrency), which gives every row the bits of a one-row call. The record
+// is looked up, never tuned, loaded or stored by this call. Every other route (the int8 GEMV, the
+// FP16 GEMV, no record yet, a width that is not a multiple of 128) launches nothing and returns
+// EXACT_ROWS_NO_LAUNCH; C and A_had are then untouched. Needs suh, A_had (m * k elements) and svh,
+// no graph and no forced shape or block count
 int exl3_gemm_gr
 (
     const at::Tensor& A,
@@ -15,7 +27,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    bool one_row_route = false
 );
 
 int exl3_gemm
@@ -57,7 +70,11 @@ int exl3_mgemm_gr
     // source matrix index (suh and A_had are then per source), and the number of sources
     const c10::optional<at::Tensor>& n_stride_list = {},
     const c10::optional<at::Tensor>& had_src_list = {},
-    int num_had_src = 0
+    int num_had_src = 0,
+    // As exl3_gemm_gr's: A (G, m, k) and C (G, m, n) with 2 to EXACT_ROWS_MAX rows m are launched
+    // once under the record of the m == 1 call, or not at all (EXACT_ROWS_NO_LAUNCH). Plain grouped
+    // calls only: no weights, range filtering, per-matrix widths, sliced mode, graph or forced launch
+    bool one_row_route = false
 );
 
 int exl3_mgemm

@@ -112,6 +112,11 @@ uint64_t mgemm_autotune_hash
     return h;
 }
 
+bool exl3_gemm_asks_int8(bool mul1)
+{
+    return mul1 && exl3_gemv_int8_enabled();
+}
+
 int exl3_gemm_gr
 (
     const at::Tensor& A,
@@ -124,7 +129,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    bool one_row_route
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -186,12 +192,46 @@ int exl3_gemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // one_row_route (exl3_gemm.cuh): every routing decision below is taken for one row. The kernel
+    // arguments keep the real row count
+    const int route_m = one_row_route ? 1 : size_m;
+    if (one_row_route)
+    {
+        // The rows of the call are one m16 tile of the kernel and take its small-row reduction, as
+        // the one row does (exl3_gemm_inner.cuh, threadblock_reduce)
+        static_assert(EXACT_ROWS_MAX <= 8, "one_row_route: rows must stay in the kernel's small-row reduction");
+        TORCH_CHECK(!graph && force_shape_idx <= 0 && force_num_sms <= 0,
+                    "exl3_gemm: one_row_route takes the autotuned, ungraphed launch");
+        TORCH_CHECK(size_m >= 2 && size_m <= EXACT_ROWS_MAX,
+                    "exl3_gemm: one_row_route takes 2 to ", EXACT_ROWS_MAX, " rows, got ", size_m);
+        TORCH_CHECK(suh_ptr && A_had_ptr && svh_ptr, "exl3_gemm: one_row_route needs suh, A_had and svh");
+        TORCH_CHECK(size_k > 0 && size_n > 0 && A.numel() == (int64_t) size_m * size_k &&
+                    C.numel() == (int64_t) size_m * size_n,
+                    "exl3_gemm: one_row_route: A or C does not hold the rows");
+        TORCH_CHECK(A.is_contiguous() && C.is_contiguous() && A_had.value().is_contiguous() &&
+                    A_had.value().dtype() == at::kHalf && A_had.value().numel() >= A.numel(),
+                    "exl3_gemm: one_row_route: A, C and A_had must be contiguous, A_had FP16 with room for A");
+        TORCH_CHECK(suh.value().dtype() == at::kHalf && svh.value().dtype() == at::kHalf &&
+                    suh.value().numel() >= size_k && svh.value().numel() >= size_n,
+                    "exl3_gemm: one_row_route: suh or svh does not cover the weight");
+        TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.value().device() &&
+                    A.device() == B.device() && A.device() == suh.value().device() &&
+                    A.device() == svh.value().device(),
+                    "exl3_gemm: one_row_route: the operands must be on one CUDA device");
+        // The input transform works on 128-element blocks of the flattened rows, and the output
+        // transform on 128-column blocks: a block must not straddle two rows
+        if (size_k % 128 || size_n % 128) return EXACT_ROWS_NO_LAUNCH;
+    }
+
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
     // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    if (exl3_gemm_asks_int8(mul1))
     {
+        // one_row_route: the one-row call is offered to the int8 path, which decodes the weights per
+        // call and whose one-row launch is not the launch of several rows
+        if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
     }
@@ -235,11 +275,14 @@ int exl3_gemm_gr
         void* gemv_kernel = nullptr;
         if (exl3_gemv_try_launch
         (
-            kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+            kernelArgs, route_m, size_k, size_n, K, half_k, cb, c_fp32,
             suh_ptr && A_had_ptr && svh_ptr,
-            device, stream, &gemv_kernel, false
+            device, stream, &gemv_kernel, false, one_row_route
         ))
         {
+            // one_row_route: the one-row call takes the GEMV kernel (decided only, nothing launched),
+            // whose one-row instance is not its instance for several rows
+            if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
             add_graph_args(gemv_kernel);
             cuda_check(cudaPeekAtLastError());
             return 90;
@@ -249,14 +292,19 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+        uint64_t autotune_key = gemm_autotune_hash(MAX(route_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
+            TORCH_CHECK(!one_row_route || (tuned.tag >= 1 && tuned.tag <= EXL3_GEMM_NUM_SHAPES),
+                        "exl3_gemm: one_row_route launched under a record with kernel tag ", tuned.tag);
             return tuned.tag;
         }
+        // one_row_route: the process has no record of the one-row call yet. This call does not make
+        // one (no disk cache lookup, no tuning with its rows, no store): the first one-row call does
+        if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
         std::vector<CoopAutotuneCandidate> candidates;
         for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
         {
@@ -417,7 +465,8 @@ int exl3_mgemm_gr
     const c10::optional<at::Tensor>& c_ptrs,
     const c10::optional<at::Tensor>& n_stride_list,
     const c10::optional<at::Tensor>& had_src_list,
-    int num_had_src
+    int num_had_src,
+    bool one_row_route
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -518,6 +567,29 @@ int exl3_mgemm_gr
     int size_k = A.size(2);
     int size_n = C.size(2);
 
+    // one_row_route (exl3_gemm.cuh): the launch-autotune record is looked up for one row. The kernel
+    // arguments keep the real row count
+    const int route_m = one_row_route ? 1 : size_m;
+    if (one_row_route)
+    {
+        // As in exl3_gemm_gr: one m16 tile per matrix, the kernel's small-row reduction
+        static_assert(EXACT_ROWS_MAX <= 8, "one_row_route: rows must stay in the kernel's small-row reduction");
+        TORCH_CHECK(!graph && force_shape_idx <= 0 && force_num_sms <= 0 && !weights && num_tokens == 1 &&
+                    min_index < 0 && !size_n_list && !c_ptrs && !n_stride_list && !had_src_list,
+                    "exl3_mgemm: one_row_route takes the plain grouped launch");
+        TORCH_CHECK(size_m >= 2 && size_m <= EXACT_ROWS_MAX,
+                    "exl3_mgemm: one_row_route takes 2 to ", EXACT_ROWS_MAX, " rows, got ", size_m);
+        TORCH_CHECK(size_k > 0 && size_n > 0 && bszm_in > 0 && bszm_out > 0,
+                    "exl3_mgemm: one_row_route: A or C is empty");
+        TORCH_CHECK(A.is_contiguous() && C.is_contiguous() && A_had.is_contiguous() && A_had.dtype() == at::kHalf,
+                    "exl3_mgemm: one_row_route: A, C and A_had must be contiguous, A_had FP16");
+        TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.device(),
+                    "exl3_mgemm: one_row_route: A, C and A_had must be on one CUDA device");
+        // The transforms work on 128-element blocks of each matrix's flattened rows: a block must
+        // not straddle two rows
+        if (size_k % 128 || size_n % 128) return EXACT_ROWS_NO_LAUNCH;
+    }
+
     // Device properties
     int device;
     cudaGetDevice(&device);
@@ -593,7 +665,7 @@ int exl3_mgemm_gr
     {
         uint64_t autotune_key = mgemm_autotune_hash
         (
-            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
+            route_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
         );
         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
@@ -602,8 +674,13 @@ int exl3_mgemm_gr
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
+            TORCH_CHECK(!one_row_route || (tuned.tag >= 1 && tuned.tag <= EXL3_GEMM_NUM_SHAPES),
+                        "exl3_mgemm: one_row_route launched under a record with kernel tag ", tuned.tag);
             return tuned.tag;
         }
+        // one_row_route: no record of the one-row call in the process yet, and this call does not
+        // make one (as in exl3_gemm_gr)
+        if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
         if (!graph)
         {
             std::vector<CoopAutotuneCandidate> candidates;
@@ -730,7 +807,8 @@ int exl3_mgemm
         c_ptrs,
         n_stride_list,
         had_src_list,
-        num_had_src
+        num_had_src,
+        false
     );
 }
 

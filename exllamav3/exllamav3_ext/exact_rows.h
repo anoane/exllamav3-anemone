@@ -14,5 +14,9 @@
 #define EXACT_ROWS_CAP_MOE 8        // BC_BlockSparseMLP::run_bszN_rows, rows_exact_ok
 #define EXACT_ROWS_CAP_HC 16        // hc_collapse_rows, hc_partials_rows
 
+// exl3_gemm_gr and exl3_mgemm_gr with one_row_route: nothing was launched, the caller makes the
+// one-row launches itself. Never a launch tag (those are 0 and up)
+#define EXACT_ROWS_NO_LAUNCH (-1)
+
 // OR of the entry points this build has
 int exact_rows_caps();
