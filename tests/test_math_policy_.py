@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / "exllamav3" / "model" / "math_policy.py"
 POLICY_VARS = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL", "EXL3_MOE_FUSED_DET",
-               "EXL3_NO_FUSED_RECONSTRUCT")
+               "EXL3_NO_FUSED_RECONSTRUCT", "EXL3_EXACT_ROWS", "EXL3_DSV41_FUSED_COMPRESS")
 
 
 def load(environ):
@@ -124,6 +124,68 @@ class StableArithmeticTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.split(), ["True", "128", "True"])
+
+
+class ExactRowsTests(unittest.TestCase):
+
+    def test_accepted_values(self):
+        policy = load({})
+        for environ, expected in (({}, False), ({"EXL3_EXACT_ROWS": "0"}, False), ({"EXL3_EXACT_ROWS": "1"}, True),
+                                  ({"EXL3_EXACT_ROWS": "1", "EXL3_STABLE_ARITHMETIC": "0"}, True),
+                                  ({"EXL3_EXACT_ROWS": "1", "EXL3_DSV41_FUSED_COMPRESS": "0"}, True),
+                                  ({"EXL3_EXACT_ROWS": "0", "EXL3_STABLE_ARITHMETIC": "1"}, False),
+                                  ({"EXL3_EXACT_ROWS": "0", "EXL3_DSV41_FUSED_COMPRESS": "1"}, False)):
+            with self.subTest(environ = environ):
+                self.assertIs(policy.exact_rows_enabled(environ), expected)
+                self.assertIs(load(environ).EXACT_ROWS, expected)
+        self.assertEqual(policy.EXACT_ROWS_MAX, 8)
+
+    def test_other_values_refused(self):
+        policy = load({})
+        for value in ("", "2", "-1", "true", "yes", "8", " 1", "1 "):
+            with self.subTest(value = value), self.assertRaisesRegex(ValueError, "EXL3_EXACT_ROWS must be 0 or 1"):
+                policy.exact_rows_enabled({"EXL3_EXACT_ROWS": value})
+
+    def test_refused_combinations(self):
+        # Each names both variables. The stable profile replaces the one-row arithmetic this mode keeps;
+        # the fused compressor is on for any value but 0 (cache/dsv41.py, FUSED_COMPRESS)
+        policy = load({})
+        for extra, other in (({"EXL3_STABLE_ARITHMETIC": "1"}, "EXL3_STABLE_ARITHMETIC"),
+                             ({"EXL3_DSV41_FUSED_COMPRESS": "1"}, "EXL3_DSV41_FUSED_COMPRESS"),
+                             ({"EXL3_DSV41_FUSED_COMPRESS": ""}, "EXL3_DSV41_FUSED_COMPRESS"),
+                             ({"EXL3_DSV41_FUSED_COMPRESS": "yes"}, "EXL3_DSV41_FUSED_COMPRESS")):
+            environ = {"EXL3_EXACT_ROWS": "1", **extra}
+            with self.subTest(extra = extra):
+                with self.assertRaises(ValueError) as caught:
+                    policy.exact_rows_enabled(environ)
+                self.assertIn("EXL3_EXACT_ROWS", str(caught.exception))
+                self.assertIn(other, str(caught.exception))
+                with self.assertRaises(ValueError):
+                    load(environ)
+        # an invalid value of the other profile is that profile's error
+        with self.assertRaisesRegex(ValueError, "EXL3_STABLE_ARITHMETIC must be 0 or 1"):
+            policy.exact_rows_enabled({"EXL3_EXACT_ROWS": "1", "EXL3_STABLE_ARITHMETIC": "2"})
+
+    def test_row_range(self):
+        policy = load({})
+        for rows, inside in ((0, False), (1, False), (2, True), (8, True), (9, False)):
+            with self.subTest(rows = rows):
+                self.assertIs(policy.exact_rows(rows, True), inside)
+                self.assertIs(policy.exact_rows(rows, False), False)
+                # the import-time constant is the default
+                self.assertIs(policy.exact_rows(rows), False)
+                self.assertIs(load({"EXL3_EXACT_ROWS": "1"}).exact_rows(rows), inside)
+
+    def test_invalid_value_fails_the_import(self):
+        code = f"import importlib.util as u; s = u.spec_from_file_location('p', {str(PATH)!r}); s.loader.exec_module(u.module_from_spec(s))"
+        for extra, message in (({"EXL3_EXACT_ROWS": "2"}, "ValueError: EXL3_EXACT_ROWS must be 0 or 1"),
+                               ({"EXL3_EXACT_ROWS": "1", "EXL3_STABLE_ARITHMETIC": "1"}, "EXL3_STABLE_ARITHMETIC=1")):
+            environ = {k: v for k, v in os.environ.items() if k not in POLICY_VARS}
+            environ.update(extra)
+            with self.subTest(extra = extra):
+                r = subprocess.run([sys.executable, "-c", code], env = environ, capture_output = True, text = True)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(message, r.stderr)
 
 
 if __name__ == "__main__":
