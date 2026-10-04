@@ -54,17 +54,15 @@ from .hyperconnections import HyperConnection
 from .transformer import TransformerBlock
 
 
-def _collapse(pre: torch.Tensor, streams: torch.Tensor, per_row: bool) -> torch.Tensor:
+def _collapse_rows(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
     """
-    The stream collapse sum_h pre[h] * streams[h]: pre (b, s, H), streams (b, s, H, D), returns
-    (b, s, D). With per_row (EXL3_EXACT_ROWS) every token's sum is a call of its own, on the
-    (b, 1, H, D) operand of a one-row step: torch chooses the layout of a reduction from the shape
-    of the call. The product is pointwise.
+    EXL3_EXACT_ROWS: the stream collapse (pre.unsqueeze(-1) * streams).sum(dim = 2) of pre
+    (b, s, H) and streams (b, s, H, D), one token per call: (b, s, D). Every token runs the whole
+    expression on its own (b, 1, ..) slices, so its sum reduces the freshly allocated (b, 1, H, D)
+    product a one-token step reduces: torch chooses the layout of a reduction from its operand.
     """
-    t = pre.unsqueeze(-1) * streams
-    if per_row:
-        return torch.cat([t[:, j:j + 1].sum(dim = 2) for j in range(t.shape[1])], dim = 1)
-    return t.sum(dim = 2)
+    return torch.cat([(pre[:, j:j + 1].unsqueeze(-1) * streams[:, j:j + 1]).sum(dim = 2)
+                      for j in range(streams.shape[1])], dim = 1)
 
 
 class DSV41HyperConnection(HyperConnection):
@@ -103,11 +101,13 @@ class DSV41HyperConnection(HyperConnection):
                     f"width {D}, contiguous {streams.is_contiguous()}")
             post, comb, pre = self.mix_torch(streams, params)
         if own_pre:
-            collapsed = _collapse(pre, streams, exact)
+            collapsed = _collapse_rows(pre, streams) if exact else (pre.unsqueeze(-1) * streams).sum(dim = 2)
         elif carried_pre is None:
             collapsed = streams[:, :, 0]
+        elif exact:
+            collapsed = _collapse_rows(carried_pre, streams)
         else:
-            collapsed = _collapse(carried_pre, streams, exact)
+            collapsed = (carried_pre.unsqueeze(-1) * streams).sum(dim = 2)
         return post, comb, collapsed, pre
 
     def mix_torch(self, streams: torch.Tensor, params: dict):
@@ -316,4 +316,6 @@ class DSV41HeadCollapse(Module):
             "DSV41HeadCollapse: no pre-mix from the last layer -- did the final block run?"
         pre = to_device(pre, x.device)
         assert pre.shape == x.shape[:-1], f"pre-mix {tuple(pre.shape)} vs streams {tuple(x.shape)}"
-        return _collapse(pre, x, EXACT_ROWS and bool(params.get("exact_rows")) and x.shape[1] > 1)
+        if EXACT_ROWS and params.get("exact_rows") and x.shape[1] > 1:
+            return _collapse_rows(pre, x)
+        return (pre.unsqueeze(-1) * x).sum(dim = 2)
