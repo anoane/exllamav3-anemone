@@ -935,7 +935,7 @@ class ExactRows(unittest.TestCase):
     @torch.inference_mode()
     def test_select_rows_equal_one_row_calls(self):
         # The selections of two real forwards, on every GPU: on the GPU that made them, and copied
-        # to every other one (in the serving placement the sm_89 card holds no index source)
+        # to every other one (a GPU that holds no index source makes no selection of its own)
         captured = self.captured_selections()
         self.assertTrue(captured, "the forwards made no selection of 2 to 8 rows")
         names = sorted({self.selection_name(c) for c in captured})

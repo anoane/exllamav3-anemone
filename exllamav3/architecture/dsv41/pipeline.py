@@ -1,5 +1,5 @@
 """
-Two-stage pipelined prefill for a DeepSeek-V4.1 layer split across two GPUs.
+Two-stage pipelined prefill for a DeepSeek-V4.1 layer split across two or more GPUs.
 
 With a layer split (e.g. layers 0-11 on the first GPU, 12-39 on the second) a chunk's
 forward runs its two halves back to back, and inside each half the host blocks at sync
@@ -12,6 +12,11 @@ This driver runs one prefill call as sub-chunks and overlaps them:
 
     calling thread (first GPU, caller stream):        S1(k+1)  S1(k+2)  ...
     worker thread (second GPU, caller stream):        S2(k)    S2(k+1)  ...
+
+With more than two GPUs, stage 2 is the last GPU of the split and stage 1 is every GPU before
+it: their layers run back to back on the calling thread, as in the plain forward, and the changes
+of device between them stay inside the stage. "The first GPU" below then stands for each stage-1
+GPU: stage 2 waits for one event per stage-1 GPU and reads each on a side stream of its own.
 
 Causality allows it: S1 of chunk k+1 reads only the first-half layers' caches, which S1 of
 chunk k finished; S2 of chunk k reads the second-half caches and the chunk-k products of
@@ -61,8 +66,8 @@ from ...cache.recurrent_util import advance_recurrent_states
 from . import placement
 
 PIPELINE = os.environ.get("EXL3_DSV41_PIPELINE", "0") != "0"
-# EXPERIMENT ONLY (exp-4090): EXL3_DSV41_PIPELINE_TIMING=1 synchronizes after every module and prints, per
-# sub-chunk, the seconds each device was busy in each stage. It slows the prefill; never set it when serving.
+# Diagnostic (doc/env_vars.md): EXL3_DSV41_PIPELINE_TIMING=1 synchronizes after every module and prints, per
+# sub-chunk, the seconds each device was busy in each stage. It slows the prefill: not for serving.
 TIMING = os.environ.get("EXL3_DSV41_PIPELINE_TIMING", "0") != "0"
 
 

@@ -1381,7 +1381,10 @@ with DeepSeek-V4.1-Flash); with the Python row loops alone the mode costs 1.6 (K
 The figures above were measured with one selection, one stream collapse and one compressed
 entry per row and call, the MoE launched slot by slot and the router row by row; the one-pass
 selection, the sums over the rows, the grouped MoE launch and the router's single launch lower
-the cost under both settings, by an amount the probe has to measure on the host.
+the cost under both settings. Measured with all of them on the three-GPU host (the probe, one
+position of 1,200 tokens): with `EXL3_INT8_GEMV=0` a verify forward costs 1.19 (K = 2), 1.26,
+1.31, 1.41, 1.50, 1.60 and 1.68 (K = 8) decode steps, what it costs without the mode; with the
+int8 path on, 1.48 (K = 3) to 2.75 (K = 8).
 
 Generation with a draft returns the tokens of generation without one under either setting; the
 setting changes which one-row arithmetic both have, and the cost. What a verify forward costs on
@@ -2535,7 +2538,7 @@ rows: hidden entirely).
 
 ### `EXL3_DSV41_PIPELINE` (default: `0`), `EXL3_DSV41_PIPELINE_CHUNK` (default: `4096`)
 
-Two-stage pipelined prefill for DeepSeek-V4.1 split across two GPUs. In a plain layer-split
+Two-stage pipelined prefill for DeepSeek-V4.1 split across two or more GPUs. In a plain layer-split
 prefill the two GPUs take turns: the host issues a chunk's first-GPU layers, then its second-GPU
 layers, and inside each half it waits at sync points (block-table uploads, MoE row counts, the
 CPU-MoE stream plans), so it never queues the next chunk's first half while the second GPU is
@@ -2548,6 +2551,13 @@ second-GPU layers of sub-chunk k:
 calling thread (first GPU):    S1(0)  S1(1)  S1(2)  ...
 worker thread (second GPU):           S2(0)  S2(1)  S2(2)  ...
 ```
+
+With more than two GPUs, stage 2 is the last GPU of the split and stage 1 is every GPU before it:
+their layers run back to back on the calling thread, as in the plain forward, and the changes of
+device between them (the pool replica rows of an explicit placement included) stay inside the
+stage. In the description below "the first GPU" then stands for each stage-1 GPU: stage 2 waits for
+one event per stage-1 GPU and reads each of them on a side stream of its own. The load report names
+the devices (`eligible, 16 modules on cuda:0 + cuda:2, 29 on cuda:1`).
 
 Stage 2 of a sub-chunk waits, on the GPU, for an event its stage 1 recorded, so it reads the first
 half's products (the residual streams, the carried hyper-connection pre-mix, and across the split
@@ -2585,8 +2595,8 @@ pipelined. Everything else takes the plain path unchanged.
 Which loads are eligible (checked from the loaded modules, and re-checked after every
 load/unload):
 
-- a layer split (not `-tp`, which V4.1 refuses anyway) over exactly two CUDA devices, every
-  module past the first second-GPU module on the second GPU, at least the first decoder layer
+- a layer split (not `-tp`, which V4.1 refuses anyway) over two or more CUDA devices, every
+  module past the first module of the last GPU on that GPU, at least the first decoder layer
   before the split, and the split before the last layer that writes the cache (a split that
   leaves only the final norm and head on the second GPU gains nothing and is not pipelined).
   Every V4.1 layer owns a sliding-window ring whose shift both halves must agree on, so a first
@@ -2693,6 +2703,16 @@ cache = Cache(model, max_num_tokens = 131072)
 model.load(max_chunk_size = 4096, use_per_device = [70, 130])   # layers 0-13 on the first GPU
 generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 16384)
 ```
+
+### `EXL3_DSV41_PIPELINE_TIMING` (default: `0`)
+
+A diagnostic for the pipelined prefill above. With `1`, every module of a pipelined sub-chunk is
+followed by a synchronization of its GPU, and each stage prints one line per sub-chunk with the
+seconds each device was busy and the number of its modules
+(` -- DSV41 pipeline timing S1 [a,b): 1.234s  (cuda:0 0.900s/12  cuda:2 0.300s/3)`). The
+synchronizations remove the overlap inside a stage and slow the prefill, so the totals are not
+those of a normal run: read the split between devices, not the speed. It changes no result. Not
+for serving. Read once at import, like `EXL3_DSV41_PIPELINE`; any value other than `0` is on.
 
 ### `EXL3_DSV41_XDEV_BF16` (default: `0`)
 
