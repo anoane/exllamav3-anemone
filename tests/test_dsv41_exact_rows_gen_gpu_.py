@@ -33,7 +33,17 @@ the selection starts): compilation and the first use of a launch bucket, which t
 autotuner may time with another configuration, then fall in neither run of a case. --no-warmup
 skips them.
 
+An extension that reports the single launch (exact_rows_caps() & 32) serves the rows of an EXL3
+linear and of the grouped output projection with ONE launch, under the launch record of a one-row
+call, where that call is the cooperative FP16 kernel: the grouped projection always, a mul1 linear
+with EXL3_INT8_GEMV=0. The tokens and logits do not show which route ran, so each case also reads
+the extension's count of such calls (exact_rows_one_launches) around its drafted run: a run with
+verify forwards must have made some, and the count per verify forward is printed (with the int8
+path off, about the EXL3 linears and grouped projections of a forward; with it on, about the
+grouped projections). Run it under both settings, each with one autotune file:
+
     EXL3_EXACT_ROWS=1 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
+    EXL3_EXACT_ROWS=1 EXL3_INT8_GEMV=0 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
 
 (checkpoint-dir defaults to $DSV41_MODEL_DIR; the placement comes from EXL3_PLACEMENT and
 CUDA_VISIBLE_DEVICES.) Run it once with EXL3_MOE_TIER_VERIFY=1 too: under the mode the MoE looks
@@ -184,6 +194,15 @@ def main() -> int:
         print("  --  exact rows, generator: needs CUDA, skipped")
         return 2
 
+    # The single launch for the rows of a linear or of the grouped projection (exact_rows.h): the
+    # count of calls served that way, or None for an extension without it
+    from exllamav3.ext import exllamav3_ext as ext
+    caps = int(ext.exact_rows_caps()) if hasattr(ext, "exact_rows_caps") else 0
+    one_launches = (lambda: int(ext.exact_rows_one_launches())) if caps & 32 else None
+    print(f"  --  exact rows, generator: row-exact entry points of the extension: {caps or 'none'}; "
+          f"EXL3_INT8_GEMV={os.environ.get('EXL3_INT8_GEMV', 'unset (2)')}; the rows of a linear or of the grouped "
+          f"projection as one launch: {'counted' if one_launches else 'not in this extension'}", flush = True)
+
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     # max_history as model_init sets it for a draft of this length
@@ -225,9 +244,19 @@ def main() -> int:
                 continue
             common = dict(ngram_min = args.ngram_min, chunk = args.chunk, **kw)
             plain = run(torch, model, cache, tok, ids, draft = False, **common)
+            before = one_launches() if one_launches else 0
             drafted = run(torch, model, cache, tok, ids, draft = True, **common)
+            served = one_launches() - before if one_launches else 0
             prompt_len = ids.shape[-1]
             bad = check(model, name, prompt_len, plain, drafted, **expect)
+            verifies = sum(1 for _, rows, flagged in drafted["forwards"] if rows > 1 and flagged)
+            if one_launches:
+                print(f"       one-launch calls of the drafted run: {served} in {verifies} verify forwards"
+                      + (f" ({served / verifies:.1f} per forward)" if verifies else ""), flush = True)
+                if verifies and not served:
+                    bad.append(f"{verifies} verify forwards and no call served with one launch: the extension "
+                               f"reports the single launch (exact_rows_caps() & 32) and did not make it")
+                    print(f"       {bad[-1]}", flush = True)
             if name == "plan" and (prompt_len >= 120 or prompt_len + len(plain["tokens"]) <= 1100):
                 bad.append(f"plan: prompt {prompt_len} tokens, generation to position "
                            f"{prompt_len + len(plain['tokens'])}: it must start below 120 and pass 1100")

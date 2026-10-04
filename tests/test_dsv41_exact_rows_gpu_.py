@@ -13,9 +13,11 @@ Covered: every Linear of the trunk (attention wq_a, wq_b, wkv, wo_b; compressor 
 indexer wq_b, weights_proj, wk; engram wkv; the output head), the grouped output projection
 (DSV41Attention._project_o_rows), the MoE layer (router, expert cache lookup, routed and shared
 experts), the hyper-connection mix and both collapses, the engram gate (DSV41Engram._gate_rows),
-and the compressor's pooling and norm at rates 1 and 2. A control checks, on every GPU, that
+and the compressor's pooling and norm at rates 1 and 2. Two controls check, on every GPU, that
 the comparison discriminates: an unflagged call of several rows must differ from the one-row
-calls.
+calls (with the int8 activation path on: with EXL3_INT8_GEMV=0 it need not), and the rows of an
+EXL3 linear launched with the kernel shape of a one-row call and another block count must differ
+from the one-row calls (with the int8 path off, which the test sets in-process).
 
 Not covered: the index selection and the attention kernel, which need real pools, and the order
 of these operations in a forward. tools/dsv41_rowprobe.py under EXL3_EXACT_ROWS=1 is the evidence
@@ -31,7 +33,18 @@ ROWS_NATIVE set to 0), with the row loops made to raise where the entry point mu
 linears on the activations of a real forward too; the expert launch pair and the router against
 one-row calls on crafted and natural routing; and what each entry point refuses.
 
+An extension that reports bit 32 (EXACT_ROWS_CAP_ONE_LAUNCH) makes ONE launch for the rows of an
+EXL3 linear and of the grouped projection, under the launch record of a one-row call, where that
+call is the cooperative FP16 kernel: a mul1 linear with EXL3_INT8_GEMV=0, the grouped projection
+under either setting. The rows have the same bits either way, so the test_one_launch_* tests read
+the extension's count of such calls (exact_rows_one_launches): with the int8 path off (set
+in-process: the extension reads the variable on every launch) a flagged call must be one launch
+and equal the one-row calls of that setting, on random rows and on the activations of a real
+forward; with it on, a mul1 linear must make no such launch and equal that setting's one-row
+calls. Run the whole file under both settings, each with one autotune file:
+
     EXL3_EXACT_ROWS=1 DSV41_MODEL_DIR=<checkpoint> python -m pytest tests/test_dsv41_exact_rows_gpu_.py
+    EXL3_EXACT_ROWS=1 EXL3_INT8_GEMV=0 DSV41_MODEL_DIR=<checkpoint> python -m pytest tests/test_dsv41_exact_rows_gpu_.py
 
 Needs CUDA, the compiled extension and the checkpoint; skipped without the switch. Loads the whole
 model: run it alone on the host.
@@ -49,6 +62,10 @@ FLAGGED = {"exact_rows": True}
 # The row-exact entry points of the extension (math_policy.EXACT_ROWS_CAP_*), and the modules that
 # hold what the extension reports (ROWS_NATIVE)
 CAP_LINEAR, CAP_MGEMM, CAP_ROUTER, CAP_MOE, CAP_HC = 1, 2, 4, 8, 16
+# Not an entry point: those of CAP_LINEAR and CAP_MGEMM make one launch for the rows where they can
+CAP_ONE_LAUNCH = 32
+# What the extension takes when EXL3_INT8_GEMV is not set (exl3_gemv_int8.cu): the plain int8 mode
+INT8_GEMV_DEFAULT = "2"
 NATIVE_CONSUMERS = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
 # name, the Linear of a block or None, input dims, out_dtype the engine passes
 LINEAR_OPS = (
@@ -84,6 +101,20 @@ def _refuse(*args, **kwargs):
     raise AssertionError("the Python row loop ran where the row-exact entry point must serve")
 
 
+@contextmanager
+def int8_gemv(value: str):
+    """EXL3_INT8_GEMV replaced for the launches inside: the extension reads the variable on every
+    launch (exl3_gemv_int8.cu, exl3_gemv_int8_mode). Only ever replaced, never added or removed:
+    native threads call getenv at run time, and a replaced value leaves the environment array as
+    it is (setUpClass sets the variable before the model, and its threads, exist)."""
+    old = os.environ["EXL3_INT8_GEMV"]
+    os.environ["EXL3_INT8_GEMV"] = value
+    try:
+        yield
+    finally:
+        os.environ["EXL3_INT8_GEMV"] = old
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class ExactRows(unittest.TestCase):
 
@@ -95,6 +126,12 @@ class ExactRows(unittest.TestCase):
         path = os.environ.get("DSV41_MODEL_DIR")
         if not path:
             raise unittest.SkipTest("needs DSV41_MODEL_DIR")
+        # Before the model and its threads exist (int8_gemv): the default, which changes nothing
+        os.environ.setdefault("EXL3_INT8_GEMV", INT8_GEMV_DEFAULT)
+        # The setting of this process, and a setting with the int8 path on for the tests that need one
+        cls.int8 = os.environ["EXL3_INT8_GEMV"]
+        cls.int8_off = int(cls.int8) == 0
+        cls.int8_on = INT8_GEMV_DEFAULT if cls.int8_off else cls.int8
         from exllamav3 import Cache, Config, Model
         config = Config.from_directory(path)
         cls.model = model = Model.from_config(config)
@@ -113,8 +150,10 @@ class ExactRows(unittest.TestCase):
         cls.ext = ext
         cls.caps = int(ext.exact_rows_caps()) if hasattr(ext, "exact_rows_caps") else 0
         cls.real_inputs = None
+        cls.real_woa = {}
         print(f" -- exact rows: {n} layers on {', '.join(str(d) for d in cls.devices)}; row-exact entry points of "
-              f"the extension: {cls.caps or 'none (the Python row loops serve every flagged call)'}", flush = True)
+              f"the extension: {cls.caps or 'none (the Python row loops serve every flagged call)'}; "
+              f"EXL3_INT8_GEMV={cls.int8}", flush = True)
 
     @classmethod
     def tearDownClass(cls):
@@ -176,8 +215,15 @@ class ExactRows(unittest.TestCase):
         # Without the flag a call of several rows takes other kernels than one-row calls (measured
         # with tools/dsv41_rowprobe.py on DeepSeek-V4.1-Flash: attn.wq_b from 2 rows on layers 0
         # to 10, attn.wq_a and attn.wq_b from 3 rows on every layer). If none differs on a GPU, the
-        # comparisons of this file show nothing there (an environment that turns the int8
-        # activation path off, say)
+        # comparisons of this file show nothing there. With the int8 activation path off
+        # (EXL3_INT8_GEMV=0) one-row and multi-row calls take the same cooperative kernel, and
+        # where the launch autotuner holds one record for every row bucket they are equal:
+        # test_control_forced_grid_differs is the control of that setting
+        if self.int8_off:
+            note = "skipped test_control_unflagged_calls_differ: EXL3_INT8_GEMV=0, where unflagged calls can " \
+                   "equal one-row calls; test_control_forced_grid_differs is the control there"
+            print(f" -- exact rows: {note}", flush = True)
+            self.skipTest(note)
         for device in self.devices:
             b = self.first(device, lambda blk: True)
             differing = []
@@ -193,6 +239,56 @@ class ExactRows(unittest.TestCase):
             with self.subTest(device = str(device)):
                 self.assertTrue(differing, f"unflagged calls of 2 to 8 rows equal the one-row calls on {device}: "
                                            f"this test does not discriminate there")
+
+    def one_row_tag(self, inner, device, fp32: bool) -> int:
+        """The kernel ext.exl3_gemm launches for one row of this EXL3 linear under the current
+        EXL3_INT8_GEMV: 0 the int8 GEMV, 90 the FP16 GEMV, 1 to 4 the cooperative kernel's shape."""
+        A = self.randn((1, inner.in_features), device)
+        C = torch.empty((1, inner.out_features), dtype = torch.float if fp32 else torch.half, device = device)
+        return int(self.ext.exl3_gemm(A, inner.trellis, C, inner.suh, torch.empty_like(A), inner.svh,
+                                      -1, bool(inner.mcg), bool(inner.mul1), 0))
+
+    @torch.inference_mode()
+    def test_control_forced_grid_differs(self):
+        # With the int8 path off, the rows of a call and one-row calls take the same cooperative
+        # kernel, and what separates them is the launch: the block count decides where a column's K
+        # reduction is cut and handed from block to block through the FP16 output. Here the K rows
+        # are launched with the kernel shape of the one-row call and 2, then 4 blocks: on every GPU
+        # at least one such launch must differ from the one-row calls, or equal rows in this file
+        # show nothing about the launch. Raw kernel calls on both sides (ext.exl3_gemm)
+        for device in self.devices:
+            b = self.first(device, lambda blk: type(getattr(blk.attn.q_a, "inner", None)).__name__ == "LinearEXL3")
+            with self.subTest(device = str(device)):
+                self.assertIsNotNone(b, f"no layer on {device} has an EXL3 attn.wq_a")
+                inner = b.attn.q_a.inner
+                fp32 = inner.default_out_dtype == torch.float
+                gemm = lambda A, C, shape, blocks: int(self.ext.exl3_gemm(
+                    A, inner.trellis, C, inner.suh, torch.empty_like(A), inner.svh, shape, bool(inner.mcg),
+                    bool(inner.mul1), blocks))
+                out = lambda rows: torch.empty((rows, inner.out_features), dtype = torch.float if fp32 else torch.half,
+                                               device = device)
+                differing, tags = [], set()
+                with int8_gemv("0"):
+                    for K in ROWS:
+                        x = self.randn((K, inner.in_features), device)
+                        ones = []
+                        for j in range(K):
+                            C1 = out(1)
+                            tags.add(gemm(x[j:j + 1].clone(), C1, -1, 0))
+                            ones.append(C1.reshape(-1).clone())
+                        self.assertEqual(len(tags), 1, f"one-row calls took the kernels {sorted(tags)}")
+                        tag = next(iter(tags))
+                        self.assertIn(tag, range(1, 5), "a one-row call with the int8 path off is not the cooperative kernel")
+                        for blocks in (2, 4):
+                            C = out(K)
+                            self.assertEqual(gemm(x, C, tag, blocks), tag)
+                            if any(not torch.equal(C[j], ones[j]) for j in range(K)):
+                                differing.append(f"K={K} with {blocks} blocks")
+                print(f" -- exact rows: forced-grid control on {device} (L{b.layer_idx} attn.wq_a, kernel shape "
+                      f"{sorted(tags)}): rows differ from one-row calls for {', '.join(differing) or 'NOTHING'}",
+                      flush = True)
+                self.assertTrue(differing, f"K rows under the one-row kernel shape with 2 and 4 blocks equal the "
+                                           f"one-row calls on {device}: the comparison does not see the launch")
 
     @torch.inference_mode()
     def test_grouped_output_projection(self):
@@ -421,6 +517,18 @@ class ExactRows(unittest.TestCase):
         head = cls.tail["head"]
         targets[("head", str(torch.device(head.device)))] = head
         captured, hooked = {}, []
+        woa, hooked_attn = {}, []
+
+        def hook_woa(key, at):
+            orig = at._project_o_rows
+
+            def project(out, params, out_dtype):
+                # dsa_attn's group-major (groups, rows, width) output of the forward's rows
+                if key not in woa and 2 <= out.shape[1] <= 8:
+                    woa[key] = (at, out.clone())
+                return orig(out, params, out_dtype)
+            at._project_o_rows = project
+            hooked_attn.append(at)
 
         def hook(key, lin):
             orig = lin.forward
@@ -436,11 +544,14 @@ class ExactRows(unittest.TestCase):
         try:
             for key, lin in targets.items():
                 hook(key, lin)
+            for device in cls.devices:
+                hook_woa(str(device), next(b for b in cls.blocks if torch.device(b.device) == device).attn)
             model.prefill(ids[:, :P], {
                 "attn_mode": "flash_attn", "block_table": block_table, "cache": cache,
                 "cache_seqlens": torch.tensor([0], dtype = torch.int32),
                 "recurrent_states": [state], "indexed_embeddings": []})
             captured.clear()        # the prefill's own calls of 2 to 8 entries, if any
+            woa.clear()
             model.forward(ids[:, P:], {
                 "attn_mode": "flash_attn", "block_table": block_table, "cache": cache,
                 "cache_seqlens": torch.tensor([state.position], dtype = torch.int32),
@@ -451,8 +562,11 @@ class ExactRows(unittest.TestCase):
         finally:
             for lin in hooked:
                 del lin.forward
+            for at in hooked_attn:
+                del at._project_o_rows
             cache.release_state(state)
         cls.real_inputs = captured
+        cls.real_woa = woa
         return captured
 
     @torch.inference_mode()
@@ -490,6 +604,144 @@ class ExactRows(unittest.TestCase):
                     with rows_native(0):
                         loop = at._project_o_rows(out, dict(FLAGGED), None).clone()
                     self.same(f"wo_a/wo_b L{at.layer_idx}", native, loop)
+
+    # -- one launch for the rows (test_one_launch_*) --
+
+    def launches(self, call):
+        """call(), and how many calls of the row-exact entry points inside it were ONE launch for
+        their rows (exact_rows_one_launches)."""
+        before = int(self.ext.exact_rows_one_launches())
+        result = call()
+        return result, int(self.ext.exact_rows_one_launches()) - before
+
+    def one_launch_rows(self, what, lin, x, out_dtype, expect: int):
+        """lin on x flagged, under the current EXL3_INT8_GEMV, against one call per cloned row of
+        that setting; the flagged call must be `expect` one-launch calls (1: one launch for the
+        rows, 0: a launch per row). The one-row calls run first, so the launch record of the
+        one-row call is in the process when the flagged call looks for it."""
+        K = x.numel() // x.shape[-1]
+        ones = []
+        for j in range(K):
+            row = x.reshape(K, -1)[j : j + 1].clone().view(*([1] * (x.dim() - 1)), x.shape[-1])
+            ones.append(lin.forward(row, {}, out_dtype).clone())
+        flagged = lambda: lin.forward(x, dict(FLAGGED), out_dtype).clone()
+        many, grew = self.launches(flagged)
+        if expect and not grew:
+            # tolerated once: a first flagged call that found no record makes the one-row launches,
+            # which leave the record; the next call must find it
+            print(f" -- exact rows: {what}: the first flagged call was not one launch (no launch record of the "
+                  f"one-row call in the process?), repeated", flush = True)
+            self.same_rows(f"{what} (launch per row)", many.reshape(K, -1), ones)
+            many, grew = self.launches(flagged)
+        self.assertEqual(grew, expect, f"{what}: one-launch calls of the flagged call")
+        self.same_rows(what, many.reshape(K, -1), ones)
+
+    @torch.inference_mode()
+    def test_one_launch_linears(self):
+        self.need(CAP_LINEAR | CAP_ONE_LAUNCH)
+        captured = self.captured_linear_inputs()
+        targets = []
+        for device in self.devices:
+            for name, get, dims, out_dtype in LINEAR_OPS:
+                b = self.first(device, lambda blk: get(blk) is not None)
+                if b is not None:
+                    targets.append((name, str(device), get(b), dims, out_dtype))
+        head = self.tail["head"]
+        targets.append(("head", str(torch.device(head.device)), head, 3, None))
+        one, per_row, python, real = {}, {}, {}, set()
+        for name, device, lin, dims, out_dtype in targets:
+            for K in ROWS:
+                shape = (1, K, lin.in_features) if dims == 3 else (K, lin.in_features)
+                inputs = [("random rows", self.randn(shape, device), out_dtype)]
+                if (name, device) in captured:
+                    # the first K rows the forward passed (idx.wk gets pool entries, not the forward's rows)
+                    _, real_dtype, xr = captured[(name, device)]
+                    if K <= xr.numel() // xr.shape[-1]:
+                        rows = xr.reshape(-1, xr.shape[-1])[:K].clone()
+                        inputs.append(("real activations", rows.view(*xr.shape[:-2], K, xr.shape[-1]), real_dtype))
+                        real.add(f"{name} @ {device}")
+                for kind, x, dt in inputs:
+                    what = f"{name} @ {device}, {kind}, K={K}"
+                    with self.subTest(op = name, device = device, K = K, input = kind):
+                        with rows_native(self.caps):
+                            if not lin.rows_native(x, FLAGGED):
+                                python.setdefault(device, set()).add(name)    # the Python row loop serves it
+                                continue
+                            inner = lin.inner
+                            fp32 = (dt or inner.default_out_dtype) == torch.float
+                            with int8_gemv("0"):
+                                tag = self.one_row_tag(inner, x.device, fp32)
+                                self.assertNotEqual(tag, 0, f"{what}: the int8 GEMV ran with EXL3_INT8_GEMV=0")
+                                # The FP16 GEMV (90) has another instance for one row, and a width
+                                # that is not a multiple of 128 would put a transform block across
+                                # two rows: a launch per row for both
+                                aligned = inner.in_features % 128 == 0 and inner.out_features % 128 == 0
+                                expect = 1 if 1 <= tag <= 4 and aligned else 0
+                                self.one_launch_rows(f"{what}, int8 off", lin, x, dt, expect)
+                            (one if expect else per_row).setdefault(device, set()).add(name)
+                            if inner.mul1:
+                                with int8_gemv(self.int8_on):
+                                    self.one_launch_rows(f"{what}, int8 on", lin, x, dt, 0)
+        for device in sorted({d for _, d, _, _, _ in targets}):
+            names = lambda group: ", ".join(sorted(group.get(device, ()))) or "none"
+            print(f" -- exact rows: linears on {device} with EXL3_INT8_GEMV=0: one launch for the rows of "
+                  f"{names(one)}; a launch per row for {names(per_row)}; not through run_alloc_rows: "
+                  f"{names(python)}", flush = True)
+            with self.subTest(device = device):
+                self.assertTrue(one.get(device), f"no linear on {device} was one launch for its rows")
+        print(f" -- exact rows: one-launch linears also on the real activations of {', '.join(sorted(real)) or 'NONE'}",
+              flush = True)
+        self.assertTrue(real, "no linear was tested on real activations")
+
+    @torch.inference_mode()
+    def test_one_launch_grouped_output_projection(self):
+        # exl3_mgemm_rows against the one-row grouped call, as _project_o_grouped makes it, under
+        # both settings of EXL3_INT8_GEMV: the grouped call never takes the int8 path, so the rows
+        # are one launch under either
+        self.need(CAP_MGEMM | CAP_ONE_LAUNCH)
+        self.captured_linear_inputs()
+        ext = self.ext
+        for device in self.devices:
+            at = self.first(device, lambda blk: True).attn
+            G, width = at.o_groups, at.num_q_heads // at.o_groups * at.head_dim
+            if not at.woa_multi_ready and at.device is not None:
+                at._build_woa_multi()
+            mu = at.wo_a_multi
+            self.assertIsNotNone(mu, f"L{at.layer_idx}: the grouped GEMM does not serve wo_a")
+            self.assertEqual(width, mu.in_features)
+            n = mu.out_features
+            ah = torch.empty((G, 1, width), dtype = torch.half, device = device)
+            real = self.real_woa.get(str(device))
+            self.assertIsNotNone(real, f"the forward's grouped projection was not captured on {device}")
+            self.assertIs(real[0], at)
+            for setting in ("0", self.int8_on):
+                for K in ROWS:
+                    inputs = [("random rows", self.randn((G, K, width), device))]
+                    if K <= real[1].shape[1]:
+                        inputs.append(("real activations", real[1][:, :K].contiguous()))
+                    for kind, out in inputs:
+                        what = f"wo_a L{at.layer_idx} @ {device}, {kind}, K={K}, EXL3_INT8_GEMV={setting}"
+                        with self.subTest(layer = at.layer_idx, device = str(device), K = K, input = kind,
+                                          int8 = setting), int8_gemv(setting):
+                            ones = []
+                            for j in range(K):
+                                C1 = torch.empty((G, 1, n), dtype = torch.half, device = device)
+                                tag = ext.exl3_mgemm(
+                                    out[:, j:j + 1].contiguous(), mu.ptrs_trellis, C1, mu.ptrs_suh, ah, mu.ptrs_svh,
+                                    at.woa_indices, None, mu.K, -1, mu.mcg, mu.mul1, -1, -1, 0, 1, None, None)
+                                self.assertIn(int(tag), range(1, 5), what)
+                                ones.append(C1.reshape(-1).clone())
+                            A = out.transpose(0, 1).contiguous()
+                            C = torch.empty((K, G, n), dtype = torch.half, device = device)
+                            rows = lambda: ext.exl3_mgemm_rows(A, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh,
+                                                               at.woa_indices, mu.K, mu.mcg, mu.mul1)
+                            _, grew = self.launches(rows)
+                            if not grew:
+                                print(f" -- exact rows: {what}: the first call was not one launch, repeated", flush = True)
+                                self.same_rows(f"{what} (launch per row)", C.reshape(K, -1).clone(), ones)
+                                _, grew = self.launches(rows)
+                            self.assertEqual(grew, 1, f"{what}: one-launch calls of exl3_mgemm_rows")
+                            self.same_rows(what, C.reshape(K, -1), ones)
 
     def moe_layers(self, device):
         """A layer whose experts are in the expert cache and a resident one, where the device has them."""

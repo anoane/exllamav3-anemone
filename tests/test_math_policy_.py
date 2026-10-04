@@ -185,8 +185,11 @@ class ExactRowsTests(unittest.TestCase):
                     self.exact_rows_caps = lambda: caps
         policy = load({})
         self.assertEqual((policy.EXACT_ROWS_CAP_LINEAR, policy.EXACT_ROWS_CAP_MGEMM, policy.EXACT_ROWS_CAP_ROUTER,
-                          policy.EXACT_ROWS_CAP_MOE, policy.EXACT_ROWS_CAP_HC), (1, 2, 4, 8, 16))
-        for caps, enabled, expected in ((None, True, 0), (31, False, 0), (31, True, 31), (0, True, 0), (5, True, 5)):
+                          policy.EXACT_ROWS_CAP_MOE, policy.EXACT_ROWS_CAP_HC, policy.EXACT_ROWS_CAP_ONE_LAUNCH),
+                         (1, 2, 4, 8, 16, 32))
+        # 63: an extension that also makes one launch for the rows of a linear; the bit passes through
+        for caps, enabled, expected in ((None, True, 0), (31, False, 0), (31, True, 31), (0, True, 0), (5, True, 5),
+                                        (63, True, 63)):
             with self.subTest(caps = caps, enabled = enabled):
                 self.assertEqual(policy.exact_rows_native(Ext(caps), enabled), expected)
         # the import-time constant is the default
