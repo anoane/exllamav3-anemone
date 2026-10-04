@@ -175,8 +175,20 @@ def check_forward_rows():
     # a strided input reaches fn row by row too
     x = torch.arange(40, dtype = torch.float).reshape(4, 10)[:, ::2]
     assert torch.equal(forward_rows(lambda row: row * 2, x), x * 2)
+    # copy = False: the results of an fn that allocates its own are concatenated; one that returns
+    # its buffer is caught (an assert: not under python -O)
+    x = torch.arange(20, dtype = torch.float).reshape(1, 4, 5)
+    y = forward_rows(lambda row: row[..., :3] * 2, x, copy = False)
+    assert y.shape == (1, 4, 3) and torch.equal(y, x[..., :3] * 2), y
+    if __debug__:
+        try:
+            forward_rows(lambda row: buf.view(1, 1, 3), x, copy = False)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("forward_rows(copy = False) accepted an fn that returns one buffer")
     print("  OK  forward_rows: (1, D) and (1, 1, D) rows, the input's leading shape, the results' dtype, "
-          "distinct rows from a reused result buffer")
+          "distinct rows from a reused result buffer; copy = False concatenates and refuses such a buffer")
 
 
 # per-forward keys prepare_inputs must set fresh on every call

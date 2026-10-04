@@ -630,9 +630,11 @@ class Linear(Module):
 
         # EXL3_EXACT_ROWS: a flagged forward (params["exact_rows"], set by the model per forward)
         # projects one row per call, each the complete one-row call below. The kernel, its
-        # activation format and its launch configuration follow the row count of a call
+        # activation format and its launch configuration follow the row count of a call. Every
+        # path below returns a tensor it allocated in the call (LinearEXL3.forward and
+        # BC_LinearEXL3::run_alloc, LinearFP16.forward), so the rows are concatenated, not copied
         if EXACT_ROWS and params.get("exact_rows") and x.numel() > x.shape[-1]:
-            return forward_rows(lambda row: self.forward(row, params, out_dtype), x)
+            return forward_rows(lambda row: self.forward(row, params, out_dtype), x, copy = False)
 
         # When in_features is padded past the incoming activation width (dims not a multiple of
         # pad_to, e.g. gpt-oss hidden_size 2880), zero-extend the input. The padded weight rows

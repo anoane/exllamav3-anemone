@@ -189,16 +189,25 @@ def to2(
     return x
 
 
-def forward_rows(fn, x: torch.Tensor) -> torch.Tensor:
+def forward_rows(fn, x: torch.Tensor, copy: bool = True) -> torch.Tensor:
     """
     fn on every row of x (a row = one index of the leading dims, the last dim is the width), one
     call per row, the results stacked in x's leading shape. fn gets the row with x's number of
     dims, each leading dim 1: the tensor a one-row call passes (EXL3_EXACT_ROWS). Each result is
     copied out before the next call, since fn may return a view of a buffer it reuses.
+
+    copy = False is for an fn that returns a tensor of its own on every call: the results are
+    kept and concatenated once, which saves one copy per row.
     """
     lead, d = x.shape[:-1], x.shape[-1]
     assert lead and x.numel() > 0, f"forward_rows: no rows in {tuple(x.shape)}"
     rows = x.reshape(-1, *((1,) * (len(lead) - 1)), d)
+    if not copy:
+        ys = [fn(rows[r:r + 1]) for r in range(rows.shape[0])]
+        # two results at one address: fn returned its buffer, and every row would read the last one
+        assert len({y.data_ptr() for y in ys}) == len(ys), "forward_rows: fn reuses its result, pass copy = True"
+        out = torch.cat(ys, dim = 0)
+        return out.view(*lead, out.shape[-1])
     out = None
     for r in range(rows.shape[0]):
         y = fn(rows[r:r + 1])
