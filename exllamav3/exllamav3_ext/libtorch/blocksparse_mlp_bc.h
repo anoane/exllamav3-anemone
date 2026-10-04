@@ -112,7 +112,8 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
 .def_readonly("act_silu_ref", &BC_BlockSparseMLP::act_silu_ref)
 .def_readonly("sh_coop", &BC_BlockSparseMLP::sh_coop)
 .def("run_bszN", &BC_BlockSparseMLP::run_bszN)
-.def("run_bszN_rows", &BC_BlockSparseMLP::run_bszN_rows)
+.def("run_bszN_rows", &BC_BlockSparseMLP::run_bszN_rows,
+     py::arg("y"), py::arg("selected_experts"), py::arg("routing_weights"), py::arg("grouped") = false)
 .def("rows_exact_ok", &BC_BlockSparseMLP::rows_exact_ok)
 .def("rows_grouped", &BC_BlockSparseMLP::rows_grouped)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)

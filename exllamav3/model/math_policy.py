@@ -189,12 +189,12 @@ EXACT_ROWS_CAP_HC = 16          # hc_collapse_rows, hc_partials_rows
 # With the int8 path on they launch per row. Tests and tools/dsv41_rowprobe.py read both
 EXACT_ROWS_CAP_ONE_LAUNCH = 32
 EXACT_ROWS_CAP_HGEMM = 64       # hgemm_rows
-# Not an entry point, and nothing here selects by it: on the GPU types that launch was verified on,
-# run_bszN_rows groups the rows that picked one expert, as an unflagged call does, with the tile of
-# a one-row call (BC_BlockSparseMLP.rows_grouped says for a layer, exact_rows_served counts)
+# An argument of run_bszN_rows: on the GPU types that launch was verified on, the rows that picked
+# one expert are grouped, as in an unflagged call, with the tile of a one-row call
+# (BC_BlockSparseMLP.rows_grouped says for a layer, exact_rows_served counts the launch pairs)
 EXACT_ROWS_CAP_MOE_GROUPED = 128
-# Not an entry point either: routing_ds3_nogroup_rows projects the rows with one launch of the FMA
-# GEMV where a one-row call is that GEMV (exact_rows_served counts the calls)
+# An argument of routing_ds3_nogroup_rows: the rows are projected with one launch of the FMA GEMV
+# where a one-row call is that GEMV (exact_rows_served counts the calls)
 EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH = 256
 
 # EXL3_EXACT_ROWS: the term counts below which a torch sum over the rows of a flagged call is

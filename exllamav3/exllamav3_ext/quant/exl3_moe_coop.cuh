@@ -82,22 +82,23 @@ struct MoeCoopParams
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
 // 1 mcg, 2 mul1 codebook, uniform across the three projections.
 // exact_rows (EXL3_EXACT_ROWS, exact_rows.h): the launch covers every row with the kernel instances
-// of a one-row call: the tile and the split-k factor chosen from the topk slots of one row. Where
-// exl3_moe_coop_rows_grouped holds, the slots are launched as an unflagged call launches them: the
-// rotation launch, and the slots that picked one expert as the rows of one tile (a_global true).
+// of a one-row call: the tile and the split-k factor chosen from the topk slots of one row. With
+// rows_grouped, where exl3_moe_coop_rows_grouped holds for the device, the slots are launched as an
+// unflagged call launches them: the rotation launch, and the slots that picked one expert as the
+// rows of one tile (a_global true).
 // With the tile fixed, a slot's result does not depend on that: the rotation launch and the
 // in-block rotation run the same rotate_chunk on the same row, a row of a run sits at a fragment
 // row of its own (rows past the run and rows 8 to 15 are zero), every accumulation, fold and
 // cross-warp sum is per (row, column), and the epilogues are per (slot, chunk) and per (token,
-// chunk). Everywhere else the slots stay ungrouped and rotated in-block (a_global false, no rot
-// launch): a block then computes its slot exactly as the block of that slot does in the row's own
-// one-row launch
+// chunk). Without rows_grouped, and on every other device, the slots stay ungrouped and rotated
+// in-block (a_global false, no rot launch): a block then computes its slot exactly as the block of
+// that slot does in the row's own one-row launch. rows_grouped without exact_rows changes nothing
 void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
-                          bool exact_rows = false);
+                          bool exact_rows = false, bool rows_grouped = false);
 
-// Whether an exact_rows launch on CUDA device `device` groups the rows (above): the GPU types on
-// which rows sharing a tensor-core tile are compared bit for bit with one-row calls
-// (exact_rows.h, exact_rows_device_ok). Counted per launch in exact_rows_served
+// Whether an exact_rows launch with rows_grouped on CUDA device `device` groups the rows (above):
+// the GPU types on which rows sharing a tensor-core tile are compared bit for bit with one-row
+// calls (exact_rows.h, exact_rows_device_ok). Counted per launch in exact_rows_served
 // (EXACT_ROWS_CAP_MOE_GROUPED)
 bool exl3_moe_coop_rows_grouped(int device);
 
@@ -135,13 +136,14 @@ MoeCoopParams exl3_moe_coop_prepare
 );
 
 // Per-call part: input rows, routing, optional shared-expert output (bsz rows, width H), launch
-// (exact_rows: see exl3_moe_coop_launch)
+// (exact_rows, rows_grouped: see exl3_moe_coop_launch)
 void exl3_moe_coop_run
 (
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out,
-    bool exact_rows = false
+    bool exact_rows = false,
+    bool rows_grouped = false
 );
 
 // Tensor front end (prepare + run; the test entry point)

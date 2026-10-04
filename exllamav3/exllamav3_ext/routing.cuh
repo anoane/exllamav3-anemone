@@ -27,8 +27,9 @@ void routing_ds3_nogroup
 );
 
 // EXL3_EXACT_ROWS (exact_rows.h): routing_ds3_nogroup for 2 to EXACT_ROWS_MAX rows, every row
-// projected as a one-row call projects it (one launch of the FMA GEMV for the rows where that call
-// is the GEMV, else the one-row call per row); the selection is the one launch for all rows
+// projected as a one-row call projects it: the one-row call per row, or with one_launch
+// (EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH) one launch of the FMA GEMV for the rows where a one-row call is
+// that GEMV; the selection is the one launch for all rows
 void routing_ds3_nogroup_rows
 (
     const at::Tensor& hidden,
@@ -41,7 +42,8 @@ void routing_ds3_nogroup_rows
     const c10::optional<at::Tensor>& gate_t,
     const int act_fn,
     const c10::optional<at::Tensor>& gate_i8,
-    const c10::optional<at::Tensor>& gate_sb
+    const c10::optional<at::Tensor>& gate_sb,
+    const bool one_launch = false
 );
 
 void routing_ds3_nogroup_logits

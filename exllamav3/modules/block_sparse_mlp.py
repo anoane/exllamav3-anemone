@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..model.math_policy import (
     FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC, require_whole_k_moe,
-    EXACT_ROWS, EXACT_ROWS_CAP_MOE, exact_rows_native,
+    EXACT_ROWS, EXACT_ROWS_CAP_MOE, EXACT_ROWS_CAP_MOE_GROUPED, exact_rows_native,
 )
 from ..util.tensor import to2
 from . import Module, Linear
@@ -1397,16 +1397,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
             assert bszn_eligible
             if EXACT_ROWS and bsz > 1 and params.get("exact_rows"):
                 # EXL3_EXACT_ROWS: the launch covers the rows with the kernel instances of a one-row
-                # call (the tile of one row's slots), the rows grouped by expert only on the GPU
-                # types that was verified on (bc.rows_grouped). The caller sends a flagged call of
-                # several rows here only when that serves the layer (DSV41MoE.rows_native); the
-                # launch below sizes its tile from all slots and would not give one-row bits
+                # call (the tile of one row's slots); with an extension that reports
+                # EXACT_ROWS_CAP_MOE_GROUPED the rows are grouped by expert, on the GPU types that
+                # was verified on (bc.rows_grouped). The caller sends a flagged call of several rows
+                # here only when that serves the layer (DSV41MoE.rows_native); the launch below
+                # sizes its tile from all slots and would not give one-row bits
                 if not (ROWS_NATIVE & EXACT_ROWS_CAP_MOE):
                     raise RuntimeError(
                         f"{self.key}: EXL3_EXACT_ROWS=1: a flagged call of {bsz} rows reached the fused "
                         f"decode kernels, and this build of exllamav3_ext has no run_bszN_rows; such a "
                         f"call must be computed one row at a time")
-                self.bc.run_bszN_rows(y, selected_experts, routing_weights)
+                if ROWS_NATIVE & EXACT_ROWS_CAP_MOE_GROUPED:
+                    self.bc.run_bszN_rows(y, selected_experts, routing_weights, True)
+                else:
+                    self.bc.run_bszN_rows(y, selected_experts, routing_weights)
             else:
                 self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)

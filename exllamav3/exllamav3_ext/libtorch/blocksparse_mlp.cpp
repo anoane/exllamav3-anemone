@@ -123,14 +123,15 @@ void BC_BlockSparseMLP::run_bszN_rows
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
-    at::Tensor& routing_weights
+    at::Tensor& routing_weights,
+    bool grouped
 )
 {
     // run_bszN with exact_rows on both launches: the shared expert's one-expert launch and the
     // routed launch each cover all rows with the kernel instances, tile and split-k factor of a
-    // one-row call. Where rows_grouped holds they are launched as run_bszN launches them (the
-    // rotation launch, the rows that picked one expert as one run: the shared expert is read once
-    // for the rows); elsewhere slot by slot, with no rotation launch and no grouping
+    // one-row call. With grouped, where rows_grouped holds, they are launched as run_bszN launches
+    // them (the rotation launch, the rows that picked one expert as one run: the shared expert is
+    // read once for the rows); otherwise slot by slot, with no rotation launch and no grouping
     TORCH_CHECK(y.dim() == 2 && y.is_contiguous(), "run_bszN_rows: y must be a contiguous (rows, H) tensor");
     TORCH_CHECK_DTYPE(y, kHalf);
     const int64_t rows = y.size(0);
@@ -171,10 +172,10 @@ void BC_BlockSparseMLP::run_bszN_rows
     if (sh_coop)
     {
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
-        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt, true);
+        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt, true, grouped);
         sh_o = out_d_sh_n;
     }
-    exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, true);
+    exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, true, grouped);
 }
 
 BC_BlockSparseMLP::BC_BlockSparseMLP

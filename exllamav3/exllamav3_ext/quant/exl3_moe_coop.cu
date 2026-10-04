@@ -152,7 +152,7 @@ bool exl3_moe_coop_rows_grouped(int device)
 }
 
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
-                          bool exact_rows)
+                          bool exact_rows, bool rows_grouped)
 {
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
@@ -160,12 +160,12 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const int nproj = p.gated ? 2 : 1;
     // exact_rows: the values a one-row call computes from its topk slots and that select a kernel
     // instance or a reduction order are pinned to them (the tile, the split-k factor); the grids
-    // below still cover every slot of the call. The rows are grouped and rotated by the rotation
-    // launch, as in an unflagged call, where exl3_moe_coop_rows_grouped holds; else every slot is a
-    // run of its own, rotated in-block as in a one-row call
+    // below still cover every slot of the call. With rows_grouped the rows are grouped and rotated
+    // by the rotation launch, as in an unflagged call, where exl3_moe_coop_rows_grouped holds; else
+    // every slot is a run of its own, rotated in-block as in a one-row call
     TORCH_CHECK(!exact_rows || (p.bsz >= 1 && p.topk >= 1), "exl3_moe_coop: a row-exact call without rows or picks");
     const int geo_slots = exact_rows ? p.topk : slots;
-    p.a_global = p.bsz > 1 && (!exact_rows || exl3_moe_coop_rows_grouped(device));
+    p.a_global = p.bsz > 1 && (!exact_rows || (rows_grouped && exl3_moe_coop_rows_grouped(device)));
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, geo_slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, geo_slots, device);
@@ -323,7 +323,8 @@ void exl3_moe_coop_run
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out,
-    bool exact_rows
+    bool exact_rows,
+    bool rows_grouped
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -351,7 +352,7 @@ void exl3_moe_coop_run
     }
     else
         p.sh_gate_w = nullptr;
-    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, exact_rows);
+    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, exact_rows, rows_grouped);
 }
 
 void exl3_moe_coop

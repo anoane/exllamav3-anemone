@@ -104,7 +104,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
-    m.def("routing_ds3_nogroup_rows", &routing_ds3_nogroup_rows, "routing_ds3_nogroup_rows");
+    m.def("routing_ds3_nogroup_rows", &routing_ds3_nogroup_rows, "routing_ds3_nogroup_rows",
+          py::arg("hidden"), py::arg("gate"), py::arg("scores"), py::arg("bias"), py::arg("topk_indices"),
+          py::arg("topk_weights"), py::arg("scaling_factor"), py::arg("gate_t"), py::arg("act_fn"),
+          py::arg("gate_i8"), py::arg("gate_sb"), py::arg("one_launch") = false);
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
     m.def("moe_split_map", &moe_split_map, "moe_split_map");

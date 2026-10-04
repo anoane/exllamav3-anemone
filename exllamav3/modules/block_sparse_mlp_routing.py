@@ -12,7 +12,9 @@ from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
-from ..model.math_policy import EXACT_ROWS, EXACT_ROWS_CAP_ROUTER, exact_rows_native
+from ..model.math_policy import (
+    EXACT_ROWS, EXACT_ROWS_CAP_ROUTER, EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH, exact_rows_native,
+)
 
 ROUTING_CACHE_ROWS = 128
 
@@ -330,10 +332,10 @@ def _routing_sqrtsp_vl(cfg, y, vl, hash_sel):
 
 def _routing_sqrtsp_rows(cfg, y, router_logits, selected_experts, routing_weights):
     """EXL3_EXACT_ROWS: routing_sqrtsp for a flagged call of several rows (params["exact_rows"]).
-    One native call projects every row with the kernel of a one-row call (the FP32 GEMV, one launch
-    for the rows with an extension that reports EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH; a call of several
-    rows otherwise takes the int8 projection) and selects for all rows in the one top-k launch,
-    whose blocks each read and write one row. There is no fallback here: without the entry
+    One native call projects every row with the kernel of a one-row call (the FP32 GEMV: a launch
+    per row, or one launch for the rows with an extension that reports
+    EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH; a call of several rows otherwise takes the int8 projection)
+    and selects for all rows in the one top-k launch, whose blocks each read and write one row. There is no fallback here: without the entry
     point the caller routes one row per call (DSV41MoE.forward), and a flagged call of several rows
     that arrives anyway is refused."""
     if not (ROWS_NATIVE & EXACT_ROWS_CAP_ROUTER):
@@ -341,7 +343,7 @@ def _routing_sqrtsp_rows(cfg, y, router_logits, selected_experts, routing_weight
             f"routing: EXL3_EXACT_ROWS=1: a flagged call of {y.shape[0]} rows reached the router, whose "
             f"projection of several rows is not the one a one-row step makes, and this build of exllamav3_ext "
             f"has no routing_ds3_nogroup_rows; such a call must be routed one row at a time")
-    ext.routing_ds3_nogroup_rows(
+    args = (
         y,
         cfg.gate_tensor,
         router_logits,
@@ -354,6 +356,10 @@ def _routing_sqrtsp_rows(cfg, y, router_logits, selected_experts, routing_weight
         cfg.gate_i8,
         cfg.gate_sb,
     )
+    if ROWS_NATIVE & EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH:
+        ext.routing_ds3_nogroup_rows(*args, True)
+    else:
+        ext.routing_ds3_nogroup_rows(*args)
     return selected_experts, routing_weights
 
 

@@ -714,10 +714,10 @@ routed_scaling_factor: float32
 act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
 
 exact_rows (EXL3_EXACT_ROWS, exact_rows.h; routing_ds3_nogroup_rows): a call of 2 to EXACT_ROWS_MAX
-rows projects every row as a one-row call does, in place of the multi-row projection: where that
-call is the FMA GEMV (the transposed gate serves it), one launch of it for the rows
-(routing_gemv, one_row_route; counted in exact_rows_served, EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH), else
-a routing_gemv call per row on one-row views.
+rows projects every row as a one-row call does, in place of the multi-row projection: with
+one_launch, where that call is the FMA GEMV (the transposed gate serves it), one launch of it for
+the rows (routing_gemv, one_row_route; counted in exact_rows_served,
+EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH), else a routing_gemv call per row on one-row views.
 The top-k launch is the same for both: one block per row, which reads and writes that row only.
 */
 
@@ -734,7 +734,8 @@ static void routing_ds3_nogroup_impl
     const int act_fn,
     const c10::optional<at::Tensor>& gate_i8,
     const c10::optional<at::Tensor>& gate_sb,
-    const bool exact_rows
+    const bool exact_rows,
+    const bool one_launch
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -788,7 +789,7 @@ static void routing_ds3_nogroup_impl
                         "routing_ds3_nogroup_rows: bias must be contiguous FP16, one entry per expert, on the device of scores");
         }
 
-        if (routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream, true))
+        if (one_launch && routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream, true))
             exact_rows_count_served(EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH);
         else
         {
@@ -862,7 +863,7 @@ void routing_ds3_nogroup
 {
     routing_ds3_nogroup_impl
     (
-        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, false
+        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, false, false
     );
 }
 
@@ -878,12 +879,13 @@ void routing_ds3_nogroup_rows
     const c10::optional<at::Tensor>& gate_t,
     const int act_fn,
     const c10::optional<at::Tensor>& gate_i8,
-    const c10::optional<at::Tensor>& gate_sb
+    const c10::optional<at::Tensor>& gate_sb,
+    const bool one_launch
 )
 {
     routing_ds3_nogroup_impl
     (
-        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, true
+        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, true, one_launch
     );
 }
 

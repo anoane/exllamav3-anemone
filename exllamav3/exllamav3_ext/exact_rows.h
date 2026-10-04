@@ -24,14 +24,15 @@
 // else, and for every call with the int8 path on
 #define EXACT_ROWS_CAP_ONE_LAUNCH 32
 #define EXACT_ROWS_CAP_HGEMM 64     // hgemm_rows
-// Not an entry point: on the GPU types of exact_rows_device_ok, run_bszN_rows launches the rows as an
-// unflagged call does (the rotation launch, the slots that picked one expert as rows of one tile),
-// with the tile and the split-k factor of a one-row call (quant/exl3_moe_coop.cuh,
-// exl3_moe_coop_rows_grouped). A launch per slot, rotated in-block, everywhere else
+// An argument of run_bszN_rows (grouped): on the GPU types of exact_rows_device_ok the rows are
+// launched as an unflagged call launches them (the rotation launch, the slots that picked one expert
+// as rows of one tile), with the tile and the split-k factor of a one-row call
+// (quant/exl3_moe_coop.cuh, exl3_moe_coop_rows_grouped). Without the argument, and on every other
+// device, a launch per slot, rotated in-block
 #define EXACT_ROWS_CAP_MOE_GROUPED 128
-// Not an entry point: routing_ds3_nogroup_rows projects the rows with one launch of the FMA GEMV
-// where a one-row call is that GEMV (routing.cu, routing_gemv with one_row_route). A launch per
-// row where the one-row call is anything else
+// An argument of routing_ds3_nogroup_rows (one_launch): the rows are projected with one launch of
+// the FMA GEMV where a one-row call is that GEMV (routing.cu, routing_gemv with one_row_route).
+// Without the argument, and where the one-row call is anything else, a launch per row
 #define EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH 256
 
 // exl3_gemm_gr and exl3_mgemm_gr with one_row_route: nothing was launched, the caller makes the

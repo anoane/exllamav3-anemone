@@ -173,20 +173,23 @@ struct BC_BlockSparseMLP
 
     // EXL3_EXACT_ROWS (exact_rows.h): run_bszN for 2 to EXACT_ROWS_MAX rows, launched so that every
     // row gets the bits of a one-row call: the kernel instances, tile and split-k factor of that
-    // call, the rows grouped by expert where rows_grouped holds (exl3_moe_coop_launch, exact_rows)
+    // call. grouped (EXACT_ROWS_CAP_MOE_GROUPED): the rows that picked one expert are one run, as in
+    // run_bszN, where rows_grouped holds; without it every slot is launched on its own
+    // (exl3_moe_coop_launch, exact_rows)
     void run_bszN_rows
     (
         const at::Tensor& y,
         at::Tensor& selected_experts,
-        at::Tensor& routing_weights
+        at::Tensor& routing_weights,
+        bool grouped = false
     );
 
     // Whether run_bszN_rows serves this module at every row count up to EXACT_ROWS_MAX, topk picks
     // per row: the shared expert, if any, is a fused launch, and the rows fit the scratch
     bool rows_exact_ok(int topk);
 
-    // Whether run_bszN_rows groups the rows that picked one expert on this module's device
-    // (exl3_moe_coop_rows_grouped), or launches every slot on its own
+    // Whether run_bszN_rows with grouped groups the rows that picked one expert on this module's
+    // device (exl3_moe_coop_rows_grouped), or launches every slot on its own
     bool rows_grouped();
 
     void run_single_expert_gr
