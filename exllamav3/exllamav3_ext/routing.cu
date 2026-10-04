@@ -9,6 +9,7 @@
 #include "hgemm.cuh"
 #include "stable_arithmetic.h"
 #include "exact_rows.h"
+#include <climits>
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 32
@@ -208,8 +209,12 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
 // expert; cheaper than a cublas call at this size
 #define RGEMV_WARPS 8
 
-__global__ __launch_bounds__(RGEMV_WARPS * 32)
-void routing_gemv_kernel
+// The warp of the GEMV: the score of the expert it owns (blockIdx.x * RGEMV_WARPS + warp) for one
+// row of x. Every lane runs a sequential chain of explicit FMAs over its own elements, then a
+// fixed shuffle tree adds the 32 lanes: a score is a function of that row of x, that row of gate_t
+// and k, and of nothing else in the launch (no shared memory, no block-wide state, E only bounds
+// the expert). Shared by the one-row kernel and the kernel of several rows below
+__device__ __forceinline__ void routing_gemv_warp
 (
     const half* __restrict__ x,         // (k)
     const half* __restrict__ gate_t,    // (E, k)
@@ -242,7 +247,41 @@ void routing_gemv_kernel
         scores[row] = __float2half_rn(sum);
 }
 
-void routing_gemv
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_kernel
+(
+    const half* __restrict__ x,         // (k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (E)
+    const int k,
+    const int E
+)
+{
+    routing_gemv_warp(x, gate_t, scores, k, E);
+}
+
+// EXL3_EXACT_ROWS (exact_rows.h): the GEMV for the rows of a call in one launch, grid
+// (expert blocks, rows). Block (b, r) is block b of the one-row launch on row r: the same warp
+// function on x + r * k and scores + r * E
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_rows_kernel
+(
+    const half* __restrict__ x,         // (rows, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (rows, E)
+    const int k,
+    const int E
+)
+{
+    routing_gemv_warp(x + (size_t) blockIdx.y * k, gate_t, scores + (size_t) blockIdx.y * E, k, E);
+}
+
+// one_row_route (EXL3_EXACT_ROWS): hidden holds 2 to EXACT_ROWS_MAX contiguous rows, and the
+// dispatch below is the one of a one-row call. Where that call is the FMA GEMV, one launch
+// computes every row with it and the function returns true. Where it is anything else (the int8
+// projection, cuBLAS), nothing is launched and it returns false: the caller makes the one-row
+// calls. Without one_row_route it always returns true
+bool routing_gemv
 (
     const at::Tensor& hidden,
     const at::Tensor& gate,
@@ -250,7 +289,8 @@ void routing_gemv
     const c10::optional<at::Tensor>& gate_i8,
     const c10::optional<at::Tensor>& gate_sb,
     at::Tensor& scores,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const bool one_row_route = false
 )
 {
     // Single rows take the fixed-order FMA GEMV (exact on every architecture, and the fastest);
@@ -266,15 +306,32 @@ void routing_gemv
     // other row counts do (in fixed 128-row tiles under the profile), not the GEMV
     int k = hidden.size(-1);
     int E = scores.size(-1);
-    bool bsz1 = hidden.numel() == k;
+    bool bsz1 = one_row_route || hidden.numel() == k;
 
     if ((!bsz1 || stable_arithmetic()) && gate_i8.has_value() && gate_sb.has_value() &&
         routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
+        if (one_row_route) return false;
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
     else if (bsz1 && !stable_arithmetic() && gate_t.has_value() && !(k & 1))
     {
+        if (one_row_route)
+        {
+            const int64_t rows = scores.size(0);
+            TORCH_CHECK(hidden.dim() == 2 && scores.dim() == 2 && hidden.size(0) == rows &&
+                        rows >= 2 && rows <= EXACT_ROWS_MAX && hidden.is_contiguous() && scores.is_contiguous(),
+                        "routing_gemv: one_row_route takes 2 to ", EXACT_ROWS_MAX, " contiguous rows of hidden and scores");
+            const dim3 grid(CEIL_DIVIDE(E, RGEMV_WARPS), (unsigned int) rows);
+            routing_gemv_rows_kernel<<<grid, RGEMV_WARPS * 32, 0, stream>>>
+            (
+                (const half*) hidden.data_ptr(),
+                (const half*) gate_t.value().data_ptr(),
+                (half*) scores.data_ptr(),
+                k, E
+            );
+            return true;
+        }
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (
             (const half*) hidden.data_ptr(),
@@ -285,8 +342,10 @@ void routing_gemv
     }
     else
     {
+        if (one_row_route) return false;
         hgemm(hidden, gate, scores);
     }
+    return true;
 }
 
 
@@ -655,8 +714,10 @@ routed_scaling_factor: float32
 act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
 
 exact_rows (EXL3_EXACT_ROWS, exact_rows.h; routing_ds3_nogroup_rows): a call of 2 to EXACT_ROWS_MAX
-rows projects every row with a routing_gemv call of its own on one-row views, the launch a one-row
-call makes (the FMA GEMV where the transposed gate serves it) in place of the multi-row projection.
+rows projects every row as a one-row call does, in place of the multi-row projection: where that
+call is the FMA GEMV (the transposed gate serves it), one launch of it for the rows
+(routing_gemv, one_row_route; counted in exact_rows_served, EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH), else
+a routing_gemv call per row on one-row views.
 The top-k launch is the same for both: one block per row, which reads and writes that row only.
 */
 
@@ -700,6 +761,7 @@ static void routing_ds3_nogroup_impl
         TORCH_CHECK_DTYPE(scores, kHalf);
         TORCH_CHECK_SHAPES(hidden, -1, gate, 0, 1);
         TORCH_CHECK_SHAPES(gate, 1, scores, -1, 1);
+        TORCH_CHECK(hidden.size(1) >= 1 && hidden.size(1) <= INT_MAX, "routing_ds3_nogroup_rows: the width of hidden is out of range");
         TORCH_CHECK(scores.is_cuda() && hidden.device() == scores.device() && gate.device() == scores.device(),
                     "routing_ds3_nogroup_rows: hidden, gate and scores must be on one CUDA device");
         if (gate_t.has_value())
@@ -726,10 +788,15 @@ static void routing_ds3_nogroup_impl
                         "routing_ds3_nogroup_rows: bias must be contiguous FP16, one entry per expert, on the device of scores");
         }
 
-        for (int64_t r = 0; r < rows; ++r)
+        if (routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream, true))
+            exact_rows_count_served(EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH);
+        else
         {
-            at::Tensor scores_r = scores.slice(0, r, r + 1);
-            routing_gemv(hidden.slice(0, r, r + 1), gate, gate_t, gate_i8, gate_sb, scores_r, stream);
+            for (int64_t r = 0; r < rows; ++r)
+            {
+                at::Tensor scores_r = scores.slice(0, r, r + 1);
+                routing_gemv(hidden.slice(0, r, r + 1), gate, gate_t, gate_i8, gate_sb, scores_r, stream);
+            }
         }
     }
     else

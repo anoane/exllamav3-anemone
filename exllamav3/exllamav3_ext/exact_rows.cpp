@@ -6,11 +6,13 @@
 
 static std::atomic<uint64_t> one_launches{0};
 static std::atomic<uint64_t> moe_grouped{0};
+static std::atomic<uint64_t> router_one_launches{0};
 
 int exact_rows_caps()
 {
     return EXACT_ROWS_CAP_LINEAR | EXACT_ROWS_CAP_MGEMM | EXACT_ROWS_CAP_ROUTER | EXACT_ROWS_CAP_MOE |
-           EXACT_ROWS_CAP_HC | EXACT_ROWS_CAP_ONE_LAUNCH | EXACT_ROWS_CAP_HGEMM | EXACT_ROWS_CAP_MOE_GROUPED;
+           EXACT_ROWS_CAP_HC | EXACT_ROWS_CAP_ONE_LAUNCH | EXACT_ROWS_CAP_HGEMM | EXACT_ROWS_CAP_MOE_GROUPED |
+           EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH;
 }
 
 bool exact_rows_device_ok(int device)
@@ -36,6 +38,7 @@ static std::atomic<uint64_t>* served_counter(int cap)
     switch (cap)
     {
         case EXACT_ROWS_CAP_MOE_GROUPED: return &moe_grouped;
+        case EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH: return &router_one_launches;
         default: return nullptr;
     }
 }

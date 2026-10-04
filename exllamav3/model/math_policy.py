@@ -193,6 +193,9 @@ EXACT_ROWS_CAP_HGEMM = 64       # hgemm_rows
 # run_bszN_rows groups the rows that picked one expert, as an unflagged call does, with the tile of
 # a one-row call (BC_BlockSparseMLP.rows_grouped says for a layer, exact_rows_served counts)
 EXACT_ROWS_CAP_MOE_GROUPED = 128
+# Not an entry point either: routing_ds3_nogroup_rows projects the rows with one launch of the FMA
+# GEMV where a one-row call is that GEMV (exact_rows_served counts the calls)
+EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH = 256
 
 # EXL3_EXACT_ROWS: the term counts below which a torch sum over the rows of a flagged call is
 # row-exact (exact_rows_sum): any width, and an odd width

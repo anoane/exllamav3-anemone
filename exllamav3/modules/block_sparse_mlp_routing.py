@@ -330,9 +330,10 @@ def _routing_sqrtsp_vl(cfg, y, vl, hash_sel):
 
 def _routing_sqrtsp_rows(cfg, y, router_logits, selected_experts, routing_weights):
     """EXL3_EXACT_ROWS: routing_sqrtsp for a flagged call of several rows (params["exact_rows"]).
-    One native call projects every row with the launch of a one-row call (the FP32 GEMV; a call of
-    several rows otherwise takes the int8 projection) and selects for all rows in the one top-k
-    launch, whose blocks each read and write one row. There is no fallback here: without the entry
+    One native call projects every row with the kernel of a one-row call (the FP32 GEMV, one launch
+    for the rows with an extension that reports EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH; a call of several
+    rows otherwise takes the int8 projection) and selects for all rows in the one top-k launch,
+    whose blocks each read and write one row. There is no fallback here: without the entry
     point the caller routes one row per call (DSV41MoE.forward), and a flagged call of several rows
     that arrives anyway is refused."""
     if not (ROWS_NATIVE & EXACT_ROWS_CAP_ROUTER):

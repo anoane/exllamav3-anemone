@@ -27,7 +27,8 @@ void routing_ds3_nogroup
 );
 
 // EXL3_EXACT_ROWS (exact_rows.h): routing_ds3_nogroup for 2 to EXACT_ROWS_MAX rows, every row
-// projected by the launch of a one-row call; the selection is the one launch for all rows
+// projected as a one-row call projects it (one launch of the FMA GEMV for the rows where that call
+// is the GEMV, else the one-row call per row); the selection is the one launch for all rows
 void routing_ds3_nogroup_rows
 (
     const at::Tensor& hidden,

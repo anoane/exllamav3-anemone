@@ -29,6 +29,10 @@
 // with the tile and the split-k factor of a one-row call (quant/exl3_moe_coop.cuh,
 // exl3_moe_coop_rows_grouped). A launch per slot, rotated in-block, everywhere else
 #define EXACT_ROWS_CAP_MOE_GROUPED 128
+// Not an entry point: routing_ds3_nogroup_rows projects the rows with one launch of the FMA GEMV
+// where a one-row call is that GEMV (routing.cu, routing_gemv with one_row_route). A launch per
+// row where the one-row call is anything else
+#define EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH 256
 
 // exl3_gemm_gr and exl3_mgemm_gr with one_row_route: nothing was launched, the caller makes the
 // one-row launches itself. Never a launch tag (those are 0 and up)
@@ -53,6 +57,8 @@ void exact_rows_count_one_launch();
 
 // Launches the other batched forms served since the extension was loaded, by capability bit:
 // EXACT_ROWS_CAP_MOE_GROUPED, the launch pairs of run_bszN_rows made with the rows grouped (the
-// shared expert's and the routed one count one each). 0 for a bit that counts nothing
+// shared expert's and the routed one count one each); EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH, the calls
+// of routing_ds3_nogroup_rows that projected their rows with one launch. 0 for a bit that counts
+// nothing
 uint64_t exact_rows_served(int cap);
 void exact_rows_count_served(int cap);
