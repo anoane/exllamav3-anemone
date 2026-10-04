@@ -716,23 +716,37 @@ class DSV41Engram(Module):
 
     # ---- forward ----
 
-    def _gate(self, h, key, eps):
+    def _gate(self, h, key, eps, per_token = False):
         """
         The gate of the tokens of h and key (B, L, H, D) fp32, (B, L, H): torch reductions over
         the call, whose layout follows its shape. forward's docstring has the formula.
+
+        per_token (EXL3_EXACT_ROWS): every token gets the bits of its one-token call. The three
+        reductions over D then run one token per call, each over the freshly allocated
+        (B, 1, H, D) pointwise result a one-token step reduces (the squares of the token's
+        slices of h and key, the product of its slices of h * qk and key); everything else is
+        elementwise and serves all tokens at once, in the expression order of a one-token call.
         """
         D = h.shape[-1]
-        rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
-        dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
+        if per_token and h.shape[1] > 1:
+            tokens = range(h.shape[1])
+            hq = h * self.qk
+            h2 = torch.cat([h[:, l:l + 1].square().mean(-1) for l in tokens], dim = 1)
+            k2 = torch.cat([key[:, l:l + 1].square().mean(-1) for l in tokens], dim = 1)
+            dots = torch.cat([(hq[:, l:l + 1] * key[:, l:l + 1]).sum(-1) for l in tokens], dim = 1)
+            rstd = torch.rsqrt(h2 + eps) * torch.rsqrt(k2 + eps)
+            dot = dots * rstd * D ** -0.5
+        else:
+            rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
+            dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
         return torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
 
     def _gate_rows(self, h, key, eps):
         """
-        EXL3_EXACT_ROWS: _gate one token per call, on the token's (B, 1, H, D) slices of h and
-        key: the operands of a one-token step, whose reductions run over freshly allocated
-        pointwise results.
+        EXL3_EXACT_ROWS: the gate of a flagged call of several tokens, every token with the bits
+        of the one-token call on its (B, 1, H, D) slices of h and key (_gate, per_token).
         """
-        return torch.cat([self._gate(h[:, l:l + 1], key[:, l:l + 1], eps) for l in range(h.shape[1])], dim = 1)
+        return self._gate(h, key, eps, True)
 
     def forward(self, x, params, out_dtype = None):
         """
