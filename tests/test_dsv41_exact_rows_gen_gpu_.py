@@ -33,14 +33,15 @@ the selection starts): compilation and the first use of a launch bucket, which t
 autotuner may time with another configuration, then fall in neither run of a case. --no-warmup
 skips them.
 
-An extension that reports the single launch (exact_rows_caps() & 32) serves the rows of an EXL3
-linear and of the grouped output projection with ONE launch, under the launch record of a one-row
-call, where that call is the cooperative FP16 kernel: the grouped projection always, a mul1 linear
-with EXL3_INT8_GEMV=0. The tokens and logits do not show which route ran, so each case also reads
-the extension's count of such calls (exact_rows_one_launches) around its drafted run: a run with
-verify forwards must have made some, and the count per verify forward is printed (with the int8
-path off, about the EXL3 linears and grouped projections of a forward; with it on, about the
-grouped projections). Run it under both settings, each with one autotune file:
+With EXL3_INT8_GEMV=0, an extension that reports the single launch (exact_rows_caps() & 32)
+serves the rows of an EXL3 linear and of the grouped output projection with ONE launch, under the
+launch record of a one-row call, where that call is the cooperative FP16 kernel and the GPU is of
+a type the launch was verified on (compute capability 8.0, 8.9 or 12.0). With the int8 path on it
+launches per row, as an extension without the single launch does. The tokens and logits do not
+show which route ran, so each case also reads the extension's count of such calls
+(exact_rows_one_launches) around its drafted run: with the int8 path off a run with verify
+forwards must have made some (about the EXL3 linears and grouped projections of a forward, per
+forward; printed), with it on none. Run it under both settings, each with one autotune file:
 
     EXL3_EXACT_ROWS=1 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
     EXL3_EXACT_ROWS=1 EXL3_INT8_GEMV=0 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
@@ -199,6 +200,11 @@ def main() -> int:
     from exllamav3.ext import exllamav3_ext as ext
     caps = int(ext.exact_rows_caps()) if hasattr(ext, "exact_rows_caps") else 0
     one_launches = (lambda: int(ext.exact_rows_one_launches())) if caps & 32 else None
+    # The extension makes it with EXL3_INT8_GEMV=0 only (it reads the variable as atoi does, unset
+    # is 2), and on these compute capabilities only (exl3_gemm_one_row_route_ok)
+    int8_off = int(os.environ.get("EXL3_INT8_GEMV", "2")) == 0
+    verified_gpu = any(tuple(torch.cuda.get_device_capability(i)) in ((8, 0), (8, 9), (12, 0))
+                       for i in range(torch.cuda.device_count()))
     print(f"  --  exact rows, generator: row-exact entry points of the extension: {caps or 'none'}; "
           f"EXL3_INT8_GEMV={os.environ.get('EXL3_INT8_GEMV', 'unset (2)')}; the rows of a linear or of the grouped "
           f"projection as one launch: {'counted' if one_launches else 'not in this extension'}", flush = True)
@@ -253,9 +259,13 @@ def main() -> int:
             if one_launches:
                 print(f"       one-launch calls of the drafted run: {served} in {verifies} verify forwards"
                       + (f" ({served / verifies:.1f} per forward)" if verifies else ""), flush = True)
-                if verifies and not served:
+                if int8_off and verified_gpu and verifies and not served:
                     bad.append(f"{verifies} verify forwards and no call served with one launch: the extension "
                                f"reports the single launch (exact_rows_caps() & 32) and did not make it")
+                    print(f"       {bad[-1]}", flush = True)
+                if not int8_off and served:
+                    bad.append(f"{served} calls served with one launch with the int8 path on (EXL3_INT8_GEMV="
+                               f"{os.environ.get('EXL3_INT8_GEMV', 'unset')}): that setting must launch per row")
                     print(f"       {bad[-1]}", flush = True)
             if name == "plan" and (prompt_len >= 120 or prompt_len + len(plain["tokens"]) <= 1100):
                 bad.append(f"plan: prompt {prompt_len} tokens, generation to position "

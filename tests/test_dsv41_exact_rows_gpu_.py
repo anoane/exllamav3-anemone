@@ -17,7 +17,10 @@ and the compressor's pooling and norm at rates 1 and 2. Two controls check, on e
 the comparison discriminates: an unflagged call of several rows must differ from the one-row
 calls (with the int8 activation path on: with EXL3_INT8_GEMV=0 it need not), and the rows of an
 EXL3 linear launched with the kernel shape of a one-row call and another block count must differ
-from the one-row calls (with the int8 path off, which the test sets in-process).
+from the one-row calls (with the int8 path off, which the test sets in-process). The converse,
+test_forced_shape_rows_equal_one_row_calls, runs with every extension: K rows launched with a
+forced kernel shape and block count equal one-row calls launched with the same, for every kernel
+shape a linear's widths take, with FP16 and FP32 output.
 
 Not covered: the index selection and the attention kernel, which need real pools, and the order
 of these operations in a forward. tools/dsv41_rowprobe.py under EXL3_EXACT_ROWS=1 is the evidence
@@ -33,15 +36,17 @@ ROWS_NATIVE set to 0), with the row loops made to raise where the entry point mu
 linears on the activations of a real forward too; the expert launch pair and the router against
 one-row calls on crafted and natural routing; and what each entry point refuses.
 
-An extension that reports bit 32 (EXACT_ROWS_CAP_ONE_LAUNCH) makes ONE launch for the rows of an
-EXL3 linear and of the grouped projection, under the launch record of a one-row call, where that
-call is the cooperative FP16 kernel: a mul1 linear with EXL3_INT8_GEMV=0, the grouped projection
-under either setting. The rows have the same bits either way, so the test_one_launch_* tests read
-the extension's count of such calls (exact_rows_one_launches): with the int8 path off (set
-in-process: the extension reads the variable on every launch) a flagged call must be one launch
-and equal the one-row calls of that setting, on random rows and on the activations of a real
-forward; with it on, a mul1 linear must make no such launch and equal that setting's one-row
-calls. Run the whole file under both settings, each with one autotune file:
+With EXL3_INT8_GEMV=0, an extension that reports bit 32 (EXACT_ROWS_CAP_ONE_LAUNCH) makes ONE
+launch for the rows of an EXL3 linear and of the grouped projection, under the launch record of a
+one-row call, where that call is the cooperative FP16 kernel and the GPU is one of the types the
+launch was verified on (ONE_LAUNCH_SM). The rows have the same bits either way, so the
+test_one_launch_* tests read the extension's count of such calls (exact_rows_one_launches): with
+the int8 path off (set in-process: the extension reads the variable on every launch) a flagged
+call must be one launch and equal the one-row calls of that setting, on random rows and on the
+activations of a real forward, and a first flagged call that finds no launch record of the
+one-row call must launch per row; with the int8 path on, no call may be one launch, and the rows
+equal that setting's one-row calls. Run the whole file under both settings, each with one
+autotune file:
 
     EXL3_EXACT_ROWS=1 DSV41_MODEL_DIR=<checkpoint> python -m pytest tests/test_dsv41_exact_rows_gpu_.py
     EXL3_EXACT_ROWS=1 EXL3_INT8_GEMV=0 DSV41_MODEL_DIR=<checkpoint> python -m pytest tests/test_dsv41_exact_rows_gpu_.py
@@ -64,6 +69,8 @@ FLAGGED = {"exact_rows": True}
 CAP_LINEAR, CAP_MGEMM, CAP_ROUTER, CAP_MOE, CAP_HC = 1, 2, 4, 8, 16
 # Not an entry point: those of CAP_LINEAR and CAP_MGEMM make one launch for the rows where they can
 CAP_ONE_LAUNCH = 32
+# The compute capabilities on which the extension makes that launch (exl3_gemm_one_row_route_ok)
+ONE_LAUNCH_SM = ((8, 0), (8, 9), (12, 0))
 # What the extension takes when EXL3_INT8_GEMV is not set (exl3_gemv_int8.cu): the plain int8 mode
 INT8_GEMV_DEFAULT = "2"
 NATIVE_CONSUMERS = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
@@ -289,6 +296,53 @@ class ExactRows(unittest.TestCase):
                       flush = True)
                 self.assertTrue(differing, f"K rows under the one-row kernel shape with 2 and 4 blocks equal the "
                                            f"one-row calls on {device}: the comparison does not see the launch")
+
+    @torch.inference_mode()
+    def test_forced_shape_rows_equal_one_row_calls(self):
+        # What the single launch rests on, for every kernel shape and not only the one the launch
+        # autotuner picked on this host: with the kernel shape and the block count fixed, the
+        # cooperative kernel gives a row of a K-row call the bits of a one-row call. Raw kernel
+        # calls on both sides (ext.exl3_gemm with a forced shape and block count, the int8 path
+        # off), FP16 and FP32 output, on two linears whose widths take every shape between them
+        ext = self.ext
+        for device in self.devices:
+            is_exl3 = lambda lin: type(getattr(lin, "inner", None)).__name__ == "LinearEXL3"
+            b = self.first(device, lambda blk: is_exl3(blk.attn.q_a) and is_exl3(blk.attn.q_b))
+            with self.subTest(device = str(device)):
+                self.assertIsNotNone(b, f"no layer on {device} has EXL3 attn.wq_a and attn.wq_b")
+            if b is None:
+                continue
+            covered = set()
+            for name, lin in (("attn.wq_a", b.attn.q_a), ("attn.wq_b", b.attn.q_b)):
+                inner = lin.inner
+                bits, half_k = int(inner.K), float(inner.K) != int(inner.K)
+                with torch.cuda.device(device):     # the shape filter asks the current device
+                    shapes = [shape for shape in range(1, ext.exl3_gemm_num_kernel_shapes() + 1)
+                              if ext.exl3_gemm_shape_compat(shape, 1, inner.in_features, inner.out_features, bits, half_k)]
+                gemm = lambda A, C, shape, blocks: int(ext.exl3_gemm(
+                    A, inner.trellis, C, inner.suh, torch.empty_like(A), inner.svh, shape, bool(inner.mcg),
+                    bool(inner.mul1), blocks))
+                for shape in shapes:
+                    for dtype in (torch.half, torch.float):
+                        for blocks in (7, 32):
+                            for K in ROWS:
+                                with self.subTest(op = name, device = str(device), shape = shape, dtype = str(dtype),
+                                                  blocks = blocks, K = K), int8_gemv("0"):
+                                    x = self.randn((K, inner.in_features), device)
+                                    ones = []
+                                    for j in range(K):
+                                        C1 = torch.empty((1, inner.out_features), dtype = dtype, device = device)
+                                        self.assertEqual(gemm(x[j:j + 1].clone(), C1, shape, blocks), shape)
+                                        ones.append(C1.reshape(-1).clone())
+                                    C = torch.empty((K, inner.out_features), dtype = dtype, device = device)
+                                    self.assertEqual(gemm(x, C, shape, blocks), shape)
+                                    self.same_rows(f"{name} L{b.layer_idx} @ {device}, shape {shape}, {blocks} blocks, "
+                                                   f"{dtype}", C, ones)
+                                    covered.add(shape)
+            print(f" -- exact rows: forced shapes on {device} (L{b.layer_idx} attn.wq_a, attn.wq_b; 7 and 32 blocks; FP16 "
+                  f"and FP32 output): K rows against one-row calls for kernel shapes {sorted(covered) or 'NONE'}", flush = True)
+            with self.subTest(device = str(device)):
+                self.assertTrue(covered, f"no kernel shape was tested on {device}")
 
     @torch.inference_mode()
     def test_grouped_output_projection(self):
@@ -614,6 +668,10 @@ class ExactRows(unittest.TestCase):
         result = call()
         return result, int(self.ext.exact_rows_one_launches()) - before
 
+    def one_launch_device(self, device) -> bool:
+        """Whether the extension makes the single launch on this GPU (ONE_LAUNCH_SM)."""
+        return tuple(torch.cuda.get_device_capability(torch.device(device))) in ONE_LAUNCH_SM
+
     def one_launch_rows(self, what, lin, x, out_dtype, expect: int):
         """lin on x flagged, under the current EXL3_INT8_GEMV, against one call per cloned row of
         that setting; the flagged call must be `expect` one-launch calls (1: one launch for the
@@ -648,7 +706,7 @@ class ExactRows(unittest.TestCase):
                     targets.append((name, str(device), get(b), dims, out_dtype))
         head = self.tail["head"]
         targets.append(("head", str(torch.device(head.device)), head, 3, None))
-        one, per_row, python, real = {}, {}, {}, set()
+        one, per_row, python, real, biased = {}, {}, {}, set(), set()
         for name, device, lin, dims, out_dtype in targets:
             for K in ROWS:
                 shape = (1, K, lin.in_features) if dims == 3 else (K, lin.in_features)
@@ -672,32 +730,76 @@ class ExactRows(unittest.TestCase):
                             with int8_gemv("0"):
                                 tag = self.one_row_tag(inner, x.device, fp32)
                                 self.assertNotEqual(tag, 0, f"{what}: the int8 GEMV ran with EXL3_INT8_GEMV=0")
-                                # The FP16 GEMV (90) has another instance for one row, and a width
-                                # that is not a multiple of 128 would put a transform block across
-                                # two rows: a launch per row for both
+                                # The FP16 GEMV (90) has another instance for one row, a width that
+                                # is not a multiple of 128 would put a transform block across two
+                                # rows, and a GPU outside ONE_LAUNCH_SM has no bitwise run of the
+                                # launch: a launch per row for each
                                 aligned = inner.in_features % 128 == 0 and inner.out_features % 128 == 0
-                                expect = 1 if 1 <= tag <= 4 and aligned else 0
+                                expect = 1 if 1 <= tag <= 4 and aligned and self.one_launch_device(device) else 0
                                 self.one_launch_rows(f"{what}, int8 off", lin, x, dt, expect)
                             (one if expect else per_row).setdefault(device, set()).add(name)
-                            if inner.mul1:
-                                with int8_gemv(self.int8_on):
-                                    self.one_launch_rows(f"{what}, int8 on", lin, x, dt, 0)
+                            if inner.bias is not None:
+                                biased.add(f"{name} @ {device}")
+                            # with the int8 path on, no flagged call is one launch, whatever the codebook
+                            with int8_gemv(self.int8_on):
+                                self.one_launch_rows(f"{what}, int8 on", lin, x, dt, 0)
         for device in sorted({d for _, d, _, _, _ in targets}):
             names = lambda group: ", ".join(sorted(group.get(device, ()))) or "none"
             print(f" -- exact rows: linears on {device} with EXL3_INT8_GEMV=0: one launch for the rows of "
                   f"{names(one)}; a launch per row for {names(per_row)}; not through run_alloc_rows: "
-                  f"{names(python)}", flush = True)
+                  f"{names(python)}; with the int8 path on: a launch per row for all", flush = True)
             with self.subTest(device = device):
-                self.assertTrue(one.get(device), f"no linear on {device} was one launch for its rows")
+                if self.one_launch_device(device):
+                    self.assertTrue(one.get(device), f"no linear on {device} was one launch for its rows")
+                else:
+                    print(f" -- exact rows: {device} has compute capability "
+                          f"{torch.cuda.get_device_capability(torch.device(device))}: the extension makes no single "
+                          f"launch there", flush = True)
+        # run_alloc_rows adds the bias row by row after the single launch: which tested linears have one
+        print(f" -- exact rows: tested linears with a bias: "
+              f"{', '.join(sorted(biased)) or 'none (the bias add after the single launch did not run)'}", flush = True)
         print(f" -- exact rows: one-launch linears also on the real activations of {', '.join(sorted(real)) or 'NONE'}",
               flush = True)
         self.assertTrue(real, "no linear was tested on real activations")
 
     @torch.inference_mode()
+    def test_one_launch_first_call_without_record(self):
+        # The single launch never makes the launch record it runs under: a flagged call that finds
+        # none in the process launches per row (which loads or tunes the record), and the next one
+        # is one launch. The bucket must be one no other call of this process touches: the FP32
+        # output of attn.wq_a, which the engine reads as FP16. Sorts ahead of the other
+        # test_one_launch_* tests; one-row calls of that bucket made earlier would fail it
+        self.need(CAP_LINEAR | CAP_ONE_LAUNCH)
+        K = 4
+        for device in self.devices:
+            b = self.first(device, lambda blk: type(getattr(blk.attn.q_a, "inner", None)).__name__ == "LinearEXL3")
+            with self.subTest(device = str(device)):
+                self.assertIsNotNone(b, f"no layer on {device} has an EXL3 attn.wq_a")
+                lin = b.attn.q_a
+                x = self.randn((1, K, lin.in_features), device)
+                flagged = lambda: lin.forward(x, dict(FLAGGED), torch.float).clone()
+                with rows_native(self.caps), int8_gemv("0"):
+                    self.assertTrue(lin.rows_native(x, FLAGGED), "attn.wq_a does not go through run_alloc_rows")
+                    first, grew = self.launches(flagged)
+                    self.assertEqual(grew, 0, f"attn.wq_a FP32 @ {device}: the first flagged call was one launch: a "
+                                              f"launch record of the one-row call was already in the process")
+                    ones = [lin.forward(x[:, j:j + 1].clone(), {}, torch.float).clone() for j in range(K)]
+                    self.same_rows(f"attn.wq_a FP32 @ {device}, first flagged call", first.reshape(K, -1), ones)
+                    tag = self.one_row_tag(lin.inner, device, True)
+                    aligned = lin.inner.in_features % 128 == 0 and lin.inner.out_features % 128 == 0
+                    expect = 1 if 1 <= tag <= 4 and aligned and self.one_launch_device(device) else 0
+                    second, grew = self.launches(flagged)
+                    self.assertEqual(grew, expect, f"attn.wq_a FP32 @ {device}: one-launch calls of the second flagged call")
+                    self.same_rows(f"attn.wq_a FP32 @ {device}, second flagged call", second.reshape(K, -1), ones)
+                print(f" -- exact rows: attn.wq_a FP32 on {device} (L{b.layer_idx}): first flagged call a launch per row "
+                      f"(no launch record yet), second {'one launch' if expect else 'a launch per row'}", flush = True)
+
+    @torch.inference_mode()
     def test_one_launch_grouped_output_projection(self):
         # exl3_mgemm_rows against the one-row grouped call, as _project_o_grouped makes it, under
-        # both settings of EXL3_INT8_GEMV: the grouped call never takes the int8 path, so the rows
-        # are one launch under either
+        # both settings of EXL3_INT8_GEMV: one launch for the rows with the int8 path off, a launch
+        # per row with it on (the grouped call itself never takes the int8 path; the variable
+        # decides so that the default setting launches as it did before the single launch)
         self.need(CAP_MGEMM | CAP_ONE_LAUNCH)
         self.captured_linear_inputs()
         ext = self.ext
@@ -735,12 +837,14 @@ class ExactRows(unittest.TestCase):
                             C = torch.empty((K, G, n), dtype = torch.half, device = device)
                             rows = lambda: ext.exl3_mgemm_rows(A, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh,
                                                                at.woa_indices, mu.K, mu.mcg, mu.mul1)
+                            expect = 1 if setting == "0" and width % 128 == 0 and n % 128 == 0 \
+                                and self.one_launch_device(device) else 0
                             _, grew = self.launches(rows)
-                            if not grew:
+                            if expect and not grew:
                                 print(f" -- exact rows: {what}: the first call was not one launch, repeated", flush = True)
                                 self.same_rows(f"{what} (launch per row)", C.reshape(K, -1).clone(), ones)
                                 _, grew = self.launches(rows)
-                            self.assertEqual(grew, 1, f"{what}: one-launch calls of exl3_mgemm_rows")
+                            self.assertEqual(grew, expect, f"{what}: one-launch calls of exl3_mgemm_rows")
                             self.same_rows(what, C.reshape(K, -1), ones)
 
     def moe_layers(self, device):
