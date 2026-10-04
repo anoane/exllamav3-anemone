@@ -1155,8 +1155,8 @@ class DSV41Attention(DSV4Attention):
         call: row j of the row-major copy is the (groups, 1, width) block the one-row call passes,
         and row j of C the (1, groups * n) row its wo_b reads. The entry point makes that call's
         launch once per row, with that call's scratch, or (an extension that reports
-        EXACT_ROWS_CAP_ONE_LAUNCH) one launch for the rows under that call's launch record. wo_b
-        then gets the rows as one flagged call.
+        EXACT_ROWS_CAP_ONE_LAUNCH, with EXL3_INT8_GEMV=0) one launch for the rows under that
+        call's launch record. wo_b then gets the rows as one flagged call.
         """
         G, rows, width = out.shape
         if ROWS_NATIVE & EXACT_ROWS_CAP_MGEMM:

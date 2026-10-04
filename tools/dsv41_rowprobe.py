@@ -56,11 +56,11 @@ one-row steps have the same bits with the mode on and off (two runs on one --tun
 The mode makes those launches from the extension's row-exact entry points where it has them
 (exact_rows_caps), else from Python, one call per row: --exact-rows-caps MASK runs with a subset
 of the entry points (0: the Python loops alone), for the same tables and the verify cost of each.
-An extension that reports bit 32 serves the rows of an EXL3 linear and of the grouped wo_a with
-ONE launch, under the launch record of a one-row call, where that call is the cooperative FP16
-kernel (a mul1 linear: with EXL3_INT8_GEMV=0 only; wo_a: always). The bits are the same either
-way, so the tool prints how many calls of a K-row forward were served like that
-(exact_rows_one_launches) next to the verify cost.
+With EXL3_INT8_GEMV=0, an extension that reports bit 32 serves the rows of an EXL3 linear and of
+the grouped wo_a with ONE launch, under the launch record of a one-row call, where that call is
+the cooperative FP16 kernel; with the int8 path on it launches per row. The bits are the same
+either way, so the tool prints how many calls of a K-row forward were served like that
+(exact_rows_one_launches) next to the verify cost: 0 under the default EXL3_INT8_GEMV.
 
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
