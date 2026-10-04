@@ -212,9 +212,11 @@ int exl3_gemm_gr
         TORCH_CHECK(A.is_contiguous() && C.is_contiguous() && A_had.value().is_contiguous() &&
                     A_had.value().dtype() == at::kHalf && A_had.value().numel() >= A.numel(),
                     "exl3_gemm: one_row_route: A, C and A_had must be contiguous, A_had FP16 with room for A");
-        TORCH_CHECK(suh.value().dtype() == at::kHalf && svh.value().dtype() == at::kHalf &&
+        // B, suh and svh are read as dense arrays through raw pointers, as A, A_had and C are
+        TORCH_CHECK(B.is_contiguous() && suh.value().is_contiguous() && svh.value().is_contiguous() &&
+                    suh.value().dtype() == at::kHalf && svh.value().dtype() == at::kHalf &&
                     suh.value().numel() >= size_k && svh.value().numel() >= size_n,
-                    "exl3_gemm: one_row_route: suh or svh does not cover the weight");
+                    "exl3_gemm: one_row_route: B, suh and svh must be contiguous, suh and svh FP16 covering the weight");
         TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.value().device() &&
                     A.device() == B.device() && A.device() == suh.value().device() &&
                     A.device() == svh.value().device(),
@@ -294,17 +296,30 @@ int exl3_gemm_gr
     if (autotune)
     {
         uint64_t autotune_key = gemm_autotune_hash(MAX(route_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+        if (one_row_route)
+        {
+            // The record of the one-row call is looked up, never made by this call (no disk cache
+            // lookup, no tuning with its rows, no store): the first one-row call makes it. Nothing
+            // is launched unless the record is a launch that call's candidates give: this weight's
+            // cooperative kernel in the recorded shape, with that shape's block size, one z-slice,
+            // and a shape that takes these widths on this device
+            CoopAutotuneLaunch record;
+            if (!CoopKernelAutotuner::find(autotune_key, &record)) return EXACT_ROWS_NO_LAUNCH;
+            if (record.tag < 1 || record.tag > EXL3_GEMM_NUM_SHAPES ||
+                record.block_dim != exl3_gemm_blockdim_g[record.tag] ||
+                record.num_sms < 1 || record.concurrency != 1 ||
+                !record.kernel || record.kernel != (void*) get_gemm_kernel_ptr(K, record.tag, c_fp32, cb, half_k) ||
+                !exl3_gemm_shape_compat(record.tag, size_m, size_k, size_n, K, half_k))
+                return EXACT_ROWS_NO_LAUNCH;
+        }
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
-            TORCH_CHECK(!one_row_route || (tuned.tag >= 1 && tuned.tag <= EXL3_GEMM_NUM_SHAPES),
-                        "exl3_gemm: one_row_route launched under a record with kernel tag ", tuned.tag);
             return tuned.tag;
         }
-        // one_row_route: the process has no record of the one-row call yet. This call does not make
-        // one (no disk cache lookup, no tuning with its rows, no store): the first one-row call does
+        // one_row_route: never past this point, where a call tunes with its own rows
         if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
         std::vector<CoopAutotuneCandidate> candidates;
         for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
@@ -586,6 +601,13 @@ int exl3_mgemm_gr
                     "exl3_mgemm: one_row_route: A, C and A_had must be contiguous, A_had FP16");
         TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.device(),
                     "exl3_mgemm: one_row_route: A, C and A_had must be on one CUDA device");
+        // The pointer tables and the indices are read as dense arrays through raw pointers
+        TORCH_CHECK(B.is_contiguous() && suh.is_contiguous() && svh.is_contiguous() &&
+                    A.device() == B.device() && A.device() == suh.device() && A.device() == svh.device(),
+                    "exl3_mgemm: one_row_route: the pointer tables must be contiguous, on the device of A");
+        TORCH_CHECK(!indices || (indices.value().is_contiguous() && indices.value().dtype() == at::kLong &&
+                                 indices.value().device() == A.device()),
+                    "exl3_mgemm: one_row_route: indices must be contiguous int64, on the device of A");
         // The transforms work on 128-element blocks of each matrix's flattened rows: a block must
         // not straddle two rows
         if (size_k % 128 || size_n % 128) return EXACT_ROWS_NO_LAUNCH;
@@ -670,17 +692,27 @@ int exl3_mgemm_gr
         );
         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
+        if (one_row_route)
+        {
+            // As in exl3_gemm_gr: the record of the one-row call, looked up and never made here, and
+            // nothing launched unless it is a launch that call's candidates give
+            CoopAutotuneLaunch record;
+            if (!CoopKernelAutotuner::find(autotune_key, &record)) return EXACT_ROWS_NO_LAUNCH;
+            if (record.tag < 1 || record.tag > EXL3_GEMM_NUM_SHAPES ||
+                record.block_dim != exl3_gemm_blockdim_g[record.tag] ||
+                record.num_sms < 1 || record.concurrency < 1 ||
+                !record.kernel || record.kernel != (void*) get_mgemm_kernel_ptr(K, record.tag, c_fp32, cb, half_k) ||
+                !exl3_gemm_shape_compat(record.tag, size_m, size_k, size_n, K, half_k))
+                return EXACT_ROWS_NO_LAUNCH;
+        }
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
-            TORCH_CHECK(!one_row_route || (tuned.tag >= 1 && tuned.tag <= EXL3_GEMM_NUM_SHAPES),
-                        "exl3_mgemm: one_row_route launched under a record with kernel tag ", tuned.tag);
             return tuned.tag;
         }
-        // one_row_route: no record of the one-row call in the process yet, and this call does not
-        // make one (as in exl3_gemm_gr)
+        // one_row_route: never past this point, where a call tunes with its own rows
         if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
         if (!graph)
         {
