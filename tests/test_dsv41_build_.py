@@ -280,12 +280,61 @@ def check_exact_rows(model):
             assert span(p, rows) == brute(p, rows), (p, rows, span(p, rows), brute(p, rows))
     if (c.sliding_window, c.index_topk, sorted(set(c.compress_ratios))) == (128, 512, [0, 1, 2]):
         # DeepSeek-V4.1-Flash: the plan changes at 128 and 512 (rate 1), 257 and 1025 (rate 2)
+        assert far == 2048
         got = {p: span(p, 8) for p in (120, 124, 128, 252, 508, 1020, 1200)}
         assert got == {120: 8, 124: 4, 128: 8, 252: 5, 508: 4, 1020: 5, 1200: 8}, got
         assert not regime(ids(8), cached(1020)) and regime(ids(5), cached(1020))
+    flash = (c.sliding_window, c.index_topk, sorted(set(c.compress_ratios))) == (128, 512, [0, 1, 2])
+    check_draft_window(model, far, flash)
     print(f"  OK  EXL3_EXACT_ROWS: the regime (one cached sequence, 2..{EXACT_ROWS_MAX} rows, one attention plan), "
-          f"row_plan and exact_rows_span against brute force over {n} layers; switch "
-          f"{'ON' if EXACT_ROWS else 'off'} in this run")
+          f"row_plan and exact_rows_span against brute force over {n} layers, the generator's draft window; "
+          f"switch {'ON' if EXACT_ROWS else 'off'} in this run")
+
+
+def check_draft_window(model, far, flash):
+    """Generator._draft_window (EXL3_EXACT_ROWS) on stand-in jobs, with the real model's plan span."""
+    from types import SimpleNamespace
+    from exllamav3 import Generator
+    from exllamav3.constants import PAGE_SIZE
+    from exllamav3.model.math_policy import EXACT_ROWS_MAX
+
+    def job(position, new_tokens = 0, max_rq = 2048, pages = 64, done = True, sequences = 1, banned = (),
+            embeddings = ()):
+        seq = SimpleNamespace(kv_position = position, allocated_pages = [None] * pages)
+        return SimpleNamespace(
+            is_prefill_done = lambda: done, sequences = [seq] * sequences, banned_strings = list(banned),
+            embeddings = list(embeddings), recurrent_state = SimpleNamespace(position = position),
+            max_rq_tokens = max_rq, new_tokens = new_tokens)
+
+    def window(jobs, exact = True, ndt = 7):
+        g = SimpleNamespace(exact_rows = exact, num_draft_tokens = ndt, active_jobs = jobs, model = model)
+        return Generator._draft_window(g)
+
+    # without the mode: the configured length, whatever the jobs
+    assert window([job(far), job(far)], exact = False) == 7 and window([], exact = False, ndt = 12) == 12
+    # one generating sequence, at most EXACT_ROWS_MAX rows
+    assert window([job(far)]) == 7 and window([job(far)], ndt = 3) == 3
+    assert window([job(far)], ndt = 12) == EXACT_ROWS_MAX - 1
+    assert window([]) == 0 and window([job(far), job(far)]) == 0 and window([job(far, sequences = 2)]) == 0
+    assert window([job(far), job(far, done = False)]) == 7, "a job still in prefill is not in the forward"
+    assert window([job(far, banned = ["x"])]) == 0 and window([job(far, embeddings = [object()])]) == 0
+    # no position past the requeue point: an undrafted job forwards while new_tokens <= max_rq_tokens
+    assert [window([job(far, new_tokens = t)]) for t in (2040, 2045, 2047, 2048, 2049)] == [7, 3, 1, 0, 0]
+    assert window([job(far, new_tokens = -1, max_rq = 3)]) == 4
+    # no position outside the job's pages
+    last = 64 * PAGE_SIZE - 1
+    assert [window([job(last - k)]) for k in (9, 7, 2, 1, 0)] == [7, 7, 2, 1, 0]
+    # a job state that is not at the K/V position: no draft
+    behind = job(far)
+    behind.recurrent_state.position -= 1
+    assert window([behind]) == 0
+    behind.recurrent_state = None
+    assert window([behind]) == 0
+    if flash:
+        # no row of the verify forward changes the attention plan (128, 257, 512, 1025)
+        got = {p: window([job(p)]) for p in (120, 124, 127, 128, 252, 256, 257, 508, 511, 512, 1020, 1024, 1025)}
+        assert got == {120: 7, 124: 3, 127: 0, 128: 7, 252: 4, 256: 0, 257: 7, 508: 3, 511: 0, 512: 7,
+                       1020: 4, 1024: 0, 1025: 7}, got
 
 
 def check_chat_prompt(model, path):

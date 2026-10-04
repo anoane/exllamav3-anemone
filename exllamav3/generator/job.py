@@ -630,7 +630,9 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.num_draft_tokens
+        # (draft_headroom: num_draft_tokens, or 0 under EXL3_EXACT_ROWS, where a drafted job requeues where an
+        # undrafted one does)
+        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.draft_headroom
 
         for seq in self.sequences:
 
@@ -1105,7 +1107,7 @@ class Job:
         # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.num_draft_tokens)
+                                      - 1 - self.generator.draft_headroom)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1117,7 +1119,7 @@ class Job:
                 self.max_rq_tokens = y - x
         else:
             # Default budget: the whole response plus one speculative window past the limit
-            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.draft_headroom
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:

@@ -6,6 +6,7 @@ from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
+from ..model.math_policy import EXACT_ROWS, EXACT_ROWS_MAX
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,13 @@ class Generator:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
             self.num_draft_tokens = 0
+
+        # EXL3_EXACT_ROWS with a model that supports it (DeepSeek-V4.1): a draft verification computes every row
+        # with the arithmetic of a one-token step, and the generator schedules a drafted job as an undrafted one,
+        # so that both generate the same tokens. Draft windows are then cut by _draft_window(), and a job keeps
+        # no headroom of num_draft_tokens below its requeue point or in its default token budgets (draft_headroom)
+        self.exact_rows = EXACT_ROWS and bool(model.caps.get("exact_rows"))
+        self.draft_headroom = 0 if self.exact_rows else self.num_draft_tokens
 
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
@@ -660,6 +668,8 @@ class Generator:
 
         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
         window = self.num_draft_tokens
+        if self.exact_rows:
+            window = self._draft_window()
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -698,6 +708,11 @@ class Generator:
                 "cache_seqlens": cache_seqlens
             }
         )
+
+        # A closed window (EXL3_EXACT_ROWS): nothing was drafted; the prefill above gave the draft cache this
+        # round's input token
+        if self.exact_rows and window == 0:
+            return None
 
         if conf_cols:
             self._draft_conf_round = {
@@ -764,6 +779,10 @@ class Generator:
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
         window = self.num_draft_tokens
+        if self.exact_rows:
+            window = self._draft_window()
+            if window == 0:
+                return None
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -827,6 +846,10 @@ class Generator:
 
         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
         window = self.num_draft_tokens
+        if self.exact_rows:
+            window = self._draft_window()
+            if window == 0:
+                return None
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -918,8 +941,10 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Generate draft
+        # Generate draft. A closed window (EXL3_EXACT_ROWS) still feeds the matcher its history and drafts nothing
         window = self.num_draft_tokens
+        if self.exact_rows:
+            window = self._draft_window()
         draft_ids = []
         min_len = window
         for job in self.active_jobs:
@@ -934,6 +959,43 @@ class Generator:
         # Trim to minimum length in batch
         draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
         return draft_ids
+
+
+    def _draft_window(self) -> int:
+        """
+        How many draft tokens the next verification may carry: num_draft_tokens, or under EXL3_EXACT_ROWS
+        (self.exact_rows) the longest window, possibly 0, with which drafted generation stays token-identical to
+        undrafted generation.
+
+        The model computes the rows of a verify forward with one-token arithmetic only for ONE sequence of at most
+        EXACT_ROWS_MAX rows whose rows share one attention plan (model.exact_rows_span), without indexed
+        embeddings. So there is no draft while more than one sequence generates, and a window is cut to that
+        span. It is also cut so that the drafted job forwards no position an undrafted job does not: none past its
+        requeue point (max_rq_tokens) and none outside its pages. A job with banned strings does not draft: a
+        rewind under a draft starts from a state that ran ahead of the accepted position, and can restore a
+        checkpoint and replay where the undrafted job rewinds in place.
+        """
+        if not self.exact_rows:
+            return self.num_draft_tokens
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if len(jobs) != 1:
+            return 0
+        job = jobs[0]
+        if len(job.sequences) != 1 or job.banned_strings or job.embeddings:
+            return 0
+        seq = job.sequences[0]
+        state = job.recurrent_state
+        if state is None or state.position != seq.kv_position:
+            return 0
+        window = min(
+            self.num_draft_tokens,
+            EXACT_ROWS_MAX - 1,
+            job.max_rq_tokens - job.new_tokens,
+            len(seq.allocated_pages) * PAGE_SIZE - 1 - seq.kv_position,
+        )
+        if window <= 0:
+            return 0
+        return self.model.exact_rows_span(seq.kv_position, 1 + window) - 1
 
 
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
