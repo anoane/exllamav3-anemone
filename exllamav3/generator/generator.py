@@ -971,9 +971,12 @@ class Generator:
         EXACT_ROWS_MAX rows whose rows share one attention plan (model.exact_rows_span), without indexed
         embeddings. So there is no draft while more than one sequence generates, and a window is cut to that
         span. It is also cut so that the drafted job forwards no position an undrafted job does not: none past its
-        requeue point (max_rq_tokens) and none outside its pages. A job with banned strings does not draft: a
-        rewind under a draft starts from a state that ran ahead of the accepted position, and can restore a
-        checkpoint and replay where the undrafted job rewinds in place.
+        requeue point (max_rq_tokens) and none outside its pages. And it stops below the job's next recurrent
+        checkpoint position: the rows from there on are always rejected (iterate_gen), and forwarding them moves
+        the sliding-window ring a page early, so that the checkpoint stashed at that position would keep other rows
+        than an undrafted job's and the checkpoint cache could evict differently. A job with banned strings does
+        not draft: a rewind under a draft starts from a state that ran ahead of the accepted position, and can
+        restore a checkpoint and replay where the undrafted job rewinds in place.
         """
         if not self.exact_rows:
             return self.num_draft_tokens
@@ -987,11 +990,15 @@ class Generator:
         state = job.recurrent_state
         if state is None or state.position != seq.kv_position:
             return 0
+        # tokens up to the next checkpoint position, by the rule of Job.is_checkpoint_boundary for a generating job
+        interval = self.recurrent_checkpoint_interval
+        to_checkpoint = interval - (seq.kv_position - job.cached_pages * PAGE_SIZE) % interval
         window = min(
             self.num_draft_tokens,
             EXACT_ROWS_MAX - 1,
             job.max_rq_tokens - job.new_tokens,
             len(seq.allocated_pages) * PAGE_SIZE - 1 - seq.kv_position,
+            to_checkpoint - 1,
         )
         if window <= 0:
             return 0

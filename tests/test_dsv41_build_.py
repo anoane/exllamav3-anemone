@@ -311,15 +311,17 @@ def check_draft_window(model, far, flash):
     from exllamav3.model.math_policy import EXACT_ROWS_MAX
 
     def job(position, new_tokens = 0, max_rq = 2048, pages = 64, done = True, sequences = 1, banned = (),
-            embeddings = ()):
+            embeddings = (), cached_pages = 0):
         seq = SimpleNamespace(kv_position = position, allocated_pages = [None] * pages)
         return SimpleNamespace(
             is_prefill_done = lambda: done, sequences = [seq] * sequences, banned_strings = list(banned),
             embeddings = list(embeddings), recurrent_state = SimpleNamespace(position = position),
-            max_rq_tokens = max_rq, new_tokens = new_tokens)
+            max_rq_tokens = max_rq, new_tokens = new_tokens, cached_pages = cached_pages)
 
-    def window(jobs, exact = True, ndt = 7):
-        g = SimpleNamespace(exact_rows = exact, num_draft_tokens = ndt, active_jobs = jobs, model = model)
+    # (interval: by default no recurrent checkpoint within reach of the positions below)
+    def window(jobs, exact = True, ndt = 7, interval = PAGE_SIZE << 30):
+        g = SimpleNamespace(exact_rows = exact, num_draft_tokens = ndt, active_jobs = jobs, model = model,
+                            recurrent_checkpoint_interval = interval)
         return Generator._draft_window(g)
 
     # without the mode: the configured length, whatever the jobs
@@ -336,6 +338,15 @@ def check_draft_window(model, far, flash):
     # no position outside the job's pages
     last = 64 * PAGE_SIZE - 1
     assert [window([job(last - k)]) for k in (9, 7, 2, 1, 0)] == [7, 7, 2, 1, 0]
+    # no position at or past the next recurrent checkpoint (Job.is_checkpoint_boundary: every `interval` tokens
+    # from the end of the cached prefix), where a draft is always cut and the state is stashed
+    cp = (-(-far // PAGE_SIZE) + 2) | 1          # an odd page past `far`
+    at = lambda k, **kw: job(cp * PAGE_SIZE - k, pages = cp + 2, **kw)
+    assert [window([at(k)], interval = PAGE_SIZE) for k in (9, 8, 4, 2, 1, 0)] == [7, 7, 3, 1, 0, 7]
+    assert [window([at(k)], interval = 2 * PAGE_SIZE) for k in (4, 1, 0)] == [7, 7, 7], \
+        "the end of an odd page is no checkpoint at an interval of two pages"
+    assert [window([at(k, cached_pages = 1)], interval = 2 * PAGE_SIZE) for k in (4, 1, 0)] == [3, 0, 7], \
+        "checkpoints are counted from the end of the cached prefix"
     # a job state that is not at the K/V position: no draft
     behind = job(far)
     behind.recurrent_state.position -= 1
