@@ -136,16 +136,30 @@ static void moe_coop_smem_optin(void* kernel, int smem)
     done[kernel] = smem;
 }
 
-void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
+bool exl3_moe_coop_rows_ok(const MoeCoopParams& p, int topk, int rows)
+{
+    if (topk < 1 || rows < 1 || rows > p.rows_max) return false;
+    const int64_t slots = (int64_t) rows * topk;
+    if (slots > p.slots_max) return false;
+    const int ksplit = moe_coop_pick_ksplit(std::max(1, p.slots_max / topk));
+    return ksplit * slots <= p.slots_max;
+}
+
+void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
+                          bool exact_rows)
 {
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
     const int slots = p.bsz * p.topk;
     const int nproj = p.gated ? 2 : 1;
-    p.a_global = p.bsz > 1;
+    // exact_rows: the three values a one-row call computes from its topk slots are pinned to them
+    // (a_global, the tile, the split-k factor); the grids below still cover every slot of the call
+    TORCH_CHECK(!exact_rows || (p.bsz >= 1 && p.topk >= 1), "exl3_moe_coop: a row-exact call without rows or picks");
+    const int geo_slots = exact_rows ? p.topk : slots;
+    p.a_global = !exact_rows && p.bsz > 1;
 
-    const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
-    const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
+    const bool wide_a = moe_coop_pick_wide(p.Hi / 16, geo_slots, device);
+    const bool wide_b = moe_coop_pick_wide(p.I / 16, geo_slots, device);
     MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a, p.act == MOE_COOP_ACT_SILU_REF);
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
@@ -153,9 +167,12 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
 
     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
-    const int max_split = std::max(1, p.slots_max / slots);
+    const int max_split = std::max(1, p.slots_max / geo_slots);
     p.ksplit_a = moe_coop_pick_ksplit(max_split);
     p.ksplit_b = moe_coop_pick_ksplit(max_split);
+    // The partial rows of split q live at slot + q * slots: the one-row factor must fit every slot
+    TORCH_CHECK(!exact_rows || ((int64_t) p.ksplit_a * slots <= p.slots_max && (int64_t) p.ksplit_b * slots <= p.slots_max),
+                "exl3_moe_coop: the split-k partials of a row-exact call exceed the scratch (exl3_moe_coop_rows_ok)");
     const int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
 
@@ -295,7 +312,8 @@ void exl3_moe_coop_run
 (
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
-    const c10::optional<at::Tensor>& sh_out
+    const c10::optional<at::Tensor>& sh_out,
+    bool exact_rows
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -323,7 +341,7 @@ void exl3_moe_coop_run
     }
     else
         p.sh_gate_w = nullptr;
-    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream);
+    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, exact_rows);
 }
 
 void exl3_moe_coop

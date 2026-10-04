@@ -4,7 +4,10 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
-from ..model.math_policy import FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC, require_whole_k_moe
+from ..model.math_policy import (
+    FUSED_PREFILL, FUSED_COUNT_LIMIT, STABLE_ARITHMETIC, require_whole_k_moe,
+    EXACT_ROWS, EXACT_ROWS_CAP_MOE, exact_rows_native,
+)
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
@@ -44,6 +47,9 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
+# extension built before them)
+ROWS_NATIVE = exact_rows_native(ext)
 
 @dataclass
 class FusedBuffers:
@@ -1389,7 +1395,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
         # quantized paths apply), so this is the last tier
         else:
             assert bszn_eligible
-            self.bc.run_bszN(y, selected_experts, routing_weights)
+            if EXACT_ROWS and bsz > 1 and params.get("exact_rows"):
+                # EXL3_EXACT_ROWS: the launch pair covers the rows with the geometry of a one-row
+                # call (no grouping of rows by expert, the tile of one row's slots). The caller
+                # sends a flagged call of several rows here only when that serves the layer
+                # (DSV41MoE.rows_native); the grouped launch below would not give one-row bits
+                if not (ROWS_NATIVE & EXACT_ROWS_CAP_MOE):
+                    raise RuntimeError(
+                        f"{self.key}: EXL3_EXACT_ROWS=1: a flagged call of {bsz} rows reached the fused "
+                        f"decode kernels, and this build of exllamav3_ext has no run_bszN_rows; such a "
+                        f"call must be computed one row at a time")
+                self.bc.run_bszN_rows(y, selected_experts, routing_weights)
+            else:
+                self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 

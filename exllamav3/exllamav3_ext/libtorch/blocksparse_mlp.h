@@ -171,6 +171,19 @@ struct BC_BlockSparseMLP
         at::Tensor& routing_weights
     );
 
+    // EXL3_EXACT_ROWS (exact_rows.h): run_bszN for 2 to EXACT_ROWS_MAX rows, one launch pair that
+    // gives every row the launch geometry of a one-row call (exl3_moe_coop_launch, exact_rows)
+    void run_bszN_rows
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights
+    );
+
+    // Whether run_bszN_rows serves this module at every row count up to EXACT_ROWS_MAX, topk picks
+    // per row: the shared expert, if any, is a fused launch, and the rows fit the scratch
+    bool rows_exact_ok(int topk);
+
     void run_single_expert_gr
     (
         const at::Tensor& y,

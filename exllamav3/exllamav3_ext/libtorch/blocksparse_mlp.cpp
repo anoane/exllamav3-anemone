@@ -4,6 +4,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include "../util.h"
+#include "../exact_rows.h"
 #include "../hgemm.cuh"
 #include "../quant/exl3_gemm.cuh"
 #include "../quant/hadamard.cuh"
@@ -101,6 +102,54 @@ void BC_BlockSparseMLP::run_bszN
         sh_o = out_d_sh_n;
     }
     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+}
+
+static_assert(EXACT_ROWS_MAX <= MAX_BSZN, "EXACT_ROWS_MAX exceeds the rows of the fused decode path");
+
+bool BC_BlockSparseMLP::rows_exact_ok(int topk)
+{
+    // The BC_GatedMLP graph of a shared expert is per row count: only the fused launch is row-exact
+    if (shared_experts && !sh_coop) return false;
+    if (!exl3_moe_coop_rows_ok(coop_p, topk, EXACT_ROWS_MAX)) return false;
+    return !sh_coop || exl3_moe_coop_rows_ok(sh_coop_p, 1, EXACT_ROWS_MAX);
+}
+
+void BC_BlockSparseMLP::run_bszN_rows
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights
+)
+{
+    // run_bszN with exact_rows on both launches: the shared expert's one-expert launch and the
+    // routed launch each cover all rows with the kernel instances, tile and split-k factor of a
+    // one-row call, slot by slot. No rotation launch, no grouping of rows that picked one expert
+    TORCH_CHECK(y.dim() == 2 && y.is_contiguous(), "run_bszN_rows: y must be a contiguous (rows, H) tensor");
+    TORCH_CHECK_DTYPE(y, kHalf);
+    const int64_t rows = y.size(0);
+    TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
+                "run_bszN_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+    TORCH_CHECK_DTYPE(selected_experts, kLong);
+    TORCH_CHECK_DTYPE(routing_weights, kHalf);
+    TORCH_CHECK(selected_experts.dim() == 2 && selected_experts.sizes() == routing_weights.sizes() &&
+                selected_experts.is_contiguous() && routing_weights.is_contiguous() &&
+                selected_experts.size(0) == rows && selected_experts.size(1) >= 1,
+                "run_bszN_rows: selected_experts and routing_weights must be contiguous (rows, topk)");
+    TORCH_CHECK(y.device() == selected_experts.device() && y.device() == routing_weights.device(),
+                "run_bszN_rows: y, selected_experts and routing_weights must be on one device");
+    TORCH_CHECK(sh_coop || !shared_experts, "run_bszN_rows: the shared expert is not a fused launch (rows_exact_ok)");
+    const int num_tokens = (int) rows;
+
+    c10::cuda::CUDAGuard device_guard(y.device());
+
+    c10::optional<at::Tensor> sh_o;
+    if (sh_coop)
+    {
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt, true);
+        sh_o = out_d_sh_n;
+    }
+    exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, true);
 }
 
 BC_BlockSparseMLP::BC_BlockSparseMLP

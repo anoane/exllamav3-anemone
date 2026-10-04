@@ -104,6 +104,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_ds3_nogroup_rows", &routing_ds3_nogroup_rows, "routing_ds3_nogroup_rows");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
     m.def("moe_split_map", &moe_split_map, "moe_split_map");

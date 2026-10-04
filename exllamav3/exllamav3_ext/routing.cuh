@@ -26,6 +26,23 @@ void routing_ds3_nogroup
     const c10::optional<at::Tensor>& gate_sb
 );
 
+// EXL3_EXACT_ROWS (exact_rows.h): routing_ds3_nogroup for 2 to EXACT_ROWS_MAX rows, every row
+// projected by the launch of a one-row call; the selection is the one launch for all rows
+void routing_ds3_nogroup_rows
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate,
+    at::Tensor scores,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor topk_indices,
+    at::Tensor topk_weights,
+    const float scaling_factor,
+    const c10::optional<at::Tensor>& gate_t,
+    const int act_fn,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
+);
+
 void routing_ds3_nogroup_logits
 (
     at::Tensor scores,

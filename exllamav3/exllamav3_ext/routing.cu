@@ -8,6 +8,7 @@
 #include "reduction.cuh"
 #include "hgemm.cuh"
 #include "stable_arithmetic.h"
+#include "exact_rows.h"
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 32
@@ -652,27 +653,71 @@ topk_indices: int64, shape (bsz, k)
 topk_weights: float16, shape (bsz, k)
 routed_scaling_factor: float32
 act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
+
+exact_rows (EXL3_EXACT_ROWS, exact_rows.h; routing_ds3_nogroup_rows): a call of 2 to EXACT_ROWS_MAX
+rows projects every row with a routing_gemv call of its own on one-row views, the launch a one-row
+call makes (the FMA GEMV where the transposed gate serves it) in place of the multi-row projection.
+The top-k launch is the same for both: one block per row, which reads and writes that row only.
 */
 
-void routing_ds3_nogroup
+static void routing_ds3_nogroup_impl
 (
     const at::Tensor& hidden,
     const at::Tensor& gate,
-    at::Tensor scores,
+    at::Tensor& scores,
     const c10::optional<at::Tensor>& bias,
-    at::Tensor topk_indices,
-    at::Tensor topk_weights,
+    const at::Tensor& topk_indices,
+    const at::Tensor& topk_weights,
     const float scaling_factor,
     const c10::optional<at::Tensor>& gate_t,
     const int act_fn,
     const c10::optional<at::Tensor>& gate_i8,
-    const c10::optional<at::Tensor>& gate_sb
+    const c10::optional<at::Tensor>& gate_sb,
+    const bool exact_rows
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
+    if (exact_rows)
+    {
+        // Everything the per-row launches read or write is checked before the first one; the checks
+        // below, ahead of the top-k launch, cover the rest
+        TORCH_CHECK(!stable_arithmetic(), "routing_ds3_nogroup_rows: EXL3_STABLE_ARITHMETIC replaces the one-row projection");
+        TORCH_CHECK_DIM(hidden, 2);
+        TORCH_CHECK_DIM(gate, 2);
+        TORCH_CHECK_DIM(scores, 2);
+        TORCH_CHECK_DIM(topk_indices, 2);
+        TORCH_CHECK_DIM(topk_weights, 2);
+        TORCH_CHECK(hidden.is_contiguous() && scores.is_contiguous() && topk_indices.is_contiguous() && topk_weights.is_contiguous(),
+                    "routing_ds3_nogroup_rows: hidden, scores, topk_indices and topk_weights must be contiguous");
+        const int64_t rows = scores.size(0);
+        TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
+                    "routing_ds3_nogroup_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+        TORCH_CHECK(hidden.size(0) == rows, "routing_ds3_nogroup_rows: hidden and scores must have the same rows");
+        TORCH_CHECK_DTYPE(hidden, kHalf);
+        TORCH_CHECK_DTYPE(gate, kHalf);
+        TORCH_CHECK_DTYPE(scores, kHalf);
+        TORCH_CHECK_SHAPES(hidden, -1, gate, 0, 1);
+        TORCH_CHECK_SHAPES(gate, 1, scores, -1, 1);
+        TORCH_CHECK(hidden.device() == scores.device() && gate.device() == scores.device(),
+                    "routing_ds3_nogroup_rows: hidden, gate and scores must be on one device");
+        if (gate_t.has_value())
+        {
+            const at::Tensor& gt = gate_t.value();
+            TORCH_CHECK(gt.dtype() == at::kHalf && gt.dim() == 2 && gt.is_contiguous() &&
+                        gt.size(0) == gate.size(1) && gt.size(1) == gate.size(0) && gt.device() == scores.device(),
+                        "routing_ds3_nogroup_rows: gate_t must be the contiguous transposed gate");
+        }
+
+        for (int64_t r = 0; r < rows; ++r)
+        {
+            at::Tensor scores_r = scores.slice(0, r, r + 1);
+            routing_gemv(hidden.slice(0, r, r + 1), gate, gate_t, gate_i8, gate_sb, scores_r, stream);
+        }
+    }
+    else
+        routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
@@ -715,6 +760,48 @@ void routing_ds3_nogroup
         bsz
     );
     cuda_check(cudaPeekAtLastError());
+}
+
+void routing_ds3_nogroup
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate,
+    at::Tensor scores,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor topk_indices,
+    at::Tensor topk_weights,
+    const float scaling_factor,
+    const c10::optional<at::Tensor>& gate_t,
+    const int act_fn,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
+)
+{
+    routing_ds3_nogroup_impl
+    (
+        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, false
+    );
+}
+
+void routing_ds3_nogroup_rows
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate,
+    at::Tensor scores,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor topk_indices,
+    at::Tensor topk_weights,
+    const float scaling_factor,
+    const c10::optional<at::Tensor>& gate_t,
+    const int act_fn,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
+)
+{
+    routing_ds3_nogroup_impl
+    (
+        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, true
+    );
 }
 
 

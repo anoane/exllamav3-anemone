@@ -80,8 +80,17 @@ struct MoeCoopParams
 
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
-// 1 mcg, 2 mul1 codebook, uniform across the three projections
-void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream);
+// 1 mcg, 2 mul1 codebook, uniform across the three projections.
+// exact_rows (EXL3_EXACT_ROWS, exact_rows.h): the launch pair covers every row with the geometry of
+// a one-row call: slots ungrouped and rotated in-block (a_global false, no rot launch), the tile and
+// the split-k factor chosen from the topk slots of one row. A block then computes its slot exactly
+// as the block of that slot does in the row's own one-row launch
+void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
+                          bool exact_rows = false);
+
+// Whether an exact_rows launch of `rows` token rows of `topk` picks fits the scratch p was prepared
+// with: the rows, their slots, and the split-k partials at the split factor of a one-row call
+bool exl3_moe_coop_rows_ok(const MoeCoopParams& p, int topk, int rows);
 
 // Static part of the parameter block, validated once from the module's tensors (BC construction);
 // K_gu / K_d / cb come back through the out-params. Gate tables/scratch are ignored when
@@ -113,11 +122,13 @@ MoeCoopParams exl3_moe_coop_prepare
 );
 
 // Per-call part: input rows, routing, optional shared-expert output (bsz rows, width H), launch
+// (exact_rows: see exl3_moe_coop_launch)
 void exl3_moe_coop_run
 (
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
-    const c10::optional<at::Tensor>& sh_out
+    const c10::optional<at::Tensor>& sh_out,
+    bool exact_rows = false
 );
 
 // Tensor front end (prepare + run; the test entry point)

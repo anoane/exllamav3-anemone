@@ -12,8 +12,13 @@ from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+from ..model.math_policy import EXACT_ROWS, EXACT_ROWS_CAP_ROUTER, exact_rows_native
 
 ROUTING_CACHE_ROWS = 128
+
+# EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
+# extension built before them)
+ROWS_NATIVE = exact_rows_native(ext)
 
 
 def _routing_buffers(cfg, bsz, device):
@@ -323,12 +328,41 @@ def _routing_sqrtsp_vl(cfg, y, vl, hash_sel):
     return sel, w
 
 
+def _routing_sqrtsp_rows(cfg, y, router_logits, selected_experts, routing_weights):
+    """EXL3_EXACT_ROWS: routing_sqrtsp for a flagged call of several rows (params["exact_rows"]).
+    One native call projects every row with the launch of a one-row call (the FP32 GEMV; a call of
+    several rows otherwise takes the int8 projection) and selects for all rows in the one top-k
+    launch, whose blocks each read and write one row. There is no fallback here: without the entry
+    point the caller routes one row per call (DSV41MoE.forward), and a flagged call of several rows
+    that arrives anyway is refused."""
+    if not (ROWS_NATIVE & EXACT_ROWS_CAP_ROUTER):
+        raise RuntimeError(
+            f"routing: EXL3_EXACT_ROWS=1: a flagged call of {y.shape[0]} rows reached the router, whose "
+            f"projection of several rows is not the one a one-row step makes, and this build of exllamav3_ext "
+            f"has no routing_ds3_nogroup_rows; such a call must be routed one row at a time")
+    ext.routing_ds3_nogroup_rows(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        _esb_h(cfg),
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+        cfg.gate_i8,
+        cfg.gate_sb,
+    )
+    return selected_experts, routing_weights
+
+
 def routing_sqrtsp(bsz, cfg, y, params):
     """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
     weights normalized over the selected set, times routed_scaling_factor. The nogroup top-k
     kernel serves every batch size (one block per row); bsz 1 reuses the cached output
     buffers, larger batches allocate per call. activate_all_experts (conversion) stays
-    torch-composed."""
+    torch-composed. A flagged call of several rows under EXL3_EXACT_ROWS gives every row the
+    projection of a one-row call (_routing_sqrtsp_rows)."""
     if params.get("activate_all_experts"):
         scores = _sqrtsp_scores(cfg, y)
         routing_weights = scores / (scores.sum(dim = -1, keepdim = True) + 1e-20)
@@ -348,6 +382,8 @@ def routing_sqrtsp(bsz, cfg, y, params):
         routing_weights = cfg.routing_weights_bsz1
     else:
         router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+        if EXACT_ROWS and params.get("exact_rows"):
+            return _routing_sqrtsp_rows(cfg, y, router_logits, selected_experts, routing_weights)
     ext.routing_ds3_nogroup(
         y,
         cfg.gate_tensor,
