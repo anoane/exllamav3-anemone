@@ -56,6 +56,11 @@ one-row steps have the same bits with the mode on and off (two runs on one --tun
 The mode makes those launches from the extension's row-exact entry points where it has them
 (exact_rows_caps), else from Python, one call per row: --exact-rows-caps MASK runs with a subset
 of the entry points (0: the Python loops alone), for the same tables and the verify cost of each.
+An extension that reports bit 32 serves the rows of an EXL3 linear and of the grouped wo_a with
+ONE launch, under the launch record of a one-row call, where that call is the cooperative FP16
+kernel (a mul1 linear: with EXL3_INT8_GEMV=0 only; wo_a: always). The bits are the same either
+way, so the tool prints how many calls of a K-row forward were served like that
+(exact_rows_one_launches) next to the verify cost.
 
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
@@ -119,7 +124,11 @@ HEAD_OPS = ("head.collapse", "norm", "head")
 # EXL3_EXACT_ROWS: the modules that hold the extension's row-exact entry points (ROWS_NATIVE, the
 # bits of math_policy.EXACT_ROWS_CAP_*), and the bits by name
 ROWS_NATIVE_MODULES = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
-ROWS_NATIVE_BITS = ((1, "linear"), (2, "wo_a"), (4, "router"), (8, "moe"), (16, "hc"))
+ROWS_NATIVE_BITS = ((1, "linear"), (2, "wo_a"), (4, "router"), (8, "moe"), (16, "hc"), (32, "one-launch"))
+# Bit 32 is not an entry point: the extension's run_alloc_rows (bit 1) and exl3_mgemm_rows (bit 2)
+# decide per call whether the rows are one launch, so no mask reaches it. It is in use exactly when
+# the extension reports it and one of those two entry points is used
+ONE_LAUNCH_BIT, ONE_LAUNCH_ENTRY_BITS = 32, 1 | 2
 
 TUNE_MAGIC = b"EX3ATUNE"
 TUNE_FILE = "coop_autotune_v1.bin"
@@ -221,7 +230,9 @@ examples:
                     help = "under EXL3_EXACT_ROWS=1: use only these row-exact entry points of the extension, a sum "
                            "of 1 (EXL3 linears), 2 (grouped wo_a), 4 (router), 8 (MoE experts), 16 (hyper-connection "
                            "sums); 0 runs the Python row loops alone. Default: all the extension reports. The MoE "
-                           "needs 4 and 8 together")
+                           "needs 4 and 8 together. 32 (one launch for the rows of a linear or of wo_a) is "
+                           "accepted and changes nothing: the extension decides it inside the entry points of 1 "
+                           "and 2, so mask those to keep an operation out of it")
     ap.add_argument("--tune-cache", default = "copy", metavar = "copy|live|PATH",
                     help = "launch-autotune cache the extension uses: 'copy' (default) a private copy of the live "
                            "file, removed when the run ends, so the probe reads serving's records and never "
@@ -282,6 +293,10 @@ def rows_native_setup(ext, mask, exact: bool) -> dict:
     used = 0
     if exact:
         used = (reported or 0) if mask is None else (reported or 0) & mask
+        if (reported or 0) & ONE_LAUNCH_BIT and used & ONE_LAUNCH_ENTRY_BITS:
+            used |= ONE_LAUNCH_BIT
+        else:
+            used &= ~ONE_LAUNCH_BIT
         for name in ROWS_NATIVE_MODULES:
             importlib.import_module(f"exllamav3.modules.{name}").ROWS_NATIVE = used
     names = [name for bit, name in ROWS_NATIVE_BITS if used & bit]
@@ -290,7 +305,18 @@ def rows_native_setup(ext, mask, exact: bool) -> dict:
           + (f"; this run uses {used} ({', '.join(names) if names else 'none: the Python row loops'})" if exact
              else "; the switch is off, none is used")
           + ("" if mask is None else f" [--exact-rows-caps {mask}]"), flush = True)
+    if exact and mask is not None and bool(mask & ONE_LAUNCH_BIT) != bool(used & ONE_LAUNCH_BIT):
+        print(f"  note: bit {ONE_LAUNCH_BIT} (one-launch) of --exact-rows-caps selects nothing: the extension makes "
+              f"the single launch inside the entry points of bits 1 (linear) and 2 (wo_a) whenever it reports the "
+              f"bit and they are used; here it is {'in use' if used & ONE_LAUNCH_BIT else 'not in use'}", flush = True)
     return {"extension": reported, "mask": mask, "used": used, "names": names}
+
+
+def _one_launches(ext):
+    """Calls the extension's row-exact entry points served with one launch so far
+    (exact_rows_one_launches), or None for an extension without the counter."""
+    count = getattr(ext, "exact_rows_one_launches", None)
+    return None if count is None else int(count())
 
 
 def _moe_rows_native(mlp):
@@ -2317,7 +2343,7 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     reps = max(2, args.timing_reps)
     plain, det, timing = {}, {}, {}
     for K in ks:
-        ta, tb, ha, hb = [], [], [], []
+        ta, tb, ha, hb, served = [], [], [], [], []
         det[K] = {"one_row": True, "k_row": True, "runs": reps}
         for i in range(reps):
             drv.host_s = 0.0
@@ -2326,11 +2352,14 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
             ta.append(time.perf_counter() - t)
             ha.append(drv.host_s)
             drv.rewind(K)
+            n0 = _one_launches(ext)
             drv.host_s = 0.0
             t = time.perf_counter()
             lb = drv.multi(K)
             tb.append(time.perf_counter() - t)
             hb.append(drv.host_s)
+            if n0 is not None:
+                served.append(_one_launches(ext) - n0)
             drv.rewind(K)
             if i == 0:
                 plain[K] = (la, lb)
@@ -2346,7 +2375,9 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
                      "one_row_steps_host_ms": {"median": round(1e3 * statistics.median(ha), 2),
                                                "min": round(1e3 * min(ha), 2)},
                      "k_row_forward_host_ms": {"median": round(1e3 * statistics.median(hb), 2),
-                                               "min": round(1e3 * min(hb), 2)}}
+                                               "min": round(1e3 * min(hb), 2)},
+                     # calls of the K-row forward the extension served with one launch, per repetition
+                     "one_launch_calls": served or None}
     print(f"timing, unhooked, {reps} repetitions, median [minimum]: K one-row steps, one K-row forward, and that "
           f"forward in one-row steps (wall clock around forward and logits copy; other load on the host shows); "
           f"'host': the part of each until model.forward returned, before the logits copy waits for the GPU")
@@ -2355,8 +2386,18 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
         print(f"   K={K}: {t['one_row_steps_ms']['median']:.1f} [{t['one_row_steps_ms']['min']:.1f}] ms"
               f" / {t['k_row_forward_ms']['median']:.1f} [{t['k_row_forward_ms']['min']:.1f}] ms"
               f"   {t['k_row_over_one_step']['median']:.2f}x [{t['k_row_over_one_step']['min']:.2f}x]"
-              f"   host {t['one_row_steps_host_ms']['median']:.1f} / {t['k_row_forward_host_ms']['median']:.1f} ms",
+              f"   host {t['one_row_steps_host_ms']['median']:.1f} / {t['k_row_forward_host_ms']['median']:.1f} ms"
+              + ("" if t["one_launch_calls"] is None else
+                 f"   one-launch calls {'/'.join(str(n) for n in sorted(set(t['one_launch_calls'])))}"),
               flush = True)
+    total = _one_launches(ext)
+    if total is None:
+        print("   one-launch calls: the extension has no exact_rows_one_launches (built before the single launch)")
+    else:
+        print(f"   one-launch calls: calls of run_alloc_rows and exl3_mgemm_rows in a K-row forward that were ONE "
+              f"launch under the launch record of a one-row call (the others made one launch per row); "
+              f"{total} since the extension was loaded", flush = True)
+    report["one_launches_after_timing"] = total
     report["timing"] = timing
 
     probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split, stable = stable)

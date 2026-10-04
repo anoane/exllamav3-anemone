@@ -9,7 +9,9 @@ left unset or set to that value, anything else is refused.
 
 EXL3_EXACT_ROWS is read in Python only. The extension does not read it: it reports which row-exact
 entry points it has (exact_rows_caps, exact_rows.h), and Python passes a flagged call to them or
-runs its own row loops (exact_rows_native).
+runs its own row loops (exact_rows_native). How an entry point gives the rows their one-row bits
+(a launch per row, or one launch under the launch record of a one-row call,
+EXACT_ROWS_CAP_ONE_LAUNCH) is the extension's choice per call; Python passes the same call either way.
 
 Torch-free, so tests can load this file by path.
 """
@@ -153,6 +155,11 @@ EXACT_ROWS_CAP_MGEMM = 2        # exl3_mgemm_rows
 EXACT_ROWS_CAP_ROUTER = 4       # routing_ds3_nogroup_rows
 EXACT_ROWS_CAP_MOE = 8          # BC_BlockSparseMLP.run_bszN_rows, rows_exact_ok
 EXACT_ROWS_CAP_HC = 16          # hc_collapse_rows, hc_partials_rows
+# Not an entry point, and nothing here selects by it: run_alloc_rows and exl3_mgemm_rows make one
+# launch for the rows where a one-row call is the cooperative FP16 kernel (for a mul1 linear with
+# EXL3_INT8_GEMV=0; for the grouped projection always), and count those calls
+# (exact_rows_one_launches). Tests and tools/dsv41_rowprobe.py read both
+EXACT_ROWS_CAP_ONE_LAUNCH = 32
 
 STABLE_ARITHMETIC = stable_arithmetic_enabled()
 HGEMM_FIXED_ROWS = hgemm_fixed_rows()

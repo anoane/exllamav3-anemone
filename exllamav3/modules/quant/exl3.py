@@ -171,8 +171,12 @@ class LinearEXL3:
     ) -> torch.Tensor:
         """
         EXL3_EXACT_ROWS: forward for a flagged call of 2 to EXACT_ROWS_MAX rows where
-        rows_native(params) holds. One native call (BC_LinearEXL3::run_alloc_rows) launches the
-        one-row call once per row, so every row has the bits forward gives it alone
+        rows_native(params) holds. One native call (BC_LinearEXL3::run_alloc_rows) gives every row
+        the bits forward gives it alone. Where a one-row call takes the int8-activation GEMV (the
+        mul1 codebook under the default EXL3_INT8_GEMV), it launches that call once per row. Where
+        a one-row call takes the cooperative FP16 kernel (EXL3_INT8_GEMV=0) and an extension that
+        reports EXACT_ROWS_CAP_ONE_LAUNCH, it makes one launch for the rows under the launch record
+        of the one-row call, which decodes the weights once
         """
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
         dtype = out_dtype or self.default_out_dtype

@@ -636,7 +636,9 @@ class Linear(Module):
         # projects one row per call, each the complete one-row call below. The kernel, its
         # activation format and its launch configuration follow the row count of a call. Where the
         # extension has the row-exact entry point and a one-row call is nothing but the EXL3
-        # projection (rows_native), one native call makes the one-row launches of every row.
+        # projection (rows_native), one native call gives every row its one-row bits: the one-row
+        # launch per row, or one launch for the rows under the launch record of a one-row call
+        # (BC_LinearEXL3::run_alloc_rows decides).
         # Otherwise the rows are forwarded one by one from here: every path below returns a tensor
         # it allocated in the call (LinearEXL3.forward and BC_LinearEXL3::run_alloc,
         # LinearFP16.forward), so the rows are concatenated, not copied
@@ -710,7 +712,8 @@ class Linear(Module):
         """
         EXL3_EXACT_ROWS: forward for a flagged call of several rows where rows_native holds. The
         zero-padding and the trim are those of forward on all rows at once (copies of values), the
-        projection is one native call that launches the one-row call once per row
+        projection is one native call that gives every row the bits of its one-row call
+        (LinearEXL3.forward_rows)
         """
         if x.shape[-1] < self.in_features:
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))

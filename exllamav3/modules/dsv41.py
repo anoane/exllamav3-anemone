@@ -1151,10 +1151,12 @@ class DSV41Attention(DSV4Attention):
         Returns (1, seq, hidden), as _project_o_grouped on the whole output does.
 
         Where the extension has the row-exact entry point and a one-row call takes the grouped
-        GEMM (use_mg in _project_o_grouped), one native call makes that call's launch for every
-        row: row j of the row-major copy is the (groups, 1, width) block the one-row call passes,
-        with that call's scratch, and row j of C the (1, groups * n) row its wo_b reads. wo_b then
-        gets the rows as one flagged call.
+        GEMM (use_mg in _project_o_grouped), one native call gives every row the bits of that
+        call: row j of the row-major copy is the (groups, 1, width) block the one-row call passes,
+        and row j of C the (1, groups * n) row its wo_b reads. The entry point makes that call's
+        launch once per row, with that call's scratch, or (an extension that reports
+        EXACT_ROWS_CAP_ONE_LAUNCH) one launch for the rows under that call's launch record. wo_b
+        then gets the rows as one flagged call.
         """
         G, rows, width = out.shape
         if ROWS_NATIVE & EXACT_ROWS_CAP_MGEMM:
