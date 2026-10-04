@@ -171,7 +171,8 @@ def main() -> int:
 
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = args.cache_tokens, max_batch_size = 1)
+    # max_history as model_init sets it for a draft of this length
+    cache = Cache(model, max_num_tokens = args.cache_tokens, max_batch_size = 1, max_history = DRAFT_TOKENS)
     model.load(progressbar = False, max_chunk_size = args.chunk)
     tok = Tokenizer.from_config(config)
     assert model.caps.get("exact_rows"), "not a model EXL3_EXACT_ROWS covers"
