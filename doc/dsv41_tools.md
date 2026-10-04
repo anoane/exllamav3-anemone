@@ -732,10 +732,12 @@ which validates the probe.
 Under `EXL3_EXACT_ROWS=1` (see `doc/env_vars.md`) the tool is that mode's acceptance test: the
 K-row forward then runs the operations that follow the row count one row per call, the wrappers
 follow those calls row by row, and every in-situ and replay line is expected to read `=`, with
-bit-equal logits. Per K it says whether the forward is one the mode covers; a forward whose rows
-cross a change of the attention plan (`--prefix 124`, `252`, `508` or `1020` with enough rows on
-DeepSeek-V4.1-Flash) is not, and keeps the default arithmetic. The report holds SHA-256 digests of
-the pristine one-row reference (its logits and every captured tensor), and
+bit-equal logits; the index selection and the attention kernel have no other test. The timing
+table then gives what a verify forward costs under the mode, in one-row steps: the figure that
+decides whether a draft pays. Per K it says whether the forward is one the mode covers; a forward
+whose rows cross a change of the attention plan (`--prefix 124`, `252`, `508` or `1020` with
+enough rows on DeepSeek-V4.1-Flash) is not, and keeps the default arithmetic. The report holds
+SHA-256 digests of the pristine one-row reference (its logits and every captured tensor), and
 `--same-pristine A.json B.json` compares those of two reports without importing torch: a run with
 the mode against one without it, on one `--tune-cache` file, shows that one-row steps keep their
 bits (exit status 0 equal, 1 different, 2 not comparable).

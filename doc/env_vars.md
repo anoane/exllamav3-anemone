@@ -1297,15 +1297,29 @@ With `1`, a cached DeepSeek-V4.1 forward of one sequence with 2 to 8 rows:
 
 The generator, for a model that supports the mode: proposes a draft only while one sequence is
 generating; shortens a draft so the verify forward has at most 8 rows, stays inside the job's
-pages and requeue budget and does not cross one of those positions (the rest of the draft is
-proposed again in the next round); requeues a job and sizes its default token budgets as without
-a draft; does not draft for a job with banned strings or multimodal embeddings.
+pages and requeue budget, does not cross one of those positions and stops below the job's next
+recurrent checkpoint position (the rest of the draft is proposed again in the next round);
+requeues a job and sizes its default token budgets as without a draft; does not draft for a job
+with banned strings or multimodal embeddings. So the identity is that of a job that generates
+alone from its prefill to its end: from the iteration in which a second sequence generates, both
+are computed as a batch of sequences, with or without a draft, and a drafted job has reached
+another token by then.
 
 One-row calls are unchanged, bit for bit. So are calls of 9 rows or more, batches of several
-sequences, the stateless path, draft models and every other architecture. A prefill chunk of 2 to
-8 rows (a short prompt tail) is computed row by row as well, so its rows get decode arithmetic. A
-verify forward costs about as many decode steps as it has rows, less what stays batched; drafting
-pays only at high acceptance.
+sequences, the stateless path, draft models and every other architecture (for which the generator
+prints a warning when a draft is configured: the mode does nothing there). A prefill chunk of 2
+to 8 rows (a short prompt tail) is computed row by row as well, so its rows get decode
+arithmetic.
+
+Cost: every operation that decodes weights runs once per row, so a verify forward of K rows
+costs up to K decode steps, less what stays batched. Without the mode it costs 1.1 (K = 2) to 1.7
+(K = 8) decode steps (measured on one host with DeepSeek-V4.1-Flash). A verify forward that costs
+c decode steps is faster than one-token steps only if more than c - 1 of its draft tokens are
+accepted, so drafting can be slower than not drafting under the mode. Measure both before
+serving with a draft: `tools/dsv41_rowprobe.py` prints c per K (its timing table, "that forward
+in one-row steps"), `tests/test_dsv41_exact_rows_gen_gpu_.py` the tokens per second of drafted
+and undrafted generation with the accepted and rejected draft tokens. Where the acceptance does
+not reach c - 1, serve the mode without a draft or with a shorter one (`num_draft_tokens`).
 
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported.
 Read once, in Python (`exllamav3.model.math_policy`); the extension does not read it and there is
@@ -1321,11 +1335,15 @@ What it does not cover: results still depend on the launch-autotune file, as one
 (keep one `EXLLAMAV3_TUNE_CACHE` file across runs that must agree), and on the placement (a layer
 on another GPU type has other one-row bits). Two runs agree only if they also prefill the prompt
 with the same forwards: a prompt-cache hit or another chunk size changes the bits of the prompt's
-own positions, with or without a draft.
+own positions, with or without a draft. A draft model whose verifier parameters reach the prefill
+(`draft_verifier_params`, `export_state_layers` for one) keeps it off the pipelined path of
+`EXL3_DSV41_PIPELINE=1`, so with that variable such a run and a run without the draft model
+prefill a long prompt with other forwards; an n-gram draft does not.
 
-`tools/dsv41_rowprobe.py` measures the mode operation by operation (every line of its tables
-reads `=`), `tests/test_dsv41_exact_rows_gpu_.py` checks each operation on each GPU, and
-`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation.
+`tools/dsv41_rowprobe.py` measures the mode operation by operation in a real forward (every line
+of its tables reads `=`), and is the only check of the index selection and of the attention
+kernel. `tests/test_dsv41_exact_rows_gpu_.py` checks the other operations one by one on each GPU,
+and `tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation.
 
 ```sh
 EXL3_EXACT_ROWS=1 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3
