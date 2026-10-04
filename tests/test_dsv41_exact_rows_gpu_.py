@@ -305,6 +305,10 @@ class ExactRows(unittest.TestCase):
         # calls on both sides (ext.exl3_gemm with a forced shape and block count, the int8 path
         # off), FP16 and FP32 output, on two linears whose widths take every shape between them
         ext = self.ext
+        if not hasattr(ext, "exl3_gemm_shape_compat"):
+            note = "skipped test_forced_shape_rows_equal_one_row_calls: the extension has no exl3_gemm_shape_compat"
+            print(f" -- exact rows: {note}", flush = True)
+            self.skipTest(note)
         for device in self.devices:
             is_exl3 = lambda lin: type(getattr(lin, "inner", None)).__name__ == "LinearEXL3"
             b = self.first(device, lambda blk: is_exl3(blk.attn.q_a) and is_exl3(blk.attn.q_b))
