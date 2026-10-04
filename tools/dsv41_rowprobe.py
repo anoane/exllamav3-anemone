@@ -47,12 +47,15 @@ captured tensor), the replay run against the capture run on every captured tenso
 change nothing), and coverage: every operation the layer facts call for was captured on every row
 or pool entry, else it is listed as NOT CAPTURED.
 
-Under EXL3_EXACT_ROWS=1 (doc/env_vars.md) the K-row forward runs the operations that follow the
-row count one row per call, and every table is expected to read '=': the tool is that mode's
-acceptance test. It reports per K whether the forward is one the mode covers (a call whose rows
-cross a change of the attention plan is not), and it stores SHA-256 digests of the pristine
-one-row reference, so that --same-pristine A.json B.json can show that one-row steps have the same
-bits with the mode on and off (two runs on one --tune-cache file).
+Under EXL3_EXACT_ROWS=1 (doc/env_vars.md) the K-row forward gives every row of the operations
+that follow the row count the launch of a one-row call, and every table is expected to read '=':
+the tool is that mode's acceptance test. It reports per K whether the forward is one the mode
+covers (a call whose rows cross a change of the attention plan is not), and it stores SHA-256
+digests of the pristine one-row reference, so that --same-pristine A.json B.json can show that
+one-row steps have the same bits with the mode on and off (two runs on one --tune-cache file).
+The mode makes those launches from the extension's row-exact entry points where it has them
+(exact_rows_caps), else from Python, one call per row: --exact-rows-caps MASK runs with a subset
+of the entry points (0: the Python loops alone), for the same tables and the verify cost of each.
 
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
@@ -113,6 +116,11 @@ BLOCK_OPS = ("hc_attn.mix", "attn_norm", "attn.wq_a", "attn.q_norm", "attn.wq_b"
              "hc_ffn.mix", "ffn_norm", "moe.router", "moe.out", "hc_ffn.apply")
 HEAD_OPS = ("head.collapse", "norm", "head")
 
+# EXL3_EXACT_ROWS: the modules that hold the extension's row-exact entry points (ROWS_NATIVE, the
+# bits of math_policy.EXACT_ROWS_CAP_*), and the bits by name
+ROWS_NATIVE_MODULES = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
+ROWS_NATIVE_BITS = ((1, "linear"), (2, "wo_a"), (4, "router"), (8, "moe"), (16, "hc"))
+
 TUNE_MAGIC = b"EX3ATUNE"
 TUNE_FILE = "coop_autotune_v1.bin"
 _M64 = (1 << 64) - 1
@@ -169,6 +177,8 @@ examples:
   python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --prefix 40 --rows 2,8 --no-replay
   EXL3_STABLE_ARITHMETIC=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --allow-stable
   EXL3_EXACT_ROWS=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --tune-cache tune.bin --out on.json
+  EXL3_EXACT_ROWS=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --tune-cache tune.bin \\
+      --exact-rows-caps 0 --out loops.json
   python3 tools/dsv41_rowprobe.py --same-pristine off.json on.json
   (--model defaults to DSV41_MODEL_DIR, --ref to DSV41_VLLM_REF)
 """, formatter_class = argparse.RawDescriptionHelpFormatter, allow_abbrev = False)
@@ -207,6 +217,11 @@ examples:
     ap.add_argument("--timing-reps", type = int, default = 5,
                     help = "unhooked repetitions of both arms per K (default 5, at least 2): all must agree bit "
                            "for bit, and the verify cost is reported as their median and minimum")
+    ap.add_argument("--exact-rows-caps", type = int, default = None, metavar = "MASK",
+                    help = "under EXL3_EXACT_ROWS=1: use only these row-exact entry points of the extension, a sum "
+                           "of 1 (EXL3 linears), 2 (grouped wo_a), 4 (router), 8 (MoE experts), 16 (hyper-connection "
+                           "sums); 0 runs the Python row loops alone. Default: all the extension reports. The MoE "
+                           "needs 4 and 8 together")
     ap.add_argument("--tune-cache", default = "copy", metavar = "copy|live|PATH",
                     help = "launch-autotune cache the extension uses: 'copy' (default) a private copy of the live "
                            "file, removed when the run ends, so the probe reads serving's records and never "
@@ -254,6 +269,40 @@ def print_policy(policy: dict):
     print(f"  EXACT_ROWS         {on(policy['exact_rows'])}")
     env = [f"{k}={os.environ[k]}" for k in POLICY_ENV if k in os.environ]
     print(f"  arithmetic switches set in the environment: {' '.join(env) if env else 'none'}", flush = True)
+
+
+def rows_native_setup(ext, mask, exact: bool) -> dict:
+    """
+    EXL3_EXACT_ROWS: the row-exact entry points this run uses. Every consumer module read them from
+    the extension when it was imported (ROWS_NATIVE); --exact-rows-caps masks them in all of them, so
+    that an operation keeps its Python row loop. Without the switch nothing is used or changed.
+    """
+    caps = getattr(ext, "exact_rows_caps", None)
+    reported = None if caps is None else int(caps())
+    used = 0
+    if exact:
+        used = (reported or 0) if mask is None else (reported or 0) & mask
+        for name in ROWS_NATIVE_MODULES:
+            importlib.import_module(f"exllamav3.modules.{name}").ROWS_NATIVE = used
+    names = [name for bit, name in ROWS_NATIVE_BITS if used & bit]
+    print("row-exact entry points (EXL3_EXACT_ROWS): the extension reports "
+          + ("none (it was built before them)" if reported is None else str(reported))
+          + (f"; this run uses {used} ({', '.join(names) if names else 'none: the Python row loops'})" if exact
+             else "; the switch is off, none is used")
+          + ("" if mask is None else f" [--exact-rows-caps {mask}]"), flush = True)
+    return {"extension": reported, "mask": mask, "used": used, "names": names}
+
+
+def _moe_rows_native(mlp):
+    """Whether a flagged call of several rows is ONE forward on this MoE layer (DSV41MoE.rows_native_layer:
+    EXL3_EXACT_ROWS with the row-exact router and expert entry points in use), else one forward per row;
+    None where the question does not arise."""
+    mod = sys.modules.get("exllamav3.modules.dsv41_moe")
+    layer = getattr(mlp, "rows_native_layer", None)
+    need = getattr(mod, "ROWS_NATIVE_MOE", None)
+    if layer is None or need is None or mod.ROWS_NATIVE & need != need:
+        return None
+    return bool(layer())
 
 
 # ---------------------------------------------------------------------------------
@@ -566,7 +615,8 @@ class Probe:
     def units(self, kind: str, n: int, op: str, base: int | None = None):
         """
         The units one call of n rows (or pool entries) covers. An operation the engine runs in
-        several calls per forward (one row or one entry per call under EXL3_EXACT_ROWS) continues
+        several calls per forward (one row or one entry per call under EXL3_EXACT_ROWS, where no
+        row-exact entry point of the extension takes the rows in one call) continues
         where its previous call of this forward ended; a caller that knows the position of the
         call's first row passes it (base). None, with a note, when the rows are not rows of the
         forward.
@@ -683,6 +733,7 @@ class Probe:
                 "owns_index_k": at.indexer is not None and at.indexer.wk is not None,
                 "moe_bc": getattr(b.mlp, "bc", None) is not None,
                 "sh_coop": getattr(getattr(b.mlp, "bc", None), "sh_coop", None),
+                "moe_rows_native": _moe_rows_native(b.mlp),
                 "expert_cache": getattr(b.mlp, "tier", None) is not None,
             }
             self._hook_block(b, L)
@@ -729,6 +780,12 @@ class Probe:
         self.patch(m_cached.CompressCarry, "step", self._make_carry_step)
         self.patch(self.ext, "exl3_mgemm", self._make_mgemm)
         self.patch(self.ext, "routing_ds3_nogroup", self._make_routing)
+        # EXL3_EXACT_ROWS, an extension with the row-exact entry points: the grouped projection and
+        # the routing of a flagged call are one call each for its rows, to these
+        if hasattr(self.ext, "exl3_mgemm_rows"):
+            self.patch(self.ext, "exl3_mgemm_rows", self._make_mgemm_rows)
+        if hasattr(self.ext, "routing_ds3_nogroup_rows"):
+            self.patch(self.ext, "routing_ds3_nogroup_rows", self._make_routing)
 
     # -- blocks, head --
 
@@ -786,7 +843,8 @@ class Probe:
         def make(orig):
             def forward(x, params, out_dtype = None):
                 # Under EXL3_EXACT_ROWS a call of several rows calls this module again once per row
-                # (Linear.forward): the outer call is the operation, the nested ones pass through
+                # (Linear.forward), unless the extension's row-exact entry point takes the rows in
+                # that one call: the outer call is the operation, nested ones pass through
                 if not self.on() or depth[0]:
                     return orig(x, params, out_dtype)
                 depth[0] += 1
@@ -1335,15 +1393,56 @@ class Probe:
             self.replay("attn.wo_a", rows)
         return exl3_mgemm
 
+    def _make_mgemm_rows(self, orig):
+        """ext.exl3_mgemm_rows: the grouped output projection of a flagged call's rows in one call, A
+        (rows, groups, k) and C (rows, groups, n) row-major, every row the one-row ext.exl3_mgemm launch.
+        Only DSV41Attention._project_o_rows calls it."""
+        torch = self.torch
+
+        def exl3_mgemm_rows(*args, **kwargs):
+            tag = orig(*args, **kwargs)
+            if self.on() and self.layer is not None and len(args) >= 10:
+                self.guard("attn.wo_a", after, args, tag)
+            return tag
+
+        def after(args, tag):
+            A, C = args[0], args[2]
+            seq, G, k = A.shape
+            units = self.units("row", seq, "attn.wo_a")
+            if units is None:
+                return
+            # one launch per row inside the call: the tag is the one-row launch's
+            self.record("attn.wo_a", units, {"A": A}, {"C": C}, meta = {"rows": seq, "tag": None if tag is None else int(tag)})
+            key = f"attn.wo_a @ {A.device}"
+            ent = self.tags.get(key)
+            if ent is None:
+                ent = self.tags[key] = dict(self._device_facts(A.device), K = args[7], mul1 = bool(args[9]),
+                                            mcg = bool(args[8]), fp32_out = C.dtype == torch.float, groups = G, on = {})
+                ent["in"], ent["out"] = k, C.shape[2]
+            if tag is not None:
+                ent["on"][1] = int(tag)
+
+            def rows():
+                # the call a one-row step makes (DSV4Attention._project_o_grouped), on copies of the row
+                for r in range(seq):
+                    a = A[r].unsqueeze(1).clone()
+                    c = torch.empty((G, 1, C.shape[2]), dtype = C.dtype, device = C.device)
+                    self.ext.exl3_mgemm(a, args[1], c, args[3], torch.empty_like(a), args[5], args[6], None,
+                                        args[7], -1, args[8], args[9], -1, -1, 0, 1, None, None)
+                    self.rep("attn.wo_a:C", r, c[:, 0].reshape(-1), C[r].reshape(-1))
+            self.replay("attn.wo_a", rows)
+        return exl3_mgemm_rows
+
     # -- MoE --
 
     def _make_routing(self, orig):
         def routing_ds3_nogroup(*args, **kwargs):
             res = orig(*args, **kwargs)
             stage = self.moe_stage
-            # The layer's own routing calls are those on its own gate: one for the call, or one per
-            # row under EXL3_EXACT_ROWS. A prefetch prediction of the expert cache routes the same
-            # input through a later layer's gate
+            # The layer's own routing calls are those on its own gate: one for the call (under
+            # EXL3_EXACT_ROWS through ext.routing_ds3_nogroup_rows, which this also wraps), or one
+            # per row where that mode runs the layer row by row. A prefetch prediction of the
+            # expert cache routes the same input through a later layer's gate
             if stage is None or len(args) < 6 or args[1] is not self.moe_gate:
                 return res
             n = args[0].shape[0]
@@ -1945,6 +2044,7 @@ class Driver:
         self.block_table = torch.arange(self.state.slot * pages, (self.state.slot + 1) * pages,
                                         dtype = torch.int32)[None, :]
         self.probe = None
+        self.host_s = 0.0       # time inside model.forward since the caller reset it (before the logits copy)
 
     def params(self, history: bool) -> dict:
         """What Generator.iterate_gen passes to model.forward (generator/generator.py): history is
@@ -1988,7 +2088,10 @@ class Driver:
         for r in range(K):
             if run is not None:
                 self.probe.begin(run, self.P + r, 1)
-            out.append(self._logits(self.model.forward(self.ids[:, self.P + r: self.P + r + 1], self.params(False)), 1))
+            t = time.perf_counter()
+            logits = self.model.forward(self.ids[:, self.P + r: self.P + r + 1], self.params(False))
+            self.host_s += time.perf_counter() - t
+            out.append(self._logits(logits, 1))
         logits = self.torch.cat(out, dim = 0)
         if run is not None:
             run.logits = logits
@@ -1998,7 +2101,10 @@ class Driver:
         """Arm (b): one verify forward of K rows. Returns the (K, vocab) logits."""
         if run is not None:
             self.probe.begin(run, self.P, K)
-        logits = self._logits(self.model.forward(self.ids[:, self.P: self.P + K], self.params(True)), K)
+        t = time.perf_counter()
+        logits = self.model.forward(self.ids[:, self.P: self.P + K], self.params(True))
+        self.host_s += time.perf_counter() - t
+        logits = self._logits(logits, K)
         if run is not None:
             run.logits = logits
         return logits
@@ -2068,6 +2174,7 @@ def _run_gpu(val, args, ks: list, out: str, report: dict, env: dict, tune: dict,
     import torch
     from exllamav3 import Cache, Config, Model
     from exllamav3.ext import exllamav3_ext as ext
+    report["exact_rows_native"] = rows_native_setup(ext, args.exact_rows_caps, report["arithmetic"]["exact_rows"])
 
     shown = {k: os.environ[k] for k in tuple(val.REPORT_ENV) + ("EXLLAMAV3_TUNE_CACHE",) if k in os.environ}
     print(f"environment: {shown}", flush = True)
@@ -2210,16 +2317,20 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     reps = max(2, args.timing_reps)
     plain, det, timing = {}, {}, {}
     for K in ks:
-        ta, tb = [], []
+        ta, tb, ha, hb = [], [], [], []
         det[K] = {"one_row": True, "k_row": True, "runs": reps}
         for i in range(reps):
+            drv.host_s = 0.0
             t = time.perf_counter()
             la = drv.one_row(K)
             ta.append(time.perf_counter() - t)
+            ha.append(drv.host_s)
             drv.rewind(K)
+            drv.host_s = 0.0
             t = time.perf_counter()
             lb = drv.multi(K)
             tb.append(time.perf_counter() - t)
+            hb.append(drv.host_s)
             drv.rewind(K)
             if i == 0:
                 plain[K] = (la, lb)
@@ -2231,20 +2342,34 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
                      "one_row_steps_ms": {"median": round(1e3 * ma, 2), "min": round(1e3 * min(ta), 2)},
                      "k_row_forward_ms": {"median": round(1e3 * mb, 2), "min": round(1e3 * min(tb), 2)},
                      "k_row_over_one_step": {"median": round(mb / (ma / K), 2),
-                                             "min": round(min(tb) / (min(ta) / K), 2)}}
+                                             "min": round(min(tb) / (min(ta) / K), 2)},
+                     "one_row_steps_host_ms": {"median": round(1e3 * statistics.median(ha), 2),
+                                               "min": round(1e3 * min(ha), 2)},
+                     "k_row_forward_host_ms": {"median": round(1e3 * statistics.median(hb), 2),
+                                               "min": round(1e3 * min(hb), 2)}}
     print(f"timing, unhooked, {reps} repetitions, median [minimum]: K one-row steps, one K-row forward, and that "
-          f"forward in one-row steps (wall clock around forward and logits copy; other load on the host shows)")
+          f"forward in one-row steps (wall clock around forward and logits copy; other load on the host shows); "
+          f"'host': the part of each until model.forward returned, before the logits copy waits for the GPU")
     for K in ks:
         t = timing[K]
         print(f"   K={K}: {t['one_row_steps_ms']['median']:.1f} [{t['one_row_steps_ms']['min']:.1f}] ms"
               f" / {t['k_row_forward_ms']['median']:.1f} [{t['k_row_forward_ms']['min']:.1f}] ms"
-              f"   {t['k_row_over_one_step']['median']:.2f}x [{t['k_row_over_one_step']['min']:.2f}x]", flush = True)
+              f"   {t['k_row_over_one_step']['median']:.2f}x [{t['k_row_over_one_step']['min']:.2f}x]"
+              f"   host {t['one_row_steps_host_ms']['median']:.1f} / {t['k_row_forward_host_ms']['median']:.1f} ms",
+              flush = True)
     report["timing"] = timing
 
     probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split, stable = stable)
     drv.probe = probe
     probe.install()
     print(f"wrapped {len(probe.patches)} methods and calls", flush = True)
+    if exact:
+        one = [L for L, f in probe.layers.items() if f["moe_rows_native"]]
+        per_row = [L for L, f in probe.layers.items() if not f["moe_rows_native"]]
+        no_coop = [L for L, f in probe.layers.items() if not f["sh_coop"]]
+        print(f"MoE of a flagged forward: one call for its rows on layers {_ranges(one) or 'none'}, one call per row "
+              f"on layers {_ranges(per_row) or 'none'}; shared expert not a fused launch on layers "
+              f"{_ranges(no_coop) or 'none'}", flush = True)
     n_layers = probe.n_layers
     report["layers"] = probe.layers
     report["linears"] = probe.linears
@@ -2443,6 +2568,13 @@ def main(argv = None) -> int:
         value = getattr(args, name)
         if value is not None and value < (0 if name == "prefix" else 1):
             print(f"--{name.replace('_', '-')} must be {'nonnegative' if name == 'prefix' else 'positive'}")
+            return 2
+    if args.exact_rows_caps is not None:
+        if not policy["exact_rows"]:
+            print("--exact-rows-caps needs EXL3_EXACT_ROWS=1: without the switch no row-exact entry point is used")
+            return 2
+        if not 0 <= args.exact_rows_caps <= sum(bit for bit, _ in ROWS_NATIVE_BITS):
+            print(f"--exact-rows-caps must be a sum of {', '.join(f'{bit} ({name})' for bit, name in ROWS_NATIVE_BITS)}")
             return 2
     if args.timing_reps < 2:
         print("--timing-reps must be at least 2: the determinism check compares the repetitions")

@@ -37,8 +37,10 @@ skips them.
 
 (checkpoint-dir defaults to $DSV41_MODEL_DIR; the placement comes from EXL3_PLACEMENT and
 CUDA_VISIBLE_DEVICES.) Run it once with EXL3_MOE_TIER_VERIFY=1 too: under the mode the MoE looks
-the expert cache up once per row of a verify forward, back to back. Loads the whole model: run it
-alone on the host. Exit status 0 passed, 1 failed, 2 not run.
+the expert cache up once for the rows of a verify forward (up to 8 x top-k experts in one decode
+lookup) where the extension has the row-exact entry points, and once per row, back to back, where
+it does not. Loads the whole model: run it alone on the host. Exit status 0 passed, 1 failed,
+2 not run.
 """
 import argparse
 import hashlib

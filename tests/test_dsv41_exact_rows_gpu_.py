@@ -21,18 +21,67 @@ Not covered: the index selection and the attention kernel, which need real pools
 of these operations in a forward. tools/dsv41_rowprobe.py under EXL3_EXACT_ROWS=1 is the evidence
 for those (idx.scores, idx.topk, attn.dsa_attn and the forward's logits in its tables).
 
+A flagged call takes the extension's row-exact entry points where it has them (exact_rows_caps:
+the rows of an EXL3 linear, of the grouped output projection and of the router in one native call,
+the MoE experts of all rows in one launch pair, the hyper-connection sums), else the Python loops
+of one call per row. The tests above cover whichever the extension gives. The test_native_* tests
+need the entry points and are skipped, with a printed note, for an extension built before them:
+each operation with the entry points against the Python row loop on the same input (the consumers'
+ROWS_NATIVE set to 0), with the row loops made to raise where the entry point must serve; the
+linears on the activations of a real forward too; the expert launch pair and the router against
+one-row calls on crafted and natural routing; and what each entry point refuses.
+
     EXL3_EXACT_ROWS=1 DSV41_MODEL_DIR=<checkpoint> python -m pytest tests/test_dsv41_exact_rows_gpu_.py
 
 Needs CUDA, the compiled extension and the checkpoint; skipped without the switch. Loads the whole
 model: run it alone on the host.
 """
+import importlib
 import os
 import unittest
+from contextlib import contextmanager
+from unittest import mock
 
 import torch
 
 ROWS = range(2, 9)
 FLAGGED = {"exact_rows": True}
+# The row-exact entry points of the extension (math_policy.EXACT_ROWS_CAP_*), and the modules that
+# hold what the extension reports (ROWS_NATIVE)
+CAP_LINEAR, CAP_MGEMM, CAP_ROUTER, CAP_MOE, CAP_HC = 1, 2, 4, 8, 16
+NATIVE_CONSUMERS = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
+# name, the Linear of a block or None, input dims, out_dtype the engine passes
+LINEAR_OPS = (
+    ("attn.wq_a", lambda b: b.attn.q_a, 3, None),
+    ("attn.wq_b", lambda b: b.attn.q_b, 3, None),
+    ("attn.wkv", lambda b: b.attn.wkv, 3, None),
+    ("attn.wo_b", lambda b: b.attn.wo_b, 3, None),
+    ("comp.wkv", lambda b: b.attn.compressor.wkv if b.attn.compressor else None, 3, None),
+    ("comp.wgate", lambda b: b.attn.compressor.wgate if b.attn.compressor else None, 3, None),
+    ("idx.wq_b", lambda b: b.attn.indexer.wq_b if b.attn.indexer else None, 3, None),
+    ("idx.weights_proj", lambda b: b.attn.indexer.weights_proj if b.attn.indexer else None, 3, None),
+    ("idx.wk", lambda b: b.attn.indexer.wk if b.attn.indexer else None, 2, None),
+    ("engram.wkv", lambda b: b.engram.wkv if b.engram is not None else None, 3, torch.float),
+)
+
+
+@contextmanager
+def rows_native(caps: int):
+    """The consumers' ROWS_NATIVE set to caps for the block: what the extension reports, or 0 for
+    the Python row loops alone."""
+    mods = [importlib.import_module(f"exllamav3.modules.{name}") for name in NATIVE_CONSUMERS]
+    saved = [m.ROWS_NATIVE for m in mods]
+    for m in mods:
+        m.ROWS_NATIVE = caps
+    try:
+        yield
+    finally:
+        for m, value in zip(mods, saved):
+            m.ROWS_NATIVE = value
+
+
+def _refuse(*args, **kwargs):
+    raise AssertionError("the Python row loop ran where the row-exact entry point must serve")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -60,7 +109,12 @@ class ExactRows(unittest.TestCase):
             if torch.device(b.device) not in cls.devices:
                 cls.devices.append(torch.device(b.device))
         cls.rng = torch.Generator().manual_seed(20261004)
-        print(f" -- exact rows: {n} layers on {', '.join(str(d) for d in cls.devices)}", flush = True)
+        from exllamav3.ext import exllamav3_ext as ext
+        cls.ext = ext
+        cls.caps = int(ext.exact_rows_caps()) if hasattr(ext, "exact_rows_caps") else 0
+        cls.real_inputs = None
+        print(f" -- exact rows: {n} layers on {', '.join(str(d) for d in cls.devices)}; row-exact entry points of "
+              f"the extension: {cls.caps or 'none (the Python row loops serve every flagged call)'}", flush = True)
 
     @classmethod
     def tearDownClass(cls):
@@ -98,19 +152,7 @@ class ExactRows(unittest.TestCase):
 
     @torch.inference_mode()
     def test_linears(self):
-        ops = (
-            # name, the Linear of a block or None, input dims, out_dtype the engine passes
-            ("attn.wq_a", lambda b: b.attn.q_a, 3, None),
-            ("attn.wq_b", lambda b: b.attn.q_b, 3, None),
-            ("attn.wkv", lambda b: b.attn.wkv, 3, None),
-            ("attn.wo_b", lambda b: b.attn.wo_b, 3, None),
-            ("comp.wkv", lambda b: b.attn.compressor.wkv if b.attn.compressor else None, 3, None),
-            ("comp.wgate", lambda b: b.attn.compressor.wgate if b.attn.compressor else None, 3, None),
-            ("idx.wq_b", lambda b: b.attn.indexer.wq_b if b.attn.indexer else None, 3, None),
-            ("idx.weights_proj", lambda b: b.attn.indexer.weights_proj if b.attn.indexer else None, 3, None),
-            ("idx.wk", lambda b: b.attn.indexer.wk if b.attn.indexer else None, 2, None),
-            ("engram.wkv", lambda b: b.engram.wkv if b.engram is not None else None, 3, torch.float),
-        )
+        ops = LINEAR_OPS
         tested = set()
         for device in self.devices:
             for name, get, dims, out_dtype in ops:
@@ -281,6 +323,405 @@ class ExactRows(unittest.TestCase):
                         self.assertEqual((first, many.shape[0]), (pos0 // 2, (pos0 + K) // 2 - pos0 // 2))
                         self.same_rows("compressor rate 2", many, ones)
                         self.assertTrue(torch.equal(ring_many, ring_ones), "the carry rings differ")
+
+    # -- the row-exact entry points of the extension (test_native_*) --
+
+    def need(self, bits: int):
+        """Skip, with a note, unless the extension reports these row-exact entry points."""
+        if not self.caps or self.caps & bits != bits:
+            note = f"skipped {self.id().rsplit('.', 1)[-1]}: the extension reports the row-exact entry points " \
+                   f"{self.caps or 'none'}, the test needs {bits or 'some'}"
+            print(f" -- exact rows: {note}", flush = True)
+            self.skipTest(note)
+
+    @contextmanager
+    def counted(self, name: str):
+        """ext.<name> wrapped for the block: a list that grows by one per call."""
+        calls, orig = [], getattr(self.ext, name)
+
+        def wrapper(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+        with mock.patch.object(self.ext, name, wrapper):
+            yield calls
+
+    def same(self, what, native, loop):
+        self.assertEqual(native.dtype, loop.dtype, what)
+        self.assertEqual(tuple(native.shape), tuple(loop.shape), what)
+        self.assertTrue(torch.equal(native, loop), f"{what}: the entry point's rows differ from the Python row loop's")
+
+    def linear_both(self, what, lin, x, out_dtype) -> bool:
+        """lin on x flagged, with the extension's entry points and with the Python row loop alone.
+        Returns whether the entry point served: then the row loop must not have run."""
+        m_linear = importlib.import_module("exllamav3.modules.linear")
+        with rows_native(self.caps):
+            served = lin.rows_native(x, FLAGGED)
+            if served:
+                with mock.patch.object(m_linear, "forward_rows", _refuse):
+                    native = lin.forward(x, dict(FLAGGED), out_dtype).clone()
+            else:
+                native = lin.forward(x, dict(FLAGGED), out_dtype).clone()
+        with rows_native(0):
+            loop = lin.forward(x, dict(FLAGGED), out_dtype).clone()
+        self.same(what, native, loop)
+        return served
+
+    @torch.inference_mode()
+    def test_native_equals_python_loop_linears(self):
+        self.need(CAP_LINEAR)
+        served = {}
+        for device in self.devices:
+            for name, get, dims, out_dtype in LINEAR_OPS:
+                b = self.first(device, lambda blk: get(blk) is not None)
+                if b is None:
+                    continue
+                lin = get(b)
+                for K in ROWS:
+                    with self.subTest(op = name, layer = b.layer_idx, device = str(device), K = K):
+                        shape = (1, K, lin.in_features) if dims == 3 else (K, lin.in_features)
+                        took = self.linear_both(f"{name} L{b.layer_idx}", lin, self.randn(shape, device), out_dtype)
+                        served.setdefault(str(device), {}).setdefault(name, set()).add(took)
+        head = self.tail["head"]
+        for K in ROWS:
+            with self.subTest(op = "head", device = str(head.device), K = K):
+                took = self.linear_both("head", head, self.randn((1, K, head.in_features), head.device), None)
+                served.setdefault(str(torch.device(head.device)), {}).setdefault("head", set()).add(took)
+        for device, ops in served.items():
+            entry = sorted(name for name, took in ops.items() if took == {True})
+            loops = sorted(name for name, took in ops.items() if took != {True})
+            print(f" -- exact rows: linears on {device}: one native call for the rows of {', '.join(entry) or 'NONE'}; "
+                  f"the Python row loop for {', '.join(loops) or 'none'}", flush = True)
+            with self.subTest(device = device):
+                self.assertTrue(entry, f"no linear on {device} went through run_alloc_rows")
+
+    @classmethod
+    def captured_linear_inputs(cls) -> dict:
+        """
+        {(operation, device): (the Linear, out_dtype, x)}: what the first layer of each device that
+        has the operation, and the head, were called with in one cached forward of 8 rows that
+        follows a prefill of 1200 random tokens, driven as the generator drives a verify forward
+        (the params of tools/dsv41_rowprobe.py, Driver). 1200 is past every change of the attention
+        plan, so the forward is one the mode flags.
+        """
+        if cls.real_inputs is not None:
+            return cls.real_inputs
+        from exllamav3.constants import PAGE_SIZE
+        model, cache = cls.model, cls.cache
+        P, K = 1200, 8
+        ids = torch.randint(0, model.config.vocab_size, (1, P + K), generator = cls.rng)
+        state = cache.get_new_state()
+        pages = cache.max_num_tokens // PAGE_SIZE // cache.num_slots
+        block_table = torch.arange(state.slot * pages, (state.slot + 1) * pages, dtype = torch.int32)[None, :]
+        targets = {}
+        for device in cls.devices:
+            for name, get, _, _ in LINEAR_OPS:
+                b = next((b for b in cls.blocks if torch.device(b.device) == device and get(b) is not None), None)
+                if b is not None:
+                    targets[(name, str(device))] = get(b)
+        head = cls.tail["head"]
+        targets[("head", str(torch.device(head.device)))] = head
+        captured, hooked = {}, []
+
+        def hook(key, lin):
+            orig = lin.forward
+
+            def forward(x, params, out_dtype = None):
+                # the call of the forward's rows, with the out_dtype the engine passes; the nested
+                # one-row calls of the Python row loop are not captured
+                if key not in captured and 2 <= x.numel() // x.shape[-1] <= 8:
+                    captured[key] = (lin, out_dtype, x.clone())
+                return orig(x, params, out_dtype)
+            lin.forward = forward
+            hooked.append(lin)
+        try:
+            for key, lin in targets.items():
+                hook(key, lin)
+            model.prefill(ids[:, :P], {
+                "attn_mode": "flash_attn", "block_table": block_table, "cache": cache,
+                "cache_seqlens": torch.tensor([0], dtype = torch.int32),
+                "recurrent_states": [state], "indexed_embeddings": []})
+            captured.clear()        # the prefill's own calls of 2 to 8 entries, if any
+            model.forward(ids[:, P:], {
+                "attn_mode": "flash_attn", "block_table": block_table, "cache": cache,
+                "cache_seqlens": torch.tensor([state.position], dtype = torch.int32),
+                "recurrent_states": [state], "indexed_embeddings": [], "positions": None,
+                "recurrent_history": True, "pinned_staging": True})
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(i)
+        finally:
+            for lin in hooked:
+                del lin.forward
+            cache.release_state(state)
+        cls.real_inputs = captured
+        return captured
+
+    @torch.inference_mode()
+    def test_native_equals_python_loop_linears_real_activations(self):
+        self.need(CAP_LINEAR)
+        captured = self.captured_linear_inputs()
+        self.assertTrue(captured, "the forward reached no Linear with 2 to 8 rows")
+        print(f" -- exact rows: real activations of {len(captured)} linears: "
+              f"{', '.join(sorted(f'{name} @ {device}' for name, device in captured))}", flush = True)
+        for (name, device), (lin, out_dtype, x) in sorted(captured.items(), key = lambda kv: kv[0]):
+            with self.subTest(op = name, device = device, rows = x.numel() // x.shape[-1]):
+                self.linear_both(f"{name} @ {device}, real activations", lin, x, out_dtype)
+                # and against the one-row calls themselves, as test_linears does on random rows
+                self.linear_rows(f"{name} @ {device}, real activations", lin, x, out_dtype)
+
+    @torch.inference_mode()
+    def test_native_equals_python_loop_grouped_output_projection(self):
+        self.need(CAP_MGEMM)
+        for device in self.devices:
+            at = self.first(device, lambda blk: True).attn
+            G, width = at.o_groups, at.num_q_heads // at.o_groups * at.head_dim
+            if not at.woa_multi_ready and at.device is not None:
+                at._build_woa_multi()
+            self.assertIsNotNone(at.wo_a_multi, f"L{at.layer_idx}: the grouped GEMM does not serve wo_a")
+            for K in ROWS:
+                with self.subTest(layer = at.layer_idx, device = str(device), K = K):
+                    out = self.randn((G, K, width), device)
+                    with rows_native(self.caps), self.counted("exl3_mgemm_rows") as calls, \
+                            mock.patch.object(at, "_project_o_grouped", _refuse):
+                        native = at._project_o_rows(out, dict(FLAGGED), None).clone()
+                    self.assertEqual(len(calls), 1, "exl3_mgemm_rows calls")
+                    with rows_native(0):
+                        loop = at._project_o_rows(out, dict(FLAGGED), None).clone()
+                    self.same(f"wo_a/wo_b L{at.layer_idx}", native, loop)
+
+    def moe_layers(self, device):
+        """A layer whose experts are in the expert cache and a resident one, where the device has them."""
+        in_cache = lambda blk: getattr(blk.mlp, "tier", None) is not None
+        found = (self.first(device, in_cache), self.first(device, lambda blk: not in_cache(blk)))
+        return [(b, "cache" if in_cache(b) else "resident") for b in found if b is not None]
+
+    @torch.inference_mode()
+    def test_native_equals_python_loop_moe(self):
+        self.need(CAP_ROUTER | CAP_MOE)
+        m_moe = importlib.import_module("exllamav3.modules.dsv41_moe")
+        one_call = []
+        for device in self.devices:
+            for b, experts in self.moe_layers(device):
+                mlp = b.mlp
+                served = False
+                for K in ROWS:
+                    with self.subTest(layer = b.layer_idx, device = str(device), K = K, experts = experts):
+                        x = self.randn((1, K, mlp.hidden_size), device)
+                        with rows_native(self.caps):
+                            served = mlp.rows_native(x, FLAGGED)
+                            if served:
+                                with self.counted("routing_ds3_nogroup_rows") as calls, \
+                                        mock.patch.object(m_moe, "forward_rows", _refuse):
+                                    native = mlp.forward(x, dict(FLAGGED)).clone()
+                                self.assertEqual(len(calls), 1, "routing_ds3_nogroup_rows calls")
+                            else:
+                                native = mlp.forward(x, dict(FLAGGED)).clone()
+                        with rows_native(0):
+                            loop = mlp.forward(x, dict(FLAGGED)).clone()
+                        self.same(f"moe L{b.layer_idx}", native, loop)
+                print(f" -- exact rows: MoE L{b.layer_idx} on {device} ({experts} experts): bc.sh_coop "
+                      f"{getattr(mlp.bc, 'sh_coop', None)}, one forward for the rows: {'yes' if served else 'NO'}",
+                      flush = True)
+                one_call.append(served)
+        self.assertTrue(any(one_call), "no tested MoE layer is served by the row-exact entry points")
+
+    def moe_launch(self, mlp, y, sel, w, rows_entry: bool):
+        """The fused decode launch pair of an MoE layer on a given routing, as BlockSparseMLP.forward
+        makes it (the expert cache lookup of the call first, where the layer has one). Returns a
+        copy of the routed sum, (rows, hidden)."""
+        cached = getattr(mlp, "tier", None) is not None
+        if cached:
+            mlp.tier_resolve(sel, y.shape[0], {})
+        if rows_entry:
+            mlp.bc.run_bszN_rows(y, sel, w)
+        else:
+            mlp.bc.run_bszN(y, sel, w)
+        out = mlp.experts_cfg.out_bszn[:y.shape[0]].clone()
+        if cached:
+            mlp.tier_after_compute({})
+        return out
+
+    @torch.inference_mode()
+    def test_native_moe_selections(self):
+        # The gate of the single launch pair: run_bszN_rows on K rows against K one-row run_bszN
+        # calls on the same routing. From 6 rows on the stock launch of the sm_120 card switches
+        # the tile, and rows that picked one expert are grouped at every K: neither may show here
+        self.need(CAP_MOE)
+        tested = []
+        for device in self.devices:
+            cc = self.ext.g_get_cc(device.index if device.index is not None else torch.cuda.current_device())
+            for b, experts in self.moe_layers(device):
+                mlp = b.mlp
+                topk, cfg = mlp.num_experts_per_tok, mlp.routing_cfg
+                if mlp.bc is None or not mlp.bc.rows_exact_ok(topk):
+                    print(f" -- exact rows: MoE L{b.layer_idx} on {device}: run_bszN_rows does not serve the layer "
+                          f"(bc.sh_coop {getattr(mlp.bc, 'sh_coop', None)})", flush = True)
+                    continue
+                tested.append(f"L{b.layer_idx} on {device} (cc {cc}, {experts} experts, bc.sh_coop {mlp.bc.sh_coop})")
+                for K in ROWS:
+                    y = self.randn((K, mlp.hidden_size), device)
+                    # any valid routing serves: the unflagged router's, on these rows
+                    sel, w = (t.clone() for t in mlp.routing_fn(K, cfg, y, {}))
+                    one_zero, empty_row = w.clone(), w.clone()
+                    one_zero[0, 0] = 0
+                    empty_row[K - 1] = 0
+                    cases = (
+                        ("the router's selection", sel, w),
+                        ("every row the same experts", sel[:1].expand(K, topk).contiguous(), w),
+                        ("a zero weight", sel, one_zero),
+                        ("a row of zero weights", sel, empty_row),
+                    )
+                    for case, sel_c, w_c in cases:
+                        with self.subTest(layer = b.layer_idx, device = str(device), K = K, routing = case):
+                            many = self.moe_launch(mlp, y, sel_c, w_c, True)
+                            ones = [self.moe_launch(mlp, y[j:j + 1].clone(), sel_c[j:j + 1].clone(),
+                                                    w_c[j:j + 1].clone(), False) for j in range(K)]
+                            self.same_rows(f"moe experts L{b.layer_idx}, {case}", many, ones)
+        print(f" -- exact rows: run_bszN_rows against one-row run_bszN, K = 2..8, on {'; '.join(tested) or 'NOTHING'}",
+              flush = True)
+        self.assertTrue(tested, "run_bszN_rows serves no tested MoE layer")
+
+    @torch.inference_mode()
+    def test_native_router(self):
+        self.need(CAP_ROUTER)
+        from exllamav3.modules.block_sparse_mlp_routing import _gate_t, _esb_h, ROUTING_ACT_SQRTSP
+        for device in self.devices:
+            b = self.first(device, lambda blk: True)
+            cfg = b.mlp.routing_cfg
+            _gate_t(cfg)
+            E, topk = cfg.num_experts, cfg.num_experts_per_tok
+            route = lambda fn, z, logits, sel, w: fn(
+                z, cfg.gate_tensor, logits, _esb_h(cfg), sel, w, cfg.routed_scaling_factor, cfg.gate_tensor_t,
+                ROUTING_ACT_SQRTSP, cfg.gate_i8, cfg.gate_sb)
+            for K in ROWS:
+                with self.subTest(layer = b.layer_idx, device = str(device), K = K):
+                    z = self.randn((K, b.mlp.hidden_size), device)
+                    logits = torch.empty((K, E), dtype = torch.half, device = device)
+                    sel = torch.empty((K, topk), dtype = torch.long, device = device)
+                    w = torch.empty((K, topk), dtype = torch.half, device = device)
+                    route(self.ext.routing_ds3_nogroup_rows, z, logits, sel, w)
+                    for j in range(K):
+                        # into the bsz1 buffers, as a decode step routes
+                        route(self.ext.routing_ds3_nogroup, z[j:j + 1].clone(), cfg.router_logits_bsz1,
+                              cfg.selected_experts_bsz1, cfg.routing_weights_bsz1)
+                        for name, many, one in (("logits", logits, cfg.router_logits_bsz1),
+                                                ("experts", sel, cfg.selected_experts_bsz1),
+                                                ("weights", w, cfg.routing_weights_bsz1)):
+                            self.assertTrue(torch.equal(many[j], one[0]), f"router L{b.layer_idx} {name}: row {j} differs")
+
+    @torch.inference_mode()
+    def test_native_equals_python_loop_hyper_connection(self):
+        self.need(CAP_HC)
+        names = ("post", "comb", "collapsed", "pre")
+        H, D = self.model.config.hc_mult, self.model.config.hidden_size
+        for device in self.devices:
+            b = self.first(device, lambda blk: True)
+            for site, hc in (("hc_attn", b.attn_hc), ("hc_ffn", b.mlp_hc)):
+                for K in ROWS:
+                    for carried, own_pre in ((True, False), (False, False), (True, True)):
+                        with self.subTest(site = site, layer = b.layer_idx, device = str(device), K = K,
+                                          carried = carried, own_pre = own_pre):
+                            streams = self.randn((1, K, H, D), device, torch.float)
+                            pre = torch.rand((1, K, H), generator = self.rng).to(device) if carried else None
+                            with rows_native(self.caps), self.counted("hc_partials_rows") as partials, \
+                                    self.counted("hc_collapse_rows") as collapses:
+                                native = [t.clone() for t in hc.mix_delayed(streams, dict(FLAGGED), pre, own_pre)]
+                            # the model's first sublayer collapses by selecting stream 0
+                            self.assertEqual((len(partials), len(collapses)), (1, 1 if carried or own_pre else 0),
+                                             "hc_partials_rows, hc_collapse_rows calls")
+                            with rows_native(0):
+                                loop = [t.clone() for t in hc.mix_delayed(streams, dict(FLAGGED), pre, own_pre)]
+                            for i, name in enumerate(names):
+                                self.same(f"{site}.mix:{name} L{b.layer_idx}", native[i], loop[i])
+            head = self.tail["hc_head"]
+            for K in ROWS:
+                with self.subTest(site = "head collapse", device = str(device), K = K):
+                    streams = self.randn((1, K, H, D), device, torch.float)
+                    pre = torch.rand((1, K, H), generator = self.rng).to(device)
+                    with rows_native(self.caps), self.counted("hc_collapse_rows") as collapses:
+                        native = head.forward(streams, dict(FLAGGED, dsv41_hc_pre = pre)).clone()
+                    self.assertEqual(len(collapses), 1, "hc_collapse_rows calls")
+                    with rows_native(0):
+                        loop = head.forward(streams, dict(FLAGGED, dsv41_hc_pre = pre)).clone()
+                    self.same("head collapse", native, loop)
+
+    def refused(self, what, call):
+        with self.subTest(refusal = what), self.assertRaises(RuntimeError):
+            call()
+
+    @torch.inference_mode()
+    def test_native_refusals(self):
+        # Each entry point takes 2 to 8 rows of contiguous operands with matching row counts, and
+        # refuses everything else before it launches anything
+        self.need(0)
+        ext, device = self.ext, self.devices[0]
+        b = self.first(device, lambda blk: True)
+        half = lambda *shape: self.randn(shape, device)
+        if self.caps & CAP_LINEAR:
+            lin = b.attn.q_a
+            n, bc = lin.in_features, lin.inner.bc
+            run = lambda x: bc.run_alloc_rows(x, lin.out_features, False)
+            self.refused("run_alloc_rows: 1 row", lambda: run(half(1, 1, n)))
+            self.refused("run_alloc_rows: 9 rows", lambda: run(half(1, 9, n)))
+            self.refused("run_alloc_rows: 1 dimension", lambda: run(half(n)))
+            self.refused("run_alloc_rows: non-contiguous", lambda: run(half(1, 4, 2 * n)[..., ::2]))
+            self.refused("run_alloc_rows: CPU", lambda: run(half(1, 4, n).cpu()))
+        if self.caps & CAP_MGEMM:
+            at = b.attn
+            if not at.woa_multi_ready and at.device is not None:
+                at._build_woa_multi()
+            mu, G = at.wo_a_multi, at.o_groups
+            k, n = mu.in_features, mu.out_features
+            ah = torch.empty((G, 1, k), dtype = torch.half, device = device)
+            run = lambda A, C: ext.exl3_mgemm_rows(A, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh, at.woa_indices,
+                                                   mu.K, mu.mcg, mu.mul1)
+            self.refused("exl3_mgemm_rows: 1 row", lambda: run(half(1, G, k), half(1, G, n)))
+            self.refused("exl3_mgemm_rows: 9 rows", lambda: run(half(9, G, k), half(9, G, n)))
+            self.refused("exl3_mgemm_rows: A and C rows", lambda: run(half(3, G, k), half(2, G, n)))
+            self.refused("exl3_mgemm_rows: A and C groups", lambda: run(half(3, G, k), half(3, G + 1, n)))
+            self.refused("exl3_mgemm_rows: non-contiguous", lambda: run(half(3, G, 2 * k)[..., ::2], half(3, G, n)))
+            self.refused("exl3_mgemm_rows: 2 dimensions", lambda: run(half(3, G * k), half(3, G, n)))
+        mlp = b.mlp
+        cfg = mlp.routing_cfg
+        E, topk, hidden = cfg.num_experts, cfg.num_experts_per_tok, mlp.hidden_size
+        sel = lambda rows: torch.zeros((rows, topk), dtype = torch.long, device = device)
+        if self.caps & CAP_ROUTER:
+            from exllamav3.modules.block_sparse_mlp_routing import _gate_t, _esb_h, ROUTING_ACT_SQRTSP
+            _gate_t(cfg)
+            run = lambda z, rows: ext.routing_ds3_nogroup_rows(
+                z, cfg.gate_tensor, half(rows, E), _esb_h(cfg), sel(rows), half(rows, topk), cfg.routed_scaling_factor,
+                cfg.gate_tensor_t, ROUTING_ACT_SQRTSP, cfg.gate_i8, cfg.gate_sb)
+            self.refused("routing_ds3_nogroup_rows: 1 row", lambda: run(half(1, hidden), 1))
+            self.refused("routing_ds3_nogroup_rows: 9 rows", lambda: run(half(9, hidden), 9))
+            self.refused("routing_ds3_nogroup_rows: hidden and scores rows", lambda: run(half(3, hidden), 4))
+            self.refused("routing_ds3_nogroup_rows: non-contiguous", lambda: run(half(3, 2 * hidden)[..., ::2], 3))
+        if self.caps & CAP_MOE and mlp.bc is not None:
+            run = lambda y, rows: mlp.bc.run_bszN_rows(y, sel(rows), half(rows, topk))
+            self.refused("run_bszN_rows: 1 row", lambda: run(half(1, hidden), 1))
+            self.refused("run_bszN_rows: 9 rows", lambda: run(half(9, hidden), 9))
+            self.refused("run_bszN_rows: y and selection rows", lambda: run(half(3, hidden), 4))
+            self.refused("run_bszN_rows: non-contiguous", lambda: run(half(3, 2 * hidden)[..., ::2], 3))
+            self.refused("run_bszN_rows: weights shape", lambda: mlp.bc.run_bszN_rows(half(3, hidden), sel(3), half(3, topk + 1)))
+        if self.caps & CAP_HC:
+            f32 = lambda *shape: self.randn(shape, device, torch.float)
+            self.refused("hc_collapse_rows: 1 row", lambda: ext.hc_collapse_rows(f32(1, 1, 4), f32(1, 1, 4, 64)))
+            self.refused("hc_collapse_rows: 9 rows", lambda: ext.hc_collapse_rows(f32(1, 9, 4), f32(1, 9, 4, 64)))
+            self.refused("hc_collapse_rows: 2 sequences", lambda: ext.hc_collapse_rows(f32(2, 3, 4), f32(2, 3, 4, 64)))
+            self.refused("hc_collapse_rows: pre and streams rows", lambda: ext.hc_collapse_rows(f32(1, 3, 4), f32(1, 4, 4, 64)))
+            self.refused("hc_collapse_rows: FP16", lambda: ext.hc_collapse_rows(half(1, 3, 4), half(1, 3, 4, 64)))
+            self.refused("hc_partials_rows: 1 row", lambda: ext.hc_partials_rows(f32(1, 5, 25)))
+            self.refused("hc_partials_rows: 9 rows", lambda: ext.hc_partials_rows(f32(9, 5, 25)))
+            self.refused("hc_partials_rows: 2 dimensions", lambda: ext.hc_partials_rows(f32(3, 25)))
+
+    @torch.inference_mode()
+    def test_router_refuses_flagged_rows_without_the_entry_point(self):
+        # A flagged call of several rows must never reach the multi-row projection: without the
+        # row-exact router the MoE layer routes one row per call, and the router refuses the rest.
+        # Runs with every extension
+        from exllamav3.modules.block_sparse_mlp_routing import routing_sqrtsp
+        mlp = self.blocks[0].mlp
+        z = self.randn((3, mlp.hidden_size), mlp.device)
+        with rows_native(0), self.assertRaisesRegex(RuntimeError, "EXL3_EXACT_ROWS"):
+            routing_sqrtsp(3, mlp.routing_cfg, z, dict(FLAGGED))
 
 
 if __name__ == "__main__":
