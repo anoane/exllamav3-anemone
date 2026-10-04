@@ -61,6 +61,12 @@ the grouped wo_a with ONE launch, under the launch record of a one-row call, whe
 the cooperative FP16 kernel; with the int8 path on it launches per row. The bits are the same
 either way, so the tool prints how many calls of a K-row forward were served like that
 (exact_rows_one_launches) next to the verify cost: 0 under the default EXL3_INT8_GEMV.
+The same holds for the batched forms that give the rows of a flagged forward their one-row bits
+without a launch or a Python call per row: the tool prints the extension's count of MoE launch
+pairs with the rows grouped by expert (bit 128) and of router projections that were one launch
+(bit 256) per K-row forward (exact_rows_served), which of the hyper-connection sums ran over the
+rows (dsv41_block.ROWS_SUMMED: recorded on the first flagged call per operand shape and device),
+and, in the idx.topk and idx.scores records, that a selection was one pass for the rows.
 
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
@@ -124,7 +130,11 @@ HEAD_OPS = ("head.collapse", "norm", "head")
 # EXL3_EXACT_ROWS: the modules that hold the extension's row-exact entry points (ROWS_NATIVE, the
 # bits of math_policy.EXACT_ROWS_CAP_*), and the bits by name
 ROWS_NATIVE_MODULES = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
-ROWS_NATIVE_BITS = ((1, "linear"), (2, "wo_a"), (4, "router"), (8, "moe"), (16, "hc"), (32, "one-launch"))
+ROWS_NATIVE_BITS = ((1, "linear"), (2, "wo_a"), (4, "router"), (8, "moe"), (16, "hc"), (32, "one-launch"),
+                    (64, "hgemm"), (128, "moe-grouped"), (256, "router-one-launch"))
+# Bits 128 and 256 are arguments the engine passes to the entry points of bits 8 and 4: the batched
+# forms the extension counts (exact_rows_served)
+SERVED_BITS = ((128, "grouped MoE launch pairs"), (256, "one-launch router projections"))
 # Bit 32 is not an entry point: the extension's run_alloc_rows (bit 1) and exl3_mgemm_rows (bit 2)
 # decide per call whether the rows are one launch, so no mask reaches it. It is in use exactly when
 # the extension reports it and one of those two entry points is used
@@ -229,10 +239,14 @@ examples:
     ap.add_argument("--exact-rows-caps", type = int, default = None, metavar = "MASK",
                     help = "under EXL3_EXACT_ROWS=1: use only these row-exact entry points of the extension, a sum "
                            "of 1 (EXL3 linears), 2 (grouped wo_a), 4 (router), 8 (MoE experts), 16 (hyper-connection "
-                           "sums); 0 runs the Python row loops alone. Default: all the extension reports. The MoE "
-                           "needs 4 and 8 together. 32 (one launch for the rows of a linear or of wo_a) is "
-                           "accepted and changes nothing: the extension decides it inside the entry points of 1 "
-                           "and 2, so mask those to keep an operation out of it")
+                           "sums of shapes outside the row-exact bound), 64 (FP16 linears through the native GEMM: "
+                           "idx.weights_proj), 128 (the MoE rows grouped by expert; needs 4 and 8), 256 (the "
+                           "router's projection as one launch; needs 4 and 8); 0 runs the Python row loops alone. "
+                           "Default: all the extension reports. The MoE needs 4 and 8 together. 32 (one launch "
+                           "for the rows of a linear or of wo_a) is accepted and changes nothing: the extension "
+                           "decides it inside the entry points of 1 and 2, so mask those to keep an operation "
+                           "out of it. The one-pass index selection, the hyper-connection sums over the rows, "
+                           "the compressor and the engram gate are Python and have no bit")
     ap.add_argument("--tune-cache", default = "copy", metavar = "copy|live|PATH",
                     help = "launch-autotune cache the extension uses: 'copy' (default) a private copy of the live "
                            "file, removed when the run ends, so the probe reads serving's records and never "
@@ -317,6 +331,16 @@ def _one_launches(ext):
     (exact_rows_one_launches), or None for an extension without the counter."""
     count = getattr(ext, "exact_rows_one_launches", None)
     return None if count is None else int(count())
+
+
+def _served(ext):
+    """{bit: launches of that batched form so far} for the SERVED_BITS the extension reports
+    (exact_rows_served); empty for an extension without the counter."""
+    count, caps = getattr(ext, "exact_rows_served", None), getattr(ext, "exact_rows_caps", None)
+    if count is None or caps is None:
+        return {}
+    reported = int(caps())
+    return {bit: int(count(bit)) for bit, _ in SERVED_BITS if reported & bit}
 
 
 def _moe_rows_native(mlp):
@@ -1165,8 +1189,10 @@ class Probe:
         return group_pool
 
     def _make_comp_norm(self, orig):
-        def rms_norm(x, weight, eps):
-            out = orig(x, weight, eps)
+        def rms_norm(x, weight, eps, per_row = False):
+            # per_row (EXL3_EXACT_ROWS): the entries of the call normalized at once, the mean one
+            # entry per call; the replay below is the plain one-row call either way
+            out = orig(x, weight, eps, per_row)
             if self.on() and self.entry is not None:
                 self.guard("comp.norm", after, x, weight, eps, out)
             return out
@@ -1239,7 +1265,8 @@ class Probe:
         def after(q_idx, weights, k_idx, q_pos0, m, bound_max, kwargs, out):
             R = q_idx.shape[0]
             # the rows of the select_topk call in progress (q_pos0 is shifted by the tile): one call
-            # per tile, and under EXL3_EXACT_ROWS one select_topk per row
+            # per tile; under EXL3_EXACT_ROWS one call for the rows, pinned to the kernel of a one-row
+            # call (one_row), or one select_topk per row where the rows cannot share a pass
             units = self.units("row", R, "idx.scores", base = self.sel_pos0)
             if units is None:
                 return
@@ -1247,14 +1274,16 @@ class Probe:
             # a row's scores up to its own causal bound; a second tile of the same row is appended
             self.record("idx.scores", units, {"q_idx": q_idx, "wts": weights}, {"scores": [out[r, :vis[r]] for r in range(R)]},
                         append = True,
-                        meta = {"rows": R, "kernel": "few-query" if R <= 4 and kwargs.get("few_query", True) else "query-tiled"})
+                        meta = {"rows": R, "kernel": "few-query" if (R <= 4 or kwargs.get("one_row"))
+                                and kwargs.get("few_query", True) else "query-tiled"})
             backing = kwargs.get("scores")
 
             def rows():
                 for r in range(R):
                     if vis[r] == 0:
                         continue
-                    kw = dict(kwargs)
+                    # the reference is the plain one-row call: without the pin of EXL3_EXACT_ROWS
+                    kw = {k: v for k, v in kwargs.items() if k != "one_row"}
                     if backing is not None:
                         kw["scores"] = torch.empty((1, backing.shape[1]), dtype = backing.dtype, device = backing.device)
                     o1 = orig(q_idx[r:r + 1].clone(), weights[r:r + 1].clone(), k_idx, q_pos0 + r, m, vis[r], **kw)
@@ -1273,26 +1302,33 @@ class Probe:
                 res = orig(q_idx, wts, idx_pool, **kwargs)
             finally:
                 self.sel_pos0 = prev
+            if res is None:
+                # EXL3_EXACT_ROWS: the rows cannot share a pass (one_row refused before any launch);
+                # the engine now makes one call per row, each recorded as a call of its own
+                return res
             self.guard("idx.topk", after, q_idx, wts, idx_pool, kwargs, res)
             return res
 
         def after(q_idx, wts, idx_pool, kwargs, res):
             seq = q_idx.shape[0]
-            # the call's own rows: all of the forward's, or one of them under EXL3_EXACT_ROWS
+            # the call's own rows: all of the forward's (under EXL3_EXACT_ROWS as one pass, one_row),
+            # or one of them where that mode selects row by row
             units = self.units("row", seq, "idx.topk", base = kwargs.get("pos0"))
             if units is None:
                 return
             cand_in = kwargs.get("cand_in")
             self.record("idx.topk", units, {"q_idx": q_idx, "wts": wts, "cand_in": cand_in},
                         {"indices": res.indices, "cand": res.cand}, ids = ("indices", "cand"),
-                        meta = {"rows": seq, "ec": kwargs.get("ec"), "dense": res.indices is None})
+                        meta = {"rows": seq, "ec": kwargs.get("ec"), "dense": res.indices is None,
+                                "one_pass": bool(kwargs.get("one_row")) and seq > 1})
             if res.indices is None:
                 return
             pos0, m, ec = kwargs["pos0"], kwargs["m"], kwargs["ec"]
 
             def rows():
                 for r in range(seq):
-                    kw = dict(kwargs)
+                    # the reference is the plain one-row call: without one_row
+                    kw = {k: v for k, v in kwargs.items() if k != "one_row"}
                     kw["pos0"] = pos0 + r
                     kw["ec"] = min(ec, (pos0 + r + 1) // m)         # what a one-row call at this position passes
                     if cand_in is not None:
@@ -2343,7 +2379,7 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     reps = max(2, args.timing_reps)
     plain, det, timing = {}, {}, {}
     for K in ks:
-        ta, tb, ha, hb, served = [], [], [], [], []
+        ta, tb, ha, hb, served, forms = [], [], [], [], [], {}
         det[K] = {"one_row": True, "k_row": True, "runs": reps}
         for i in range(reps):
             drv.host_s = 0.0
@@ -2352,7 +2388,7 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
             ta.append(time.perf_counter() - t)
             ha.append(drv.host_s)
             drv.rewind(K)
-            n0 = _one_launches(ext)
+            n0, f0 = _one_launches(ext), _served(ext)
             drv.host_s = 0.0
             t = time.perf_counter()
             lb = drv.multi(K)
@@ -2360,6 +2396,8 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
             hb.append(drv.host_s)
             if n0 is not None:
                 served.append(_one_launches(ext) - n0)
+            for bit, count in _served(ext).items():
+                forms.setdefault(bit, []).append(count - f0[bit])
             drv.rewind(K)
             if i == 0:
                 plain[K] = (la, lb)
@@ -2377,7 +2415,9 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
                      "k_row_forward_host_ms": {"median": round(1e3 * statistics.median(hb), 2),
                                                "min": round(1e3 * min(hb), 2)},
                      # calls of the K-row forward the extension served with one launch, per repetition
-                     "one_launch_calls": served or None}
+                     "one_launch_calls": served or None,
+                     # launches of the other batched forms in the K-row forward, per repetition, by bit
+                     "served": forms or None}
     print(f"timing, unhooked, {reps} repetitions, median [minimum]: K one-row steps, one K-row forward, and that "
           f"forward in one-row steps (wall clock around forward and logits copy; other load on the host shows); "
           f"'host': the part of each until model.forward returned, before the logits copy waits for the GPU")
@@ -2388,7 +2428,9 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
               f"   {t['k_row_over_one_step']['median']:.2f}x [{t['k_row_over_one_step']['min']:.2f}x]"
               f"   host {t['one_row_steps_host_ms']['median']:.1f} / {t['k_row_forward_host_ms']['median']:.1f} ms"
               + ("" if t["one_launch_calls"] is None else
-                 f"   one-launch calls {'/'.join(str(n) for n in sorted(set(t['one_launch_calls'])))}"),
+                 f"   one-launch calls {'/'.join(str(n) for n in sorted(set(t['one_launch_calls'])))}")
+              + "".join(f"   {name} {'/'.join(str(n) for n in sorted(set(t['served'][bit])))}"
+                        for bit, name in SERVED_BITS if t["served"] and bit in t["served"]),
               flush = True)
     total = _one_launches(ext)
     if total is None:
@@ -2398,6 +2440,14 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
               f"launch under the launch record of a one-row call (the others made one launch per row); "
               f"{total} since the extension was loaded", flush = True)
     report["one_launches_after_timing"] = total
+    if exact:
+        # the hyper-connection sums of the flagged forwards so far: per operand shape and device,
+        # whether torch's sum over the rows gave the bits of the per-row sums on first use
+        summed = dict(sys.modules["exllamav3.modules.dsv41_block"].ROWS_SUMMED)
+        differing = sorted(f"{shape} on {device}" for (device, shape), ok in summed.items() if not ok)
+        print(f"   hyper-connection sums over the rows: {sum(summed.values())} operand shapes row-exact, "
+              f"{len(differing)} kept per row" + (f" ({'; '.join(differing)})" if differing else ""), flush = True)
+        report["hc_sums_over_rows"] = {"row_exact": sum(summed.values()), "per_row": differing}
     report["timing"] = timing
 
     probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split, stable = stable)
