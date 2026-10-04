@@ -103,7 +103,8 @@ bool exl3_gemv_try_launch
     int device,
     cudaStream_t stream,
     void** launched_kernel,
-    bool force
+    bool force,
+    bool decide_only
 )
 {
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
@@ -168,6 +169,9 @@ bool exl3_gemv_try_launch
     int max_blocks = occupancy(kernel, block_dim) * num_sms;
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
+
+    // The call is eligible; kernel_args, stream and launched_kernel are untouched up to here
+    if (decide_only) return true;
 
     cuda_check(cudaLaunchCooperativeKernel
     (

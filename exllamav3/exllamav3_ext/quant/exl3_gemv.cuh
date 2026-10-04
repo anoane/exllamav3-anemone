@@ -9,7 +9,9 @@
 
 // Try to dispatch a GEMM call to the GEMV kernel. Returns false (launching nothing) if the
 // call is not eligible. On success *launched_kernel receives the kernel pointer for graph
-// recording. `force` bypasses the shape heuristic but not the hard constraints.
+// recording. `force` bypasses the shape heuristic but not the hard constraints. `decide_only`
+// stops ahead of the launch: the return value is the decision, nothing is launched and
+// *launched_kernel is not written.
 bool exl3_gemv_try_launch
 (
     void** kernel_args,
@@ -24,7 +26,8 @@ bool exl3_gemv_try_launch
     int device,
     cudaStream_t stream,
     void** launched_kernel,
-    bool force
+    bool force,
+    bool decide_only = false
 );
 
 // Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
