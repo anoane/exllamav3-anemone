@@ -1095,6 +1095,24 @@ class DSV41Attention(DSV4Attention):
             bt = torch.zeros((1, 1), dtype = torch.int32, device = device)
             qc, page, pool_len = None, PAGE_SIZE, 0
 
+        exact = EXACT_ROWS and bool(params.get("exact_rows")) and seq > 1
+        if exact:
+            # EXL3_EXACT_ROWS leaves dsa_attn one call for the rows of the forward. The call takes
+            # ONE softmax split count, from its last row, and partitions every row's own keys by
+            # it: each row's one-row count only if the rows share one plan. The model flags only
+            # such forwards (exact_rows_span, on one layer per position rule); every layer checks
+            # its own here, against what the call selected. The first and last row suffice: the
+            # entry count only grows with the position, so a plan that changed does not come back
+            plan = self.row_plan(pos0)
+            if plan != self.row_plan(pos0 + seq - 1) or plan[0] != (indices is None) \
+                    or (indices is not None and k_len != self.index_topk):
+                raise RuntimeError(
+                    f"{self.key}: EXL3_EXACT_ROWS=1: a draft verification of {seq} rows at position "
+                    f"{pos0} does not give every row the attention of a one-row step (plan of the "
+                    f"first row {plan}, of the last {self.row_plan(pos0 + seq - 1)}; the call "
+                    f"{'selects ' + str(k_len) if indices is not None else 'is dense'}, index_topk "
+                    f"{self.index_topk}); such a call must not carry params['exact_rows']")
+
         out = dsa_attn(
             q[0].half().contiguous(), pool_c, pool_r, bt, sinks = self.sinks,
             ring = ring, kv_chunk = kv[0], win_len = w,
@@ -1114,14 +1132,21 @@ class DSV41Attention(DSV4Attention):
         if shift is not None:
             rs.wshift = shift
 
-        if EXACT_ROWS and params.get("exact_rows") and seq > 1:
-            # EXL3_EXACT_ROWS: the output projection one row per call, the seq == 1 call of a
-            # decode step (the grouped GEMM's launch configuration follows the row count, and wo_b
-            # behind it is a Linear). A row of the group-major output is strided across the groups
-            return torch.cat([
-                self._project_o_grouped(out[:, j:j + 1].contiguous().unsqueeze(1), params, out_dtype)
-                for j in range(seq)], dim = 1)
+        if exact:
+            return self._project_o_rows(out, params, out_dtype)
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype)
+
+    def _project_o_rows(self, out, params, out_dtype):
+        """
+        EXL3_EXACT_ROWS: the grouped output projection of dsa_attn's group-major (groups, seq,
+        width) output one row per call, each the seq == 1 call of a decode step: the grouped
+        GEMM's launch configuration follows the row count, and wo_b behind it is a Linear. A row
+        of the group-major output is strided across the groups, hence the contiguous copy.
+        Returns (1, seq, hidden), as _project_o_grouped on the whole output does.
+        """
+        return torch.cat([
+            self._project_o_grouped(out[:, j:j + 1].contiguous().unsqueeze(1), params, out_dtype)
+            for j in range(out.shape[1])], dim = 1)
 
     def _compress_store(self, x, params, rsl, slot, kl, bt_row, pos0):
         """

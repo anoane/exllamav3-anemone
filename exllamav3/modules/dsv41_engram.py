@@ -726,6 +726,14 @@ class DSV41Engram(Module):
         dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
         return torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
 
+    def _gate_rows(self, h, key, eps):
+        """
+        EXL3_EXACT_ROWS: _gate one token per call, on the token's (B, 1, H, D) slices of h and
+        key: the operands of a one-token step, whose reductions run over freshly allocated
+        pointwise results.
+        """
+        return torch.cat([self._gate(h[:, l:l + 1], key[:, l:l + 1], eps) for l in range(h.shape[1])], dim = 1)
+
     def forward(self, x, params, out_dtype = None):
         """
         streams (B, L, H, D) fp32 -> streams with the gated n-gram value added.
@@ -799,8 +807,7 @@ class DSV41Engram(Module):
             # alone (the same gate, scaled against overflow: dsv41_engram_math.py)
             gate = stable_engram_gate(h, key, self.qk, eps)
         elif EXACT_ROWS and params.get("exact_rows") and L > 1:
-            # EXL3_EXACT_ROWS: one token per call, the operands of a one-token step
-            gate = torch.cat([self._gate(h[:, l:l + 1], key[:, l:l + 1], eps) for l in range(L)], dim = 1)
+            gate = self._gate_rows(h, key, eps)
         else:
             gate = self._gate(h, key, eps)
         dead = hist[:, self.ctx:] == DEAD

@@ -10,10 +10,16 @@ those rows, so the comparison also covers what the mode rests on: that a one-row
 the same bits wherever the row lies in memory. All comparisons are torch.equal.
 
 Covered: every Linear of the trunk (attention wq_a, wq_b, wkv, wo_b; compressor wkv, wgate;
-indexer wq_b, weights_proj, wk; engram wkv; the output head), the grouped output projection, the
-MoE layer (router, expert cache lookup, routed and shared experts), the hyper-connection mix and
-both collapses, the engram gate, and the compressor's pooling and norm at rates 1 and 2. The
-index selection and the attention kernel need real pools: tools/dsv41_rowprobe.py covers them.
+indexer wq_b, weights_proj, wk; engram wkv; the output head), the grouped output projection
+(DSV41Attention._project_o_rows), the MoE layer (router, expert cache lookup, routed and shared
+experts), the hyper-connection mix and both collapses, the engram gate (DSV41Engram._gate_rows),
+and the compressor's pooling and norm at rates 1 and 2. A control checks, on every GPU, that
+the comparison discriminates: an unflagged call of several rows must differ from the one-row
+calls.
+
+Not covered: the index selection and the attention kernel, which need real pools, and the order
+of these operations in a forward. tools/dsv41_rowprobe.py under EXL3_EXACT_ROWS=1 is the evidence
+for those (idx.scores, idx.topk, attn.dsa_attn and the forward's logits in its tables).
 
     EXL3_EXACT_ROWS=1 DSV41_MODEL_DIR=<checkpoint> python -m pytest tests/test_dsv41_exact_rows_gpu_.py
 
@@ -124,17 +130,39 @@ class ExactRows(unittest.TestCase):
                 self.linear_rows("head", head, self.randn((1, K, head.in_features), head.device))
 
     @torch.inference_mode()
+    def test_control_unflagged_calls_differ(self):
+        # Without the flag a call of several rows takes other kernels than one-row calls (measured
+        # with tools/dsv41_rowprobe.py on DeepSeek-V4.1-Flash: attn.wq_b from 2 rows on layers 0
+        # to 10, attn.wq_a and attn.wq_b from 3 rows on every layer). If none differs on a GPU, the
+        # comparisons of this file show nothing there (an environment that turns the int8
+        # activation path off, say)
+        for device in self.devices:
+            b = self.first(device, lambda blk: True)
+            differing = []
+            for name, lin in (("attn.wq_a", b.attn.q_a), ("attn.wq_b", b.attn.q_b)):
+                for K in ROWS:
+                    x = self.randn((1, K, lin.in_features), device)
+                    many = lin.forward(x, {}).clone()
+                    ones = [lin.forward(x[:, j:j + 1].clone(), {}).clone() for j in range(K)]
+                    if any(not torch.equal(many[0, j].reshape(-1), ones[j].reshape(-1)) for j in range(K)):
+                        differing.append(f"{name} K={K}")
+            print(f" -- exact rows: control on {device} (L{b.layer_idx}): unflagged calls differ from one-row "
+                  f"calls for {', '.join(differing) or 'NOTHING'}", flush = True)
+            with self.subTest(device = str(device)):
+                self.assertTrue(differing, f"unflagged calls of 2 to 8 rows equal the one-row calls on {device}: "
+                                           f"this test does not discriminate there")
+
+    @torch.inference_mode()
     def test_grouped_output_projection(self):
-        # DSV41Attention._forward_cached_row: one _project_o_grouped per row of dsa_attn's
-        # group-major (groups, rows, width) output, each row a contiguous copy
+        # DSV41Attention._project_o_rows, which a flagged _forward_cached_row calls on dsa_attn's
+        # group-major (groups, rows, width) output
         for device in self.devices:
             at = self.first(device, lambda blk: True).attn
             G, width = at.o_groups, at.num_q_heads // at.o_groups * at.head_dim
             for K in ROWS:
                 with self.subTest(layer = at.layer_idx, device = str(device), K = K):
                     out = self.randn((G, K, width), device)
-                    many = torch.cat([at._project_o_grouped(out[:, j:j + 1].contiguous().unsqueeze(1),
-                                                            dict(FLAGGED), None) for j in range(K)], dim = 1)
+                    many = at._project_o_rows(out, dict(FLAGGED), None)
                     self.assertEqual(tuple(many.shape[:2]), (1, K))
                     ones = [at._project_o_grouped(out[:, j:j + 1].clone().unsqueeze(1), {}, None).clone()
                             for j in range(K)]
@@ -203,8 +231,8 @@ class ExactRows(unittest.TestCase):
 
     @torch.inference_mode()
     def test_engram_gate(self):
-        # DSV41Engram.forward: one _gate per token on the token's slice of the streams and of the
-        # key, which is a view into the projection's (1, L, (H + 1) * D) output
+        # DSV41Engram._gate_rows, which a flagged forward calls on the streams and on the key, a
+        # view into the projection's (1, L, (H + 1) * D) output
         engrams = [b.engram for b in self.blocks if b.engram is not None]
         self.assertTrue(engrams, "the model has no engram layer")
         for eng in engrams:
@@ -216,7 +244,7 @@ class ExactRows(unittest.TestCase):
                     h = self.randn((1, K, H, D), device, torch.float)
                     kv = self.randn((1, K, (H + 1) * D), device, torch.float)
                     key = kv[..., :H * D].view(1, K, H, D)
-                    many = torch.cat([eng._gate(h[:, l:l + 1], key[:, l:l + 1], eps) for l in range(K)], dim = 1)
+                    many = eng._gate_rows(h, key, eps)
                     self.assertEqual(tuple(many.shape), (1, K, H))
                     ones = []
                     for l in range(K):
