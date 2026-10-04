@@ -588,6 +588,14 @@ CoopAutotuneLaunch tune
 
 }  // namespace
 
+bool CoopKernelAutotuner::find(uint64_t hash, CoopAutotuneLaunch* launch_config)
+{
+    auto lookup = launch_cache.find(salt_hash(hash));
+    if (lookup == launch_cache.end()) return false;
+    if (launch_config) *launch_config = lookup->second;
+    return true;
+}
+
 bool CoopKernelAutotuner::launch_locked
 (
     uint64_t hash,
@@ -598,13 +606,7 @@ bool CoopKernelAutotuner::launch_locked
 )
 {
     CoopAutotuneLaunch launch_config;
-    hash = salt_hash(hash);
-
-    {
-        auto lookup = launch_cache.find(hash);
-        if (lookup == launch_cache.end()) return false;
-        launch_config = lookup->second;
-    }
+    if (!find(hash, &launch_config)) return false;
 
     set_kernel_attr_once(launch_config.kernel, smem);
     cuda_check(cudaLaunchCooperativeKernel

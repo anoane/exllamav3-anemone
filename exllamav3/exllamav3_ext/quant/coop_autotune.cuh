@@ -26,6 +26,10 @@ struct CoopAutotuneLaunch
 class CoopKernelAutotuner
 {
 public:
+    // The launch this process holds for `hash`, without launching it; false when it holds none.
+    // No disk cache lookup and no tuning
+    static bool find(uint64_t hash, CoopAutotuneLaunch* launch_config);
+
     static bool launch_locked
     (
         uint64_t hash,
