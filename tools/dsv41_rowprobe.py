@@ -67,6 +67,10 @@ pairs with the rows grouped by expert (bit 128) and of router projections that w
 (bit 256) per K-row forward (exact_rows_served), which of the hyper-connection sums ran over the
 rows (dsv41_block.ROWS_SUMMED: recorded on the first flagged call per operand shape and device),
 and, in the idx.topk and idx.scores records, that a selection was one pass for the rows.
+Four batched forms are Python alone and run with every extension (math_policy.exact_rows_forms):
+the one-pass index selection, the hyper-connection sums over the rows, the compressor and the
+engram gate. --exact-rows-forms MASK runs with a subset of them (0: each makes one call per row,
+entry or token), for the same tables and the verify cost of each.
 
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
@@ -139,6 +143,10 @@ SERVED_BITS = ((128, "grouped MoE launch pairs"), (256, "one-launch router proje
 # decide per call whether the rows are one launch, so no mask reaches it. It is in use exactly when
 # the extension reports it and one of those two entry points is used
 ONE_LAUNCH_BIT, ONE_LAUNCH_ENTRY_BITS = 32, 1 | 2
+# EXL3_EXACT_ROWS: the modules that hold the batched forms that are Python alone (ROWS_FORMS, the
+# bits of math_policy.EXACT_ROWS_FORM_*), and the bits by name
+ROWS_FORMS_MODULES = ("dsv41", "dsv41_block", "dsv41_cached", "dsv41_engram")
+ROWS_FORMS_BITS = ((1, "select"), (2, "hc-sums"), (4, "compress"), (8, "gate"))
 
 TUNE_MAGIC = b"EX3ATUNE"
 TUNE_FILE = "coop_autotune_v1.bin"
@@ -198,6 +206,8 @@ examples:
   EXL3_EXACT_ROWS=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --tune-cache tune.bin --out on.json
   EXL3_EXACT_ROWS=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --tune-cache tune.bin \\
       --exact-rows-caps 0 --out loops.json
+  EXL3_EXACT_ROWS=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --tune-cache tune.bin \\
+      --exact-rows-forms 14 --no-replay --out row-loop-selection.json
   python3 tools/dsv41_rowprobe.py --same-pristine off.json on.json
   (--model defaults to DSV41_MODEL_DIR, --ref to DSV41_VLLM_REF)
 """, formatter_class = argparse.RawDescriptionHelpFormatter, allow_abbrev = False)
@@ -246,7 +256,14 @@ examples:
                            "for the rows of a linear or of wo_a) is accepted and changes nothing: the extension "
                            "decides it inside the entry points of 1 and 2, so mask those to keep an operation "
                            "out of it. The one-pass index selection, the hyper-connection sums over the rows, "
-                           "the compressor and the engram gate are Python and have no bit")
+                           "the compressor and the engram gate are Python and have no bit here: see "
+                           "--exact-rows-forms")
+    ap.add_argument("--exact-rows-forms", type = int, default = None, metavar = "MASK",
+                    help = "under EXL3_EXACT_ROWS=1: use only these batched forms that are Python alone, a sum of "
+                           "1 (one selection pass for the rows), 2 (the hyper-connection sums over the rows), "
+                           "4 (the compressor's entries pooled and normalized at once), 8 (the engram gate in one "
+                           "call); 0 gives each its form of one call per row, entry or token. Default: all, as "
+                           "the engine runs")
     ap.add_argument("--tune-cache", default = "copy", metavar = "copy|live|PATH",
                     help = "launch-autotune cache the extension uses: 'copy' (default) a private copy of the live "
                            "file, removed when the run ends, so the probe reads serving's records and never "
@@ -324,6 +341,29 @@ def rows_native_setup(ext, mask, exact: bool) -> dict:
               f"the single launch inside the entry points of bits 1 (linear) and 2 (wo_a) whenever it reports the "
               f"bit and they are used; here it is {'in use' if used & ONE_LAUNCH_BIT else 'not in use'}", flush = True)
     return {"extension": reported, "mask": mask, "used": used, "names": names}
+
+
+def rows_forms_setup(mask, exact: bool) -> dict:
+    """
+    EXL3_EXACT_ROWS: the batched forms that are Python alone which this run uses. Every consumer
+    module holds them as ROWS_FORMS (math_policy.exact_rows_forms: all of them under the switch);
+    --exact-rows-forms masks them in all of them, so that an operation makes one call per row,
+    entry or token. Without the switch nothing is used or changed.
+    """
+    mods = [importlib.import_module(f"exllamav3.modules.{name}") for name in ROWS_FORMS_MODULES]
+    held = sorted({int(mod.ROWS_FORMS) for mod in mods})
+    used = 0
+    if exact:
+        assert len(held) == 1, f"the consumers hold different ROWS_FORMS: {held}"
+        used = held[0] if mask is None else held[0] & mask
+        for mod in mods:
+            mod.ROWS_FORMS = used
+    names = [name for bit, name in ROWS_FORMS_BITS if used & bit]
+    print("batched forms that are Python alone (EXL3_EXACT_ROWS): "
+          + (f"this run uses {used} ({', '.join(names) if names else 'none: one call per row, entry or token'})"
+             if exact else "the switch is off, none is used")
+          + ("" if mask is None else f" [--exact-rows-forms {mask}]"), flush = True)
+    return {"mask": mask, "used": used, "names": names}
 
 
 def _one_launches(ext):
@@ -2237,6 +2277,7 @@ def _run_gpu(val, args, ks: list, out: str, report: dict, env: dict, tune: dict,
     from exllamav3 import Cache, Config, Model
     from exllamav3.ext import exllamav3_ext as ext
     report["exact_rows_native"] = rows_native_setup(ext, args.exact_rows_caps, report["arithmetic"]["exact_rows"])
+    report["exact_rows_forms"] = rows_forms_setup(args.exact_rows_forms, report["arithmetic"]["exact_rows"])
 
     shown = {k: os.environ[k] for k in tuple(val.REPORT_ENV) + ("EXLLAMAV3_TUNE_CACHE",) if k in os.environ}
     print(f"environment: {shown}", flush = True)
@@ -2666,6 +2707,13 @@ def main(argv = None) -> int:
             return 2
         if not 0 <= args.exact_rows_caps <= sum(bit for bit, _ in ROWS_NATIVE_BITS):
             print(f"--exact-rows-caps must be a sum of {', '.join(f'{bit} ({name})' for bit, name in ROWS_NATIVE_BITS)}")
+            return 2
+    if args.exact_rows_forms is not None:
+        if not policy["exact_rows"]:
+            print("--exact-rows-forms needs EXL3_EXACT_ROWS=1: without the switch no batched form is used")
+            return 2
+        if not 0 <= args.exact_rows_forms <= sum(bit for bit, _ in ROWS_FORMS_BITS):
+            print(f"--exact-rows-forms must be a sum of {', '.join(f'{bit} ({name})' for bit, name in ROWS_FORMS_BITS)}")
             return 2
     if args.timing_reps < 2:
         print("--timing-reps must be at least 2: the determinism check compares the repetitions")
