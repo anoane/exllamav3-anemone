@@ -53,6 +53,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+import time
 
 import torch
 
@@ -60,6 +61,9 @@ from ...cache.recurrent_util import advance_recurrent_states
 from . import placement
 
 PIPELINE = os.environ.get("EXL3_DSV41_PIPELINE", "0") != "0"
+# EXPERIMENT ONLY (exp-4090): EXL3_DSV41_PIPELINE_TIMING=1 synchronizes after every module and prints, per
+# sub-chunk, the seconds each device was busy in each stage. It slows the prefill; never set it when serving.
+TIMING = os.environ.get("EXL3_DSV41_PIPELINE_TIMING", "0") != "0"
 
 
 def _positive_chunk(value) -> int:
@@ -263,17 +267,31 @@ def report(model):
               f"the load's", flush = True)
 
 
-def _run(model, mods, x, params):
+def _run(model, mods, x, params, timing = None):
     for module, instance, idx in mods:
         params["layer_instance"] = instance
         last = (idx, instance) == model.last_kv_module_idx_instance
         params["prefill"] = last
+        if timing is not None:
+            t0 = time.perf_counter()
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
+        if timing is not None:
+            d = getattr(module, "device", None)
+            if d is not None and torch.device(d).type == "cuda":
+                torch.cuda.synchronize(d)
+            a = timing.setdefault(str(d), [0.0, 0])
+            a[0] += time.perf_counter() - t0
+            a[1] += 1
         if last:
             break
     params.pop("prefill", None)
     return x
+
+
+def _timing_line(stage, a, b, t0, timing):
+    per = "  ".join(f"{d} {v[0]:.3f}s/{v[1]}" for d, v in timing.items())
+    print(f" -- DSV41 pipeline timing {stage} [{a},{b}): {time.perf_counter() - t0:.3f}s  ({per})", flush = True)
 
 
 def eligible(model, input_ids: torch.Tensor, params: dict) -> bool:
@@ -334,9 +352,12 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
             p["recurrent_states"] = [rs]
             ids = input_ids[:, a:b]
             x = model.prepare_inputs(ids, p)
+            timing, t0 = ({}, time.perf_counter()) if TIMING else (None, 0.0)
             for m in plan.pf1:
                 m.prefetch(x, p)
-            x = _run(model, plan.st1, x, p)
+            x = _run(model, plan.st1, x, p, timing)
+            if timing is not None:
+                _timing_line("S1", base + a, base + b, t0, timing)
             if placement.XDEV_BF16 and x.dtype == torch.float:
                 # the crossing's rounding (DSV41Block.prepare_for_device, which widens it on the
                 # second GPU), done here: the first GPU then holds half the bytes until S2's copy
@@ -366,7 +387,10 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
                 m.prefetch(x, p)
             for h in plan.hosts:
                 h.begin_pass()
-            _run(model, plan.st2, x, p)
+            timing, t0 = ({}, time.perf_counter()) if TIMING else (None, 0.0)
+            _run(model, plan.st2, x, p, timing)
+            if timing is not None:
+                _timing_line("S2", view.position, view.position + ids.shape[1], t0, timing)
             if view.wshift != shift1:
                 raise RuntimeError(
                     f"DSV41 pipelined prefill: the second half shifted the SWA ring by {view.wshift}, "
