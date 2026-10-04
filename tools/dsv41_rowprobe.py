@@ -434,9 +434,10 @@ class Probe:
     engine buffer a replay call wrote. The tool verifies that, bit for bit, on every run.
     """
 
-    def __init__(self, torch, ext, model, position: int, replay_int8: bool = True):
+    def __init__(self, torch, ext, model, position: int, replay_int8: bool = True, stable: bool = False):
         self.torch, self.ext, self.model, self.P = torch, ext, model, position
         self.int8_split = replay_int8
+        self.stable = stable        # EXL3_STABLE_ARITHMETIC: mHC mixes in one chunk at every row count
         self.mode = None
         self.run = None
         self.layer = None           # current block (n_layers for the head), set by the block wrappers
@@ -821,7 +822,7 @@ class Probe:
             self.record(f"{tag}.mix", units,
                         {"streams": streams[0], "carried_pre": None if carried_pre is None else carried_pre[0]},
                         {"post": post[0], "comb": comb[0], "collapsed": coll[0], "pre": pre[0]},
-                        meta = {"rows": s, "chunks": int(self.ext.hc_mix_num_chunks(s, H * D))})
+                        meta = {"rows": s, "chunks": 1 if self.stable else int(self.ext.hc_mix_num_chunks(s, H * D))})
             # post and comb are views of static workspaces that a one-row call may share
             saved_post, saved_comb = post.clone(), comb.clone()
 
@@ -1877,7 +1878,8 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
               flush = True)
     report["timing"] = timing
 
-    probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split)
+    probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split,
+                  stable = report["arithmetic"]["stable_arithmetic"])
     drv.probe = probe
     probe.install()
     print(f"wrapped {len(probe.patches)} methods and calls", flush = True)
