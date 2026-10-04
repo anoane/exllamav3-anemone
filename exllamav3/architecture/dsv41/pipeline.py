@@ -50,6 +50,7 @@ sub-chunk (e.g. 16384 with 4096-token sub-chunks).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 
@@ -173,17 +174,21 @@ class _Plan:
             d = getattr(m, "device", None)
             if d is not None and torch.device(d).type == "cuda" and torch.device(d) not in devs:
                 devs.append(torch.device(d))
-        if len(devs) != 2:
-            self.reason = f"the modules are on {len(devs)} CUDA device(s), not two"
+        if len(devs) < 2:
+            self.reason = f"the modules are on {len(devs)} CUDA device(s), not two or more"
             return
-        self.dev1, self.dev2 = devs
+        # Stage 2 is the last device. Stage 1 is everything before it: on one device, or on several
+        # whose modules then run back to back on the calling thread exactly as in the plain forward
+        # (their changes of device, the split's replica included, stay inside the stage)
+        self.devs1, self.dev2 = tuple(devs[:-1]), devs[-1]
+        self.dev1 = self.devs1[0]
         split = next(i for i, (m, _, _) in enumerate(fwd)
                      if getattr(m, "device", None) is not None and torch.device(m.device) == self.dev2)
         self.st1, self.st2 = fwd[:split], fwd[split:]
         # every module of the second list must live on the second GPU (or be device-less)
         if not all(getattr(m, "device", None) is None or torch.device(m.device) == self.dev2
                    for m, _, _ in self.st2):
-            self.reason = "a module past the split is not on the second GPU"
+            self.reason = "a module past the hand-off is not on the last GPU"
             return
         # The first half must hold at least the first decoder layer: every V4.1 layer owns a
         # sliding-window ring, so only then does stage 1 compute the chunk's ring shift that stage
@@ -218,10 +223,12 @@ class _Plan:
             return
         self.ok = True
         pf = model._get_prefetch_layers
-        self.pf1 = [m for m in pf if torch.device(m.device) == self.dev1]
+        self.pf1 = [m for m in pf if torch.device(m.device) != self.dev2]
         self.pf2 = [m for m in pf if torch.device(m.device) == self.dev2]
         self.hosts = list(getattr(model.config, "moe_cpu_hosts", {}).values())
-        self.side1 = torch.cuda.Stream(device = self.dev1)
+        # one side stream per stage-1 device: stage 2 reads that device's products on it
+        self.sides = [torch.cuda.Stream(device = d) for d in self.devs1]
+        self.side1 = self.sides[0]
 
 
 def _plan(model) -> _Plan:
@@ -247,8 +254,9 @@ def report(model):
     """
     plan = _plan(model)
     if plan.ok:
-        print(f" -- DSV41 pipelined prefill: eligible, {len(plan.st1)} modules on {plan.dev1}, "
-              f"{len(plan.st2)} on {plan.dev2}, sub-chunk {SUB_CHUNK}", flush = True)
+        print(f" -- DSV41 pipelined prefill: eligible, {len(plan.st1)} modules on "
+              f"{' + '.join(str(d) for d in plan.devs1)}, {len(plan.st2)} on {plan.dev2}, "
+              f"sub-chunk {SUB_CHUNK}", flush = True)
     else:
         print(f" !! DSV41 pipelined prefill: this load is not pipelinable ({plan.reason}); every "
               f"prefill call takes the plain path, so keep the generator's max_chunk_size within "
@@ -333,8 +341,12 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
                 # the crossing's rounding (DSV41Block.prepare_for_device, which widens it on the
                 # second GPU), done here: the first GPU then holds half the bytes until S2's copy
                 x = x.to(torch.bfloat16)
-            done = torch.cuda.Event()
-            done.record(torch.cuda.current_stream(plan.dev1))
+            # one event per stage-1 device, each after everything this chunk queued there
+            done = []
+            for d in plan.devs1:
+                e = torch.cuda.Event()
+                e.record(torch.cuda.current_stream(d))
+                done.append(e)
             # the second half runs this chunk from its start; the job moves on for the next S1
             view = _StageView(rs, rs.position, rs.window_beg)
             shift1 = rs.wshift
@@ -343,9 +355,13 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
             return ids, x, p, view, shift1, done
 
     def stage2(ids, x, p, view, shift1, done):
-        with torch.inference_mode(), torch.cuda.stream(plan.side1), torch.cuda.stream(destination_stream):
-            plan.side1.wait_event(done)
-            _record_source_tensors((ids, x, p), plan.side1)
+        with torch.inference_mode(), contextlib.ExitStack() as streams:
+            for side in plan.sides:
+                streams.enter_context(torch.cuda.stream(side))
+            streams.enter_context(torch.cuda.stream(destination_stream))
+            for side, event in zip(plan.sides, done):
+                side.wait_event(event)
+                _record_source_tensors((ids, x, p), side)
             for m in plan.pf2:
                 m.prefetch(x, p)
             for h in plan.hosts:
@@ -385,7 +401,8 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
         # everything stage 2 read there on the side stream, after a failure too: across the split
         # of an explicit placement that includes persistent Cache rows (the pool replica gathers),
         # which the allocator records do not cover
-        torch.cuda.current_stream(plan.dev1).wait_stream(plan.side1)
+        for d, side in zip(plan.devs1, plan.sides):
+            torch.cuda.current_stream(d).wait_stream(side)
     if "e" in box:
         _invalidate_state(rs)
         raise box["e"]
