@@ -145,7 +145,14 @@ def exact_rows_sum(terms: int, width: int) -> bool:
         8 threads high for some output counts and not others: a real row-count dependence).
 
     Everything else keeps the per-row form (terms: size of the reduced dimension, width: size of
-    the operand's last dimension). Callers also compare the two forms bitwise on first use
+    the operand's last dimension).
+
+    The bound was read in the Reduce.cuh of torch 2.14.0 (setReduceConfig, set_block_dimension,
+    get_output_vec_size, thread_reduce_impl; the header ships in the wheel under
+    torch/include/ATen/native/cuda/). It is a statement about that source, and this tree holds
+    none of it: for any other torch the layout is not shown here. So callers do not rest on the
+    bound alone. They compare the two forms bitwise on the first use of every operand shape on
+    every device, in the process that serves, and keep the per-row form where they differ
     (modules/dsv41_block.py, _sum_rows)
     """
     if terms < 2 or width < 2:

@@ -70,8 +70,9 @@ def _sum_rows(key, batched, rows) -> torch.Tensor:
     """
     EXL3_EXACT_ROWS: a torch sum of a flagged call inside the bound of exact_rows_sum, over all
     rows at once (batched()) where that was seen to give the bits of the per-row form (rows()).
-    The bound is read from torch's reduce layout, which torch has no argument to pin and which
-    this tree does not hold. So the first flagged call with an operand shape on a device computes
+    The bound is read from the reduce layout of one torch version (exact_rows_sum names it), which
+    torch has no argument to pin and which this tree does not hold: with another torch the bound
+    shows nothing. So the first flagged call with an operand shape on a device computes
     both forms, compares them bitwise (through an int32 view: signed zeros and NaN payloads count)
     and returns the per-row result; later calls with that key take the batched sum. A key whose
     forms differed keeps the per-row form for the life of the process, with one printed line.
@@ -88,8 +89,8 @@ def _sum_rows(key, batched, rows) -> torch.Tensor:
             and torch.equal(many.view(torch.int32), ones.view(torch.int32))
         ROWS_SUMMED[key] = ok
         if not ok:
-            print(f" !! EXL3_EXACT_ROWS: torch's sum over the rows of {key[1]} on {key[0]} does not give "
-                  f"the bits of the per-row sums; that operand keeps one sum per row")
+            print(f" !! EXL3_EXACT_ROWS: the sum of torch {torch.__version__} over the rows of {key[1]} on "
+                  f"{key[0]} does not give the bits of the per-row sums; that operand keeps one sum per row")
     return ones
 
 
