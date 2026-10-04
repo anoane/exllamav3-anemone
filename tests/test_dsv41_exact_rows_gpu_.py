@@ -462,11 +462,14 @@ class ExactRows(unittest.TestCase):
         self.assertTrue(captured, "the forward reached no Linear with 2 to 8 rows")
         print(f" -- exact rows: real activations of {len(captured)} linears: "
               f"{', '.join(sorted(f'{name} @ {device}' for name, device in captured))}", flush = True)
+        loops = []
         for (name, device), (lin, out_dtype, x) in sorted(captured.items(), key = lambda kv: kv[0]):
             with self.subTest(op = name, device = device, rows = x.numel() // x.shape[-1]):
-                self.linear_both(f"{name} @ {device}, real activations", lin, x, out_dtype)
+                if not self.linear_both(f"{name} @ {device}, real activations", lin, x, out_dtype):
+                    loops.append(f"{name} @ {device} (contiguous: {x.is_contiguous()})")
                 # and against the one-row calls themselves, as test_linears does on random rows
                 self.linear_rows(f"{name} @ {device}, real activations", lin, x, out_dtype)
+        print(f" -- exact rows: of those, the Python row loop serves {', '.join(loops) or 'none'}", flush = True)
 
     @torch.inference_mode()
     def test_native_equals_python_loop_grouped_output_projection(self):
