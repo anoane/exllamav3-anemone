@@ -26,7 +26,9 @@ The index selection is covered on the pools of real forwards (prefixes of 1200 a
 the second is past the 16,384 entries from which the candidate mask cuts) and on crafted pools:
 select_topk with one_row on K rows against K one-row calls, indices, candidate blocks and the
 scores themselves, on every GPU (the captured operands are copied to a GPU that holds no index
-source), with the calls that must refuse the shared pass. Not covered: the attention kernel and
+source), with the calls that must refuse the shared pass: among them every call on a GPU that is
+not of a type the pass is verified on (ROWS_PASS_SM; shown with the compute capability replaced,
+and expected of a real GPU of another type). Not covered: the attention kernel and
 the order of these operations in a forward. tools/dsv41_rowprobe.py under EXL3_EXACT_ROWS=1 is
 the evidence for those (attn.dsa_attn and the forward's logits in its tables).
 
@@ -42,7 +44,9 @@ projection and of the router in one native call, the MoE experts of all rows in 
 with the rows grouped by expert and the router's projection as one launch where the extension
 reports those forms), else the Python loops of one call per row. The index selection, the
 hyper-connection sums, the compressor and the engram gate take their batched forms with every
-extension. The tests above cover whichever the extension gives. The test_native_* tests
+extension (math_policy.exact_rows_forms; the consumers' ROWS_FORMS); each is also compared in
+place with its form of one call per row, entry or token, by clearing its bit (rows_forms). The
+tests above cover whichever the extension gives. The test_native_* tests
 need the entry points and are skipped, with a printed note, for an extension built before them:
 each operation with the entry points against the Python row loop on the same input (the consumers'
 ROWS_NATIVE set to 0), with the row loops made to raise where the entry point must serve; the
@@ -85,8 +89,13 @@ CAP_ONE_LAUNCH = 32
 # hgemm_rows, and the two forms the callers ask of run_bszN_rows and routing_ds3_nogroup_rows by an
 # argument: the rows grouped by expert, the router's projection as one launch
 CAP_HGEMM, CAP_MOE_GROUPED, CAP_ROUTER_ONE_LAUNCH = 64, 128, 256
-# The compute capabilities on which the extension makes that launch (exl3_gemm_one_row_route_ok)
+# The compute capabilities on which the extension makes that launch (exl3_gemm_one_row_route_ok),
+# groups the MoE rows, and on which select_topk shares a pass (dsv41_select.ROWS_PASS_SM)
 ONE_LAUNCH_SM = ((8, 0), (8, 9), (12, 0))
+# The batched forms that are Python alone (math_policy.EXACT_ROWS_FORM_*), and the modules that
+# hold them (ROWS_FORMS)
+FORM_SELECT, FORM_SUMS, FORM_COMPRESS, FORM_GATE = 1, 2, 4, 8
+FORM_CONSUMERS = ("dsv41", "dsv41_block", "dsv41_cached", "dsv41_engram")
 # What the extension takes when EXL3_INT8_GEMV is not set (exl3_gemv_int8.cu): the plain int8 mode
 INT8_GEMV_DEFAULT = "2"
 NATIVE_CONSUMERS = ("linear", "dsv41", "dsv41_moe", "block_sparse_mlp", "block_sparse_mlp_routing", "dsv41_block")
@@ -118,6 +127,21 @@ def rows_native(caps: int):
     finally:
         for m, value in zip(mods, saved):
             m.ROWS_NATIVE = value
+
+
+@contextmanager
+def rows_forms(mask: int):
+    """The consumers' ROWS_FORMS set to mask for the block: a cleared bit gives that operation its
+    form of one call per row, entry or token."""
+    mods = [importlib.import_module(f"exllamav3.modules.{name}") for name in FORM_CONSUMERS]
+    saved = [m.ROWS_FORMS for m in mods]
+    for m in mods:
+        m.ROWS_FORMS = mask
+    try:
+        yield
+    finally:
+        for m, value in zip(mods, saved):
+            m.ROWS_FORMS = value
 
 
 def _refuse(*args, **kwargs):
@@ -195,6 +219,12 @@ class ExactRows(unittest.TestCase):
         # what the captured forward gave the operations that are not Linears (captured_linear_inputs)
         cls.real_hc, cls.real_head, cls.real_moe, cls.real_comp, cls.real_gate = {}, {}, {}, [], {}
         cls.real_select, cls.real_select_far = [], None
+        from exllamav3.model.math_policy import EXACT_ROWS_FORMS_ALL
+        cls.forms = EXACT_ROWS_FORMS_ALL
+        for name in FORM_CONSUMERS:
+            held = importlib.import_module(f"exllamav3.modules.{name}").ROWS_FORMS
+            assert held == cls.forms == FORM_SELECT | FORM_SUMS | FORM_COMPRESS | FORM_GATE, \
+                f"{name}.ROWS_FORMS is {held}: the batched forms must all be on under the switch"
         print(f" -- exact rows: {n} layers on {', '.join(str(d) for d in cls.devices)}; row-exact entry points of "
               f"the extension: {cls.caps or 'none (the Python row loops serve every flagged call)'}; "
               f"EXL3_INT8_GEMV={cls.int8}", flush = True)
@@ -487,7 +517,8 @@ class ExactRows(unittest.TestCase):
         #    streams, run on all rows, give every row the bits of the sum over its own operand, and
         #    of the extension's per-row entry points;
         #  - through the module: the first flagged call records both sums as row-exact
-        #    (ROWS_SUMMED), and the next one computes them with the per-row forms made to raise.
+        #    (ROWS_SUMMED), and the next one computes them with the per-row forms made to raise;
+        #    without the form's bit (ROWS_FORMS) the per-row forms serve and nothing is recorded.
         # Control: the same sums reduced along the fastest dimension, another layout of torch's
         # reduction, must differ on the real data, or bitwise equality here shows nothing
         m_block = importlib.import_module("exllamav3.modules.dsv41_block")
@@ -549,7 +580,10 @@ class ExactRows(unittest.TestCase):
                                     with mock.patch.object(m_block, "_rows_collapse", _refuse), \
                                             mock.patch.object(m_block, "_rows_partials", _refuse):
                                         second = [t.clone() for t in hc.mix_delayed(streams, dict(FLAGGED), carry, own_pre)]
-                                for call, many in (("first", first), ("second", second)):
+                                with rows_forms(self.forms & ~FORM_SUMS), mock.patch.dict(m_block.ROWS_SUMMED, clear = True):
+                                    per_row = [t.clone() for t in hc.mix_delayed(streams, dict(FLAGGED), carry, own_pre)]
+                                    self.assertFalse(m_block.ROWS_SUMMED, f"{what}: sums over the rows without their bit")
+                                for call, many in (("first", first), ("second", second), ("per-row", per_row)):
                                     for i, name in enumerate(names):
                                         for j in range(K):
                                             self.assertTrue(_bits(many[i][0, j], ones[j][i][0, 0]),
@@ -575,7 +609,10 @@ class ExactRows(unittest.TestCase):
                             self.assertEqual(list(m_block.ROWS_SUMMED.values()), [True], "head collapse: sums recorded")
                             with mock.patch.object(m_block, "_rows_collapse", _refuse):
                                 second = head.forward(x, dict(FLAGGED, dsv41_hc_pre = pre))
-                        for call, many in (("first", first), ("second", second)):
+                        with rows_forms(self.forms & ~FORM_SUMS), mock.patch.dict(m_block.ROWS_SUMMED, clear = True):
+                            per_row = head.forward(x, dict(FLAGGED, dsv41_hc_pre = pre))
+                            self.assertFalse(m_block.ROWS_SUMMED, "head collapse: sums over the rows without their bit")
+                        for call, many in (("first", first), ("second", second), ("per-row", per_row)):
                             for j in range(K):
                                 self.assertTrue(_bits(many[0, j], ones[j][0, 0]),
                                                 f"head collapse on {device}, {kind}, {call} flagged call: row {j} differs")
@@ -666,7 +703,8 @@ class ExactRows(unittest.TestCase):
         # DSV41Engram._gate_rows, which a flagged forward calls on the streams and on the key, a
         # view into the projection's (1, L, (H + 1) * D) output
         # on random rows and on the streams and keys of a real forward, on the engram's own GPU and,
-        # with its qk copied there, on every other one. A flagged gate is ONE _gate call
+        # with its qk copied there, on every other one. A flagged gate is ONE _gate call; without
+        # the form's bit (ROWS_FORMS) it is one _gate call per token, with the same bits
         engrams = [b.engram for b in self.blocks if b.engram is not None]
         self.assertTrue(engrams, "the model has no engram layer")
         self.captured_linear_inputs()
@@ -687,6 +725,11 @@ class ExactRows(unittest.TestCase):
                                 many = eng._gate_rows(h, key, eps)
                             self.assertEqual(gate.call_count, 1, "_gate calls of a flagged gate")
                             self.assertEqual(tuple(many.shape), (1, K, H))
+                            with rows_forms(self.forms & ~FORM_GATE), \
+                                    mock.patch.object(eng, "_gate", wraps = eng._gate) as gate:
+                                loop = eng._gate_rows(h, key, eps)
+                            self.assertEqual(gate.call_count, K, "_gate calls of a flagged gate without its bit")
+                            self.assertTrue(_bits(many, loop), f"{eng.key} gate on {device}, {kind}: the two forms differ")
                             ones = []
                             for l in range(K):
                                 if kv is None:
@@ -725,6 +768,9 @@ class ExactRows(unittest.TestCase):
                         self.assertEqual((first, many.shape[0]), (pos0, K))
                         self.assertEqual([f for _, f in ones], list(range(pos0, pos0 + K)))
                         self.same_rows("compressor rate 1", many, [lat for lat, _ in ones])
+                        with rows_forms(self.forms & ~FORM_COMPRESS):
+                            loop, _ = CompressCarry.step(None, kv, None, pos0, 1, weight, eps, True)
+                        self.assertTrue(_bits(many, loop), "compressor rate 1: the two forms differ")
                     with self.subTest(rate = 2, device = str(device), K = K, pos0 = pos0):
                         # the ring already holds the row before pos0: an odd pos0 closes its group
                         ring = self.randn((PAGE_SIZE + 2, 2 * hd), device, torch.float)
@@ -737,6 +783,34 @@ class ExactRows(unittest.TestCase):
                         self.assertEqual((first, many.shape[0]), (pos0 // 2, (pos0 + K) // 2 - pos0 // 2))
                         self.same_rows("compressor rate 2", many, ones)
                         self.assertTrue(torch.equal(ring_many, ring_ones), "the carry rings differ")
+                        ring_loop = ring.clone()
+                        with rows_forms(self.forms & ~FORM_COMPRESS):
+                            loop, _ = CompressCarry.step(ring_loop, kv, gate, pos0, 2, weight, eps, True)
+                        self.assertTrue(_bits(many, loop), "compressor rate 2: the two forms differ")
+                        self.assertTrue(torch.equal(ring_many, ring_loop), "the carry rings of the two forms differ")
+            # A rate above 2 (no layer of this model has one): the pooling sums more than two terms,
+            # in an order torch may take from the operand, so every group is pooled and normalized
+            # by a call of its own, as a one-row step that closes it does
+            for rate in (3, 4):
+                K, pos0 = max(ROWS), 1200
+                groups = (pos0 + K) // rate - pos0 // rate
+                with self.subTest(rate = rate, device = str(device)):
+                    self.assertGreater(groups, 1, "the case must close several groups")
+                    kv = self.randn((K, hd), device, torch.float, 5.0)
+                    gate = self.randn((K, hd), device, torch.float, 3.0)
+                    ring = self.randn((PAGE_SIZE + rate, 2 * hd), device, torch.float)
+                    ring_many, ring_ones = ring.clone(), ring.clone()
+                    with mock.patch.object(m_comp, "group_pool", wraps = m_comp.group_pool) as pool, \
+                            mock.patch.object(m_comp, "rms_norm", wraps = m_comp.rms_norm) as norm:
+                        many, first = CompressCarry.step(ring_many, kv, gate, pos0, rate, weight, eps, True)
+                    self.assertEqual((pool.call_count, norm.call_count), (groups, groups),
+                                     f"group_pool, rms_norm calls at rate {rate}")
+                    ones = [CompressCarry.step(ring_ones, kv[j:j + 1].clone(), gate[j:j + 1].clone(),
+                                               pos0 + j, rate, weight, eps)[0] for j in range(K)]
+                    ones = [row for lat in ones for row in lat]
+                    self.assertEqual((first, many.shape[0]), (pos0 // rate, groups))
+                    self.same_rows(f"compressor rate {rate}", many, ones)
+                    self.assertTrue(torch.equal(ring_many, ring_ones), "the carry rings differ")
         # the kv and gate rows, the carry ring and the norm weight of the real forward's kv sources,
         # on every GPU (copied to the ones that hold no such source)
         self.captured_linear_inputs()
@@ -762,6 +836,11 @@ class ExactRows(unittest.TestCase):
                         self.same_rows(f"compressor rate {m} on {device}, real rows", many, ones)
                         if ring_many is not None:
                             self.assertTrue(torch.equal(ring_many, ring_ones), "the carry rings differ")
+                        ring_loop = None if c["carry"] is None else move(c["carry"]).clone()
+                        with rows_forms(self.forms & ~FORM_COMPRESS):
+                            loop, _ = CompressCarry.step(ring_loop, kv_r[:K], None if gate_r is None else gate_r[:K],
+                                                         pos0, m, weight_r, c["eps"], True)
+                        self.assertTrue(_bits(many, loop), f"compressor rate {m} on {device}, real rows: the two forms differ")
         # per_row is defined on (rows, d) latents: any other shape is refused, never reduced whole
         with self.assertRaisesRegex(ValueError, "per_row"):
             m_comp.rms_norm(self.randn((1, 3, hd), self.devices[0], torch.float), None, eps, True)
@@ -802,12 +881,14 @@ class ExactRows(unittest.TestCase):
         candidate blocks and the scores below each row's own entry count, bit for bit; the scores
         from there on -inf. The shared pass must be ONE scorer call, pinned, that never reaches
         the query-tiled kernel, and one dsa_topk call (two where candidates are published).
-        served False: the call must refuse the pass (None) before it launches anything. Returns
+        served False, and every call on a GPU that is not of a type the pass is verified on
+        (pass_device): the call must refuse the pass (None) before it launches anything. Returns
         whether it served.
         """
         m_triton = importlib.import_module("exllamav3.modules.attention_fn.dsa_triton")
         from exllamav3.modules.dsv41_select import select_topk
         want_cand = bool(kw.get("want_cand"))
+        served = served and self.pass_device(q.device)
         with self.scored() as scores, self.counted("dsa_topk") as topks, \
                 mock.patch.object(m_triton, "_dsa_indexer_kernel", _RefusedKernel()):
             many = select_topk(q[:K], w[:K], pool, pos0 = pos0, m = m, ec = (pos0 + K) // m,
@@ -836,6 +917,10 @@ class ExactRows(unittest.TestCase):
                 self.assertTrue(torch.equal(many.cand[j], one.cand[0]), f"{what}: candidate blocks of row {j} differ")
         return True
 
+    def pass_device(self, device) -> bool:
+        """Whether select_topk shares a pass between rows on this GPU (dsv41_select.ROWS_PASS_SM)."""
+        return tuple(torch.cuda.get_device_capability(torch.device(device))) in ONE_LAUNCH_SM
+
     def selection_on(self, c, device):
         """A captured selection's operands on `device` (copied when they live elsewhere)."""
         move = lambda t: None if t is None else t.to(device)
@@ -860,14 +945,53 @@ class ExactRows(unittest.TestCase):
         cutting = [c for c in captured if c["cand_in"] is not None
                    and (c["args"]["pos0"] + 1) // c["args"]["m"] > c["args"]["n_blocks"] * c["args"]["block"]]
         self.assertTrue(cutting, "no captured selection has a candidate mask that cuts")
+        # What the shared pass rests on is seen only where rows differ in their entry counts: the
+        # earlier row's key tile then holds real keys where its one-row call loads zeros. Every
+        # rate must have such calls on every GPU that shares a pass
         for device in self.devices:
+            unequal = {}
             for c in captured:
                 q, w, pool, kw, cand_in = self.selection_on(c, device)
                 pos0, m = kw.pop("pos0"), kw.pop("m")
                 for K in ROWS:
                     with self.subTest(selection = self.selection_name(c), device = str(device), K = K):
-                        self.select_rows(f"{self.selection_name(c)} on {device}, K={K}", q, w, pool, K,
-                                         pos0 = pos0, m = m, cand_in = cand_in, **kw)
+                        took = self.select_rows(f"{self.selection_name(c)} on {device}, K={K}", q, w, pool, K,
+                                                pos0 = pos0, m = m, cand_in = cand_in, **kw)
+                        unequal[m] = unequal.get(m, 0) + int(took and (pos0 + 1) // m != (pos0 + K) // m)
+            print(f" -- exact rows: selections on {device}: one pass for rows of different entry counts in "
+                  f"{', '.join(f'{n} calls at rate {m}' for m, n in sorted(unequal.items()))}", flush = True)
+            if self.pass_device(device):
+                with self.subTest(device = str(device)):
+                    self.assertTrue(unequal and all(unequal.values()),
+                                    f"on {device} no shared pass had rows of different entry counts at some rate "
+                                    f"({unequal}): the key columns past a row's own count were never real keys")
+
+    @torch.inference_mode()
+    def test_select_pass_needs_a_verified_gpu_type(self):
+        # The shared pass rests on a property of the tensor-core instruction that is compared on
+        # the GPU types of ROWS_PASS_SM alone (the list of exact_rows_device_ok). With any other
+        # compute capability select_topk must refuse the pass before it launches anything: shown
+        # on every GPU with the capability replaced. The same selections serve as they are in
+        # test_select_rows_equal_one_row_calls
+        m_select = importlib.import_module("exllamav3.modules.dsv41_select")
+        self.assertEqual(tuple(m_select.ROWS_PASS_SM), ONE_LAUNCH_SM, "the GPU types of the shared pass")
+        self.assertFalse(m_select._rows_pass_device(torch.device("cpu")))
+        captured = self.captured_selections()
+        self.assertTrue(captured, "the forwards made no selection of 2 to 8 rows")
+        for device in self.devices:
+            self.assertEqual(m_select._rows_pass_device(device), self.pass_device(device), f"the type of {device}")
+            for c in captured[:2] + captured[-2:]:
+                q, w, pool, kw, cand_in = self.selection_on(c, device)
+                pos0, m = kw.pop("pos0"), kw.pop("m")
+                for sm in ((7, 5), (8, 6), (9, 0), (10, 0), (12, 1)):
+                    for K in (2, 8):
+                        with self.subTest(selection = self.selection_name(c), device = str(device), sm = sm, K = K), \
+                                mock.patch.dict(m_select._ROWS_PASS_DEVICES, clear = True), \
+                                mock.patch.object(torch.cuda, "get_device_capability", return_value = sm):
+                            took = self.select_rows(f"{self.selection_name(c)} on {device} as sm {sm}, K={K}", q, w,
+                                                    pool, K, pos0 = pos0, m = m, cand_in = cand_in, **kw)
+                            self.assertFalse(took, f"a shared pass on compute capability {sm}")
+            self.assertEqual(m_select._rows_pass_device(device), self.pass_device(device), f"the type of {device}")
 
     @torch.inference_mode()
     def test_select_control_unpinned_differs(self):
@@ -978,13 +1102,17 @@ class ExactRows(unittest.TestCase):
             print(f" -- exact rows: crafted selections on {device}: one pass for {len(served)} cases, refused "
                   f"(the row loop serves) in: {', '.join(sorted(refused)) or 'NONE'}", flush = True)
             with self.subTest(device = str(device)):
-                self.assertEqual(refused, {"the rows straddle a tile width", "a tile outside the score budget"})
+                if self.pass_device(device):
+                    self.assertEqual(refused, {"the rows straddle a tile width", "a tile outside the score budget"})
+                else:
+                    self.assertFalse(served, f"{device} is not of a type the shared pass is verified on")
 
     @torch.inference_mode()
     def test_index_select_falls_back(self):
-        # DSV41Attention._index_select inside a real flagged forward, twice per index source: with
-        # select_topk made to refuse the shared pass (the row loop: 1 + rows calls) and as it is
-        # (one call). Both must select the same
+        # DSV41Attention._index_select inside a real flagged forward, three times per index source:
+        # with select_topk made to refuse the shared pass (the row loop: 1 + rows calls), without
+        # the form's bit (ROWS_FORMS: the row loop, rows calls, the pass never asked for) and as
+        # it is (one call on a GPU of a verified type). All must select the same
         m_dsv41 = importlib.import_module("exllamav3.modules.dsv41")
         seen, hooked = [], []
 
@@ -1007,11 +1135,18 @@ class ExactRows(unittest.TestCase):
                     loop = orig(x, params, q_res, idx_pool, bt_row, epp, pos0, ec, b)
                 loop_calls = list(calls)
                 calls.clear()
+                with mock.patch.object(m_dsv41, "ROWS_FORMS", self.forms & ~FORM_SELECT), \
+                        mock.patch.object(m_dsv41, "select_topk", counting):
+                    masked = orig(x, params, q_res, idx_pool, bt_row, epp, pos0, ec, b)
+                masked_calls = list(calls)
+                calls.clear()
                 with mock.patch.object(m_dsv41, "select_topk", counting):
                     one = orig(x, params, q_res, idx_pool, bt_row, epp, pos0, ec, b)
-                same = loop.k_len == one.k_len and torch.equal(loop.indices, one.indices) and \
-                    (loop.cand is None) == (one.cand is None) and (one.cand is None or torch.equal(loop.cand, one.cand))
-                seen.append((at.layer_idx, str(at.device), x.shape[1], loop_calls, list(calls), same))
+                same = all(
+                    other.k_len == one.k_len and torch.equal(other.indices, one.indices)
+                    and (other.cand is None) == (one.cand is None)
+                    and (one.cand is None or torch.equal(other.cand, one.cand)) for other in (loop, masked))
+                seen.append((at.layer_idx, str(at.device), x.shape[1], loop_calls, masked_calls, list(calls), same))
                 return one
             at._index_select = index_select
             hooked.append(at)
@@ -1024,13 +1159,16 @@ class ExactRows(unittest.TestCase):
             for at in hooked:
                 del at._index_select
         self.assertEqual(len(seen), len(hooked), "not every index source selected in the flagged forward")
-        for layer, device, rows, loop_calls, calls, same in seen:
+        for layer, device, rows, loop_calls, masked_calls, calls, same in seen:
             with self.subTest(layer = layer, device = device):
                 self.assertEqual(loop_calls, [True] + [False] * rows, "select_topk calls of the row loop")
-                self.assertEqual(calls, [True], "select_topk calls of the shared pass")
+                self.assertEqual(masked_calls, [False] * rows, "select_topk calls without the form's bit")
+                self.assertEqual(calls, [True] if self.pass_device(device) else [True] + [False] * rows,
+                                 "select_topk calls of the shared pass")
                 self.assertTrue(same, f"L{layer}: the shared pass and the row loop select differently")
         print(f" -- exact rows: _index_select on layers {[layer for layer, *_ in seen]}: one select_topk call for "
-              f"{seen[0][2]} rows, and the row loop when that call refuses", flush = True)
+              f"{seen[0][2]} rows on a GPU of a verified type, and the row loop when that call refuses or is not "
+              f"asked for", flush = True)
 
     # -- the row-exact entry points of the extension (test_native_*) --
 
@@ -1521,8 +1659,14 @@ class ExactRows(unittest.TestCase):
 
     @torch.inference_mode()
     def test_native_equals_python_loop_moe(self):
+        # The MoE layer through its forward, as the engine calls it: with the extension's entry
+        # points against the Python row loop. Where the extension reports the grouped MoE launch
+        # and the router's single launch, the engine itself must ask for them (the extension's
+        # counts around the forward), and with those two bits masked it must not: the launch per
+        # slot and the projection per row, with the same bits
         self.need(CAP_ROUTER | CAP_MOE)
         m_moe = importlib.import_module("exllamav3.modules.dsv41_moe")
+        batched = self.caps & (CAP_MOE_GROUPED | CAP_ROUTER_ONE_LAUNCH)
         for device in self.devices:
             # every GPU must show the entry points on a layer of its own, at every K: a layer they
             # do not serve compares the Python row loop with itself
@@ -1539,10 +1683,23 @@ class ExactRows(unittest.TestCase):
                             if one:
                                 with self.counted("routing_ds3_nogroup_rows") as calls, \
                                         mock.patch.object(m_moe, "forward_rows", _refuse):
-                                    native = mlp.forward(x, dict(FLAGGED)).clone()
+                                    native, grew = self.served_forms(lambda: mlp.forward(x, dict(FLAGGED)).clone())
                                 self.assertEqual(len(calls), 1, "routing_ds3_nogroup_rows calls")
+                                if self.caps & CAP_MOE_GROUPED:
+                                    self.assertEqual(grew[CAP_MOE_GROUPED],
+                                                     (2 if mlp.bc.sh_coop else 1) if mlp.bc.rows_grouped() else 0,
+                                                     "grouped launch pairs of a flagged MoE forward")
+                                if self.caps & CAP_ROUTER_ONE_LAUNCH:
+                                    self.assertEqual(grew[CAP_ROUTER_ONE_LAUNCH], 1,
+                                                     "one-launch projections of a flagged MoE forward")
                             else:
                                 native = mlp.forward(x, dict(FLAGGED)).clone()
+                        if one and batched:
+                            with rows_native(self.caps & ~batched), mock.patch.object(m_moe, "forward_rows", _refuse):
+                                plain, grew = self.served_forms(lambda: mlp.forward(x, dict(FLAGGED)).clone())
+                            self.assertFalse(any(grew.values()), f"batched forms served without their bits: {grew}")
+                            self.same(f"moe L{b.layer_idx}, without the grouped launch and the single projection",
+                                      native, plain)
                         with rows_native(0):
                             loop = mlp.forward(x, dict(FLAGGED)).clone()
                         self.same(f"moe L{b.layer_idx}", native, loop)
@@ -1561,6 +1718,14 @@ class ExactRows(unittest.TestCase):
         before = int(self.ext.exact_rows_served(cap))
         result = call()
         return result, int(self.ext.exact_rows_served(cap)) - before
+
+    def served_forms(self, call):
+        """call(), and the launches it made of each batched form the extension counts:
+        {capability bit: launches}, for the bits the extension reports (exact_rows_served)."""
+        bits = [bit for bit in (CAP_MOE_GROUPED, CAP_ROUTER_ONE_LAUNCH) if self.caps & bit]
+        before = {bit: int(self.ext.exact_rows_served(bit)) for bit in bits}
+        result = call()
+        return result, {bit: int(self.ext.exact_rows_served(bit)) - before[bit] for bit in bits}
 
     def moe_launch(self, mlp, y, sel, w, rows_entry: bool, grouped: bool = False):
         """The fused decode launch pair of an MoE layer on a given routing, as BlockSparseMLP.forward

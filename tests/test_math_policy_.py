@@ -186,6 +186,18 @@ class ExactRowsTests(unittest.TestCase):
             with self.subTest(terms = terms, width = width):
                 self.assertIs(policy.exact_rows_sum(terms, width), expected)
 
+    def test_python_forms(self):
+        # exact_rows_forms: every batched form that is Python alone under the switch, none without
+        policy = load({})
+        bits = (policy.EXACT_ROWS_FORM_SELECT, policy.EXACT_ROWS_FORM_SUMS, policy.EXACT_ROWS_FORM_COMPRESS,
+                policy.EXACT_ROWS_FORM_GATE)
+        self.assertEqual(bits, (1, 2, 4, 8))
+        self.assertEqual(policy.EXACT_ROWS_FORMS_ALL, 15)
+        self.assertEqual((policy.exact_rows_forms(True), policy.exact_rows_forms(False)), (15, 0))
+        # the import-time constant is the default
+        self.assertEqual(policy.exact_rows_forms(), 0)
+        self.assertEqual(load({"EXL3_EXACT_ROWS": "1"}).exact_rows_forms(), 15)
+
     def test_native_entry_points(self):
         # exact_rows_native: what the extension reports, behind the switch; an extension built before
         # the row-exact entry points has no exact_rows_caps

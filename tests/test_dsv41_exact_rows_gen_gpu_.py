@@ -44,7 +44,8 @@ forwards must have made some (about the EXL3 linears and grouped projections of 
 forward; printed), with it on none. The other batched forms of a verify forward give the same
 bits as their per-row forms too, so each case also checks that they ran in its drafted run: the
 index selection as one pass for the rows (select_topk calls that served with one_row, and those
-that refused it, printed), the hyper-connection sums over the rows (dsv41_block.ROWS_SUMMED: every
+that refused it, printed; required where an index source on a GPU of a verified type selects, as
+every other GPU type keeps the row loop), the hyper-connection sums over the rows (dsv41_block.ROWS_SUMMED: every
 operand shape recorded as row-exact), and, where the extension reports them, the MoE launch pairs
 with the rows grouped by expert and the router projections made with one launch
 (exact_rows_served). Run it under both settings, each with one autotune file:
@@ -231,8 +232,8 @@ def main() -> int:
     # The extension makes it with EXL3_INT8_GEMV=0 only (it reads the variable as atoi does, unset
     # is 2), and on these compute capabilities only (exl3_gemm_one_row_route_ok)
     int8_off = int(os.environ.get("EXL3_INT8_GEMV", "2")) == 0
-    verified_gpu = any(tuple(torch.cuda.get_device_capability(i)) in ((8, 0), (8, 9), (12, 0))
-                       for i in range(torch.cuda.device_count()))
+    verified = lambda device: tuple(torch.cuda.get_device_capability(device)) in ((8, 0), (8, 9), (12, 0))
+    verified_gpu = any(verified(i) for i in range(torch.cuda.device_count()))
     # The batched forms the extension makes when asked (128: the MoE rows grouped by expert, 256: the
     # router's projection as one launch) and counts; the hyper-connection sums record themselves
     import exllamav3.modules.dsv41_block as m_block
@@ -252,6 +253,10 @@ def main() -> int:
     # (compress ratio, index_topk) of every index source: from which position its rows select
     blocks = model.modules[model.first_block_idx : model.first_block_idx + config.num_hidden_layers]
     sources = [(b.attn.compress_ratio, b.attn.index_topk) for b in blocks if getattr(b.attn, "is_index_source", False)]
+    # those on a GPU of a type the shared selection pass is verified on (dsv41_select.ROWS_PASS_SM):
+    # on every other GPU a flagged selection is the row loop
+    pass_sources = [(b.attn.compress_ratio, b.attn.index_topk) for b in blocks
+                    if getattr(b.attn, "is_index_source", False) and verified(torch.device(b.device))]
     encode = lambda text: tok.encode(text, add_bos = True)
     repeat, prose = encode(REPEAT), encode(PROSE)
 
@@ -299,9 +304,13 @@ def main() -> int:
             # index_topk entries of the source's pool)
             selecting = sum(1 for p, rows, flagged in drafted["forwards"] if rows > 1 and flagged
                             and any((p + 1) // ratio > topk for ratio, topk in sources))
+            # and those in which a source that may share a pass selects
+            passing = sum(1 for p, rows, flagged in drafted["forwards"] if rows > 1 and flagged
+                          and any((p + 1) // ratio > topk for ratio, topk in pass_sources))
             sums = dict(m_block.ROWS_SUMMED)
             print(f"       batched forms of the drafted run: {passes[0]} selections as one pass, {passes[1]} by the row "
-                  f"loop, in {selecting} selecting verify forwards; hyper-connection sums over the rows for "
+                  f"loop, in {selecting} selecting verify forwards ({passing} with a source on a GPU of a "
+                  f"verified type); hyper-connection sums over the rows for "
                   f"{sum(sums.values())} of {len(sums)} operand shapes; grouped MoE launch pairs "
                   f"{forms.get(128, 'not in this extension')}, one-launch router projections "
                   f"{forms.get(256, 'not in this extension')}", flush = True)
@@ -310,8 +319,9 @@ def main() -> int:
                     bad.append(f"the hyper-connection sums over the rows were not recorded as row-exact for every "
                                f"operand shape ({sum(sums.values())} of {len(sums)}): the per-row sums served")
                     print(f"       {bad[-1]}", flush = True)
-                if selecting and not passes[0]:
-                    bad.append(f"{selecting} selecting verify forwards and no selection as one pass")
+                if passing and not passes[0]:
+                    bad.append(f"{passing} verify forwards in which an index source on a GPU of a verified type "
+                               f"selects, and no selection as one pass")
                     print(f"       {bad[-1]}", flush = True)
                 for bit, what in ((128, "MoE launch pair with the rows grouped"), (256, "router projection as one launch")):
                     if bit in forms and verified_gpu and not forms[bit]:
