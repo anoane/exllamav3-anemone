@@ -189,6 +189,25 @@ def to2(
     return x
 
 
+def forward_rows(fn, x: torch.Tensor) -> torch.Tensor:
+    """
+    fn on every row of x (a row = one index of the leading dims, the last dim is the width), one
+    call per row, the results stacked in x's leading shape. fn gets the row with x's number of
+    dims, each leading dim 1: the tensor a one-row call passes (EXL3_EXACT_ROWS). Each result is
+    copied out before the next call, since fn may return a view of a buffer it reuses.
+    """
+    lead, d = x.shape[:-1], x.shape[-1]
+    assert lead and x.numel() > 0, f"forward_rows: no rows in {tuple(x.shape)}"
+    rows = x.reshape(-1, *((1,) * (len(lead) - 1)), d)
+    out = None
+    for r in range(rows.shape[0]):
+        y = fn(rows[r:r + 1])
+        if out is None:
+            out = y.new_empty((rows.shape[0],) + tuple(y.shape[1:]))
+        out[r:r + 1].copy_(y)
+    return out.view(*lead, out.shape[-1])
+
+
 def save_tensor_image(
     t: torch.Tensor,
     path: str,

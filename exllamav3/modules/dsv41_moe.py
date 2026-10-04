@@ -17,6 +17,10 @@ CPU worker.
 
 Only DeepseekV41Model builds this class, and outside its load the guard
 accepts every device.
+
+Under EXL3_EXACT_ROWS=1 a flagged forward (params["exact_rows"]) runs the
+whole layer one row per call, each the call a decode step makes: router,
+expert cache lookup, routed and shared experts.
 """
 
 from __future__ import annotations
@@ -26,6 +30,8 @@ from typing_extensions import override
 
 from .block_sparse_mlp import BlockSparseMLP
 from ..architecture.dsv41.placement import TP_REFUSAL
+from ..model.math_policy import EXACT_ROWS
+from ..util.tensor import forward_rows
 
 
 class DSV41MoE(BlockSparseMLP):
@@ -45,3 +51,18 @@ class DSV41MoE(BlockSparseMLP):
     @override
     def make_tp_allocation(self, options: dict):
         raise NotImplementedError(TP_REFUSAL)
+
+    # Defined only under EXL3_EXACT_ROWS=1: without it the class adds nothing to
+    # BlockSparseMLP.forward, not even a frame
+    if EXACT_ROWS:
+
+        @override
+        def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+            # One row per call: the router projects one row in FP32 and more rows in int8, the
+            # expert kernels size their tiles from the call's (token, expert) slots, and a one-row
+            # call is a decode-mode lookup of the expert cache. forward_rows copies each result
+            # out of the static buffer the decode kernels return a view of
+            one_row = super().forward
+            if params.get("exact_rows") and x.numel() > x.shape[-1]:
+                return forward_rows(lambda row: one_row(row, params, out_dtype), x)
+            return one_row(x, params, out_dtype)

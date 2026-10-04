@@ -19,6 +19,7 @@ def main(path):
     from exllamav3 import Config, Model
 
     check_copy_contract()
+    check_forward_rows()
     config = Config.from_directory(path)
     assert config.arch_string == "DeepseekV41ForCausalLM", config.arch_string
     model = Model.from_config(config)
@@ -148,6 +149,33 @@ def check_copy_contract():
     assert not torch.cuda.is_initialized()
     print("  OK  CPU copy contract: actual head collapse, same-device/empty carried pre, "
           "and both cross-device helper paths")
+
+
+def check_forward_rows():
+    """util.tensor.forward_rows (EXL3_EXACT_ROWS): one call per row, in the shape a one-row call
+    passes, each result copied out before the next call."""
+    import torch
+    from exllamav3.util.tensor import forward_rows
+    buf = torch.empty(3, dtype = torch.double)
+    for shape in ((4, 5), (1, 4, 5)):
+        x = torch.arange(20, dtype = torch.float).reshape(shape)
+        seen = []
+        def fn(row):
+            seen.append(tuple(row.shape))
+            # the same buffer on every call, as the MoE decode kernels return theirs
+            buf.copy_(torch.stack([row.sum(), row.min(), row.max()]))
+            return buf.view(*([1] * (row.dim() - 1)), 3)
+        y = forward_rows(fn, x)
+        assert seen == [(1,) * (len(shape) - 1) + (5,)] * 4, seen
+        assert y.shape == shape[:-1] + (3,) and y.dtype == torch.double, (y.shape, y.dtype)
+        rows = x.reshape(4, 5).double()
+        want = torch.stack([rows.sum(-1), rows.amin(-1), rows.amax(-1)], dim = -1)
+        assert torch.equal(y.reshape(4, 3), want), y
+    # a strided input reaches fn row by row too
+    x = torch.arange(40, dtype = torch.float).reshape(4, 10)[:, ::2]
+    assert torch.equal(forward_rows(lambda row: row * 2, x), x * 2)
+    print("  OK  forward_rows: (1, D) and (1, 1, D) rows, the input's leading shape, the results' dtype, "
+          "distinct rows from a reused result buffer")
 
 
 # per-forward keys prepare_inputs must set fresh on every call

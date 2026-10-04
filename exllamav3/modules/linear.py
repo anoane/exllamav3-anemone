@@ -9,6 +9,8 @@ from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from ..model.math_policy import EXACT_ROWS
+from ..util.tensor import forward_rows
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -625,6 +627,12 @@ class Linear(Module):
         if self.out_features == 0:
             dtype = out_dtype or self.out_dtype or torch.half
             return x.new_empty((*x.shape[:-1], 0), dtype = dtype)
+
+        # EXL3_EXACT_ROWS: a flagged forward (params["exact_rows"], set by the model per forward)
+        # projects one row per call, each the complete one-row call below. The kernel, its
+        # activation format and its launch configuration follow the row count of a call
+        if EXACT_ROWS and params.get("exact_rows") and x.numel() > x.shape[-1]:
+            return forward_rows(lambda row: self.forward(row, params, out_dtype), x)
 
         # When in_features is padded past the incoming activation width (dims not a multiple of
         # pad_to, e.g. gpt-oss hidden_size 2880), zero-extend the input. The padded weight rows
