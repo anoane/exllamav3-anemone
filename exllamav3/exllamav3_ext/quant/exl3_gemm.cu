@@ -117,10 +117,7 @@ bool exl3_gemm_one_row_route_ok(int device, int64_t size_k, int64_t size_n)
 {
     if (exl3_gemv_int8_enabled()) return false;
     if (size_k <= 0 || size_n <= 0 || size_k % 128 || size_n % 128) return false;
-    if (device < 0 || device >= MAX_DEVICES) return false;
-    const auto* props = at::cuda::getDeviceProperties(device);
-    const int sm = props->major * 10 + props->minor;
-    return sm == 80 || sm == 89 || sm == 120;
+    return exact_rows_device_ok(device);
 }
 
 int exl3_gemm_gr

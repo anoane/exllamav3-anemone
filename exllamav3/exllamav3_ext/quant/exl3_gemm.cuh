@@ -9,12 +9,13 @@
 //   is offered to the int8 GEMV, and a call of any tensor keeps the launch per row
 // - both widths multiples of 128: the Hadamard transforms work on 128-element blocks of the
 //   flattened rows, and a block must not straddle two rows
-// - a device of compute capability 8.0, 8.9 or 12.0. The kernel source shows that the operations
-//   on a row and their order do not depend on the row count. That a tensor-core output row depends
-//   on its own input row alone, whatever the other rows of its m16 tile hold, is a property of the
-//   instruction: those are the capabilities on which the rows of such a launch are compared bit
-//   for bit with one-row calls (tests/test_dsv41_exact_rows_gpu_.py). Every other device keeps the
-//   launch per row, sm_86 with its FP16 accumulation (EXL3_GEMM_H_ACC) among them
+// - a device of compute capability 8.0, 8.9 or 12.0 (exact_rows.h, exact_rows_device_ok). The
+//   kernel source shows that the operations on a row and their order do not depend on the row
+//   count. That a tensor-core output row depends on its own input row alone, whatever the other
+//   rows of its m16 tile hold, is a property of the instruction: those are the capabilities on
+//   which the rows of such a launch are compared bit for bit with one-row calls
+//   (tests/test_dsv41_exact_rows_gpu_.py). Every other device keeps the launch per row, sm_86 with
+//   its FP16 accumulation (EXL3_GEMM_H_ACC) among them
 // exl3_gemm_gr and exl3_mgemm_gr apply it themselves; a caller asks first only to spare the copies
 // and the scratch of a call that would launch nothing
 bool exl3_gemm_one_row_route_ok(int device, int64_t size_k, int64_t size_n);

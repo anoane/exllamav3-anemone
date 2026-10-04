@@ -22,10 +22,11 @@ Under EXL3_EXACT_ROWS=1 a flagged forward (params["exact_rows"]) gives every
 row the arithmetic of the call a decode step makes: router, routed and shared
 experts. Where the extension has the row-exact router and expert entry points
 and the layer is one they serve (rows_native), that is one BlockSparseMLP
-forward on the rows: the router projects each row with the one-row launch, the
-experts of all rows run in one launch pair with the launch geometry of one row,
-and the expert cache is looked up once for the call. Otherwise the whole layer
-runs one row per call.
+forward on the rows: the router projects the rows with the kernel of a one-row
+call, the experts of all rows run in one launch pair with the tile of one row
+(rows that picked one expert grouped, as in any call, on the GPU types that was
+verified on), and the expert cache is looked up once for the call. Otherwise
+the whole layer runs one row per call.
 """
 
 from __future__ import annotations
@@ -76,8 +77,8 @@ class DSV41MoE(BlockSparseMLP):
         @override
         def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
             # The router projects one row in FP32 and more rows in int8, the expert kernels size
-            # their tiles from the call's (token, expert) slots and group rows that picked the
-            # same expert, and a one-row call is a decode-mode lookup of the expert cache. A
+            # their tiles from the call's (token, expert) slots, and a one-row call is a
+            # decode-mode lookup of the expert cache. A
             # flagged call of several rows is either one forward that the row-exact entry points
             # serve (rows_native), or one forward per row. forward_rows copies each result out of
             # the static buffer the decode kernels return a view of; the single forward returns

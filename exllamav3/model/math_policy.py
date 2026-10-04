@@ -189,6 +189,10 @@ EXACT_ROWS_CAP_HC = 16          # hc_collapse_rows, hc_partials_rows
 # With the int8 path on they launch per row. Tests and tools/dsv41_rowprobe.py read both
 EXACT_ROWS_CAP_ONE_LAUNCH = 32
 EXACT_ROWS_CAP_HGEMM = 64       # hgemm_rows
+# Not an entry point, and nothing here selects by it: on the GPU types that launch was verified on,
+# run_bszN_rows groups the rows that picked one expert, as an unflagged call does, with the tile of
+# a one-row call (BC_BlockSparseMLP.rows_grouped says for a layer, exact_rows_served counts)
+EXACT_ROWS_CAP_MOE_GROUPED = 128
 
 # EXL3_EXACT_ROWS: the term counts below which a torch sum over the rows of a flagged call is
 # row-exact (exact_rows_sum): any width, and an odd width

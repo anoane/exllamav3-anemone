@@ -114,6 +114,11 @@ bool BC_BlockSparseMLP::rows_exact_ok(int topk)
     return !sh_coop || exl3_moe_coop_rows_ok(sh_coop_p, 1, EXACT_ROWS_MAX);
 }
 
+bool BC_BlockSparseMLP::rows_grouped()
+{
+    return exl3_moe_coop_rows_grouped((int) out_bszn.get_device());
+}
+
 void BC_BlockSparseMLP::run_bszN_rows
 (
     const at::Tensor& y,
@@ -123,7 +128,9 @@ void BC_BlockSparseMLP::run_bszN_rows
 {
     // run_bszN with exact_rows on both launches: the shared expert's one-expert launch and the
     // routed launch each cover all rows with the kernel instances, tile and split-k factor of a
-    // one-row call, slot by slot. No rotation launch, no grouping of rows that picked one expert
+    // one-row call. Where rows_grouped holds they are launched as run_bszN launches them (the
+    // rotation launch, the rows that picked one expert as one run: the shared expert is read once
+    // for the rows); elsewhere slot by slot, with no rotation launch and no grouping
     TORCH_CHECK(y.dim() == 2 && y.is_contiguous(), "run_bszN_rows: y must be a contiguous (rows, H) tensor");
     TORCH_CHECK_DTYPE(y, kHalf);
     const int64_t rows = y.size(0);

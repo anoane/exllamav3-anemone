@@ -11,6 +11,7 @@
 
 #include "../util.h"
 #include "../util.cuh"
+#include "../exact_rows.h"
 #include "exl3_devctx.cuh"
 #include "exl3_moe_coop.cuh"
 #include "comp_units/exl3_moe_coop_instances.cuh"
@@ -145,6 +146,11 @@ bool exl3_moe_coop_rows_ok(const MoeCoopParams& p, int topk, int rows)
     return ksplit * slots <= p.slots_max;
 }
 
+bool exl3_moe_coop_rows_grouped(int device)
+{
+    return exact_rows_device_ok(device);
+}
+
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
                           bool exact_rows)
 {
@@ -152,11 +158,14 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
     const int slots = p.bsz * p.topk;
     const int nproj = p.gated ? 2 : 1;
-    // exact_rows: the three values a one-row call computes from its topk slots are pinned to them
-    // (a_global, the tile, the split-k factor); the grids below still cover every slot of the call
+    // exact_rows: the values a one-row call computes from its topk slots and that select a kernel
+    // instance or a reduction order are pinned to them (the tile, the split-k factor); the grids
+    // below still cover every slot of the call. The rows are grouped and rotated by the rotation
+    // launch, as in an unflagged call, where exl3_moe_coop_rows_grouped holds; else every slot is a
+    // run of its own, rotated in-block as in a one-row call
     TORCH_CHECK(!exact_rows || (p.bsz >= 1 && p.topk >= 1), "exl3_moe_coop: a row-exact call without rows or picks");
     const int geo_slots = exact_rows ? p.topk : slots;
-    p.a_global = !exact_rows && p.bsz > 1;
+    p.a_global = p.bsz > 1 && (!exact_rows || exl3_moe_coop_rows_grouped(device));
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, geo_slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, geo_slots, device);
@@ -186,6 +195,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
     cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
     cuda_check(cudaPeekAtLastError());
+    if (exact_rows && p.a_global) exact_rows_count_served(EXACT_ROWS_CAP_MOE_GROUPED);
 }
 
 MoeCoopParams exl3_moe_coop_prepare

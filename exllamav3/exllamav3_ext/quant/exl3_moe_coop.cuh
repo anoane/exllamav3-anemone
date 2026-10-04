@@ -81,12 +81,25 @@ struct MoeCoopParams
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
 // 1 mcg, 2 mul1 codebook, uniform across the three projections.
-// exact_rows (EXL3_EXACT_ROWS, exact_rows.h): the launch pair covers every row with the geometry of
-// a one-row call: slots ungrouped and rotated in-block (a_global false, no rot launch), the tile and
-// the split-k factor chosen from the topk slots of one row. A block then computes its slot exactly
-// as the block of that slot does in the row's own one-row launch
+// exact_rows (EXL3_EXACT_ROWS, exact_rows.h): the launch covers every row with the kernel instances
+// of a one-row call: the tile and the split-k factor chosen from the topk slots of one row. Where
+// exl3_moe_coop_rows_grouped holds, the slots are launched as an unflagged call launches them: the
+// rotation launch, and the slots that picked one expert as the rows of one tile (a_global true).
+// With the tile fixed, a slot's result does not depend on that: the rotation launch and the
+// in-block rotation run the same rotate_chunk on the same row, a row of a run sits at a fragment
+// row of its own (rows past the run and rows 8 to 15 are zero), every accumulation, fold and
+// cross-warp sum is per (row, column), and the epilogues are per (slot, chunk) and per (token,
+// chunk). Everywhere else the slots stay ungrouped and rotated in-block (a_global false, no rot
+// launch): a block then computes its slot exactly as the block of that slot does in the row's own
+// one-row launch
 void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
                           bool exact_rows = false);
+
+// Whether an exact_rows launch on CUDA device `device` groups the rows (above): the GPU types on
+// which rows sharing a tensor-core tile are compared bit for bit with one-row calls
+// (exact_rows.h, exact_rows_device_ok). Counted per launch in exact_rows_served
+// (EXACT_ROWS_CAP_MOE_GROUPED)
+bool exl3_moe_coop_rows_grouped(int device);
 
 // Whether an exact_rows launch of `rows` token rows of `topk` picks fits the scratch p was prepared
 // with: the rows, their slots, and the split-k partials at the split factor of a one-row call

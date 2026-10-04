@@ -1396,10 +1396,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
         else:
             assert bszn_eligible
             if EXACT_ROWS and bsz > 1 and params.get("exact_rows"):
-                # EXL3_EXACT_ROWS: the launch pair covers the rows with the geometry of a one-row
-                # call (no grouping of rows by expert, the tile of one row's slots). The caller
-                # sends a flagged call of several rows here only when that serves the layer
-                # (DSV41MoE.rows_native); the grouped launch below would not give one-row bits
+                # EXL3_EXACT_ROWS: the launch covers the rows with the kernel instances of a one-row
+                # call (the tile of one row's slots), the rows grouped by expert only on the GPU
+                # types that was verified on (bc.rows_grouped). The caller sends a flagged call of
+                # several rows here only when that serves the layer (DSV41MoE.rows_native); the
+                # launch below sizes its tile from all slots and would not give one-row bits
                 if not (ROWS_NATIVE & EXACT_ROWS_CAP_MOE):
                     raise RuntimeError(
                         f"{self.key}: EXL3_EXACT_ROWS=1: a flagged call of {bsz} rows reached the fused "
