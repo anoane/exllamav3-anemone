@@ -74,11 +74,15 @@ at::Tensor BC_LinearEXL3::run_alloc(const at::Tensor& x, int64_t out_features, b
     return y;
 }
 
-// EXL3_EXACT_ROWS (exact_rows.h): run_alloc for a call of 2 to EXACT_ROWS_MAX rows. Every row is a
-// call of run_gr of its own, on one-row views of x and of the result: its one-row arm, so the row
-// gets the kernel, grid, workspace and launch-autotune record of a one-row call, and its own bias
-// add. Nothing is hoisted out of the loop, and the rows share only what one-row calls reuse (xh, the
-// int8 workspace), in stream order
+// EXL3_EXACT_ROWS (exact_rows.h): run_alloc for a call of 2 to EXACT_ROWS_MAX rows, every row with
+// the bits of a one-row call. Where a one-row call is the cooperative kernel with a launch record in
+// the process (exl3_gemm_gr, one_row_route: not offered to the int8 GEMV, so EXL3_INT8_GEMV=0 or a
+// tensor outside the mul1 codebook), the rows are ONE launch under that record, on a Hadamard
+// scratch of their own, and each row then gets the bias add of its one-row call. Everywhere else
+// every row is a call of run_gr of its own, on one-row views of x and of the result: its one-row
+// arm, so the row gets the kernel, grid, workspace and launch-autotune record of a one-row call, and
+// its own bias add. Nothing is hoisted out of that loop, and its rows share only what one-row calls
+// reuse (xh, the int8 workspace), in stream order
 at::Tensor BC_LinearEXL3::run_alloc_rows(const at::Tensor& x, int64_t out_features, bool output_fp32)
 {
     TORCH_CHECK(x.dim() >= 2, "run_alloc_rows: x must have at least 2 dimensions");
@@ -96,6 +100,12 @@ at::Tensor BC_LinearEXL3::run_alloc_rows(const at::Tensor& x, int64_t out_featur
     TORCH_CHECK(in_features == trellis.size(0) * 16 && out_features == trellis.size(1) * 16,
                 "run_alloc_rows: x or out_features does not match the quantized weight");
     TORCH_CHECK(x.device() == trellis.device(), "run_alloc_rows: x must be on the module's device");
+    // The scales a launch reads through raw pointers: one element per input and per output column
+    TORCH_CHECK(suh.defined() && svh.defined(), "run_alloc_rows: the module has no suh or svh");
+    TORCH_CHECK_DTYPE(suh, kHalf);
+    TORCH_CHECK_DTYPE(svh, kHalf);
+    TORCH_CHECK(suh.numel() == in_features && svh.numel() == out_features && suh.device() == x.device() &&
+                svh.device() == x.device(), "run_alloc_rows: suh or svh does not match the quantized weight");
 
     std::vector<int64_t> out_shape = x.sizes().vec();
     out_shape.back() = out_features;
@@ -107,6 +117,27 @@ at::Tensor BC_LinearEXL3::run_alloc_rows(const at::Tensor& x, int64_t out_featur
 
     at::Tensor x_flat = x.view({rows, in_features});
     at::Tensor y_flat = y.view({rows, out_features});
+
+    // One launch for the rows. exl3_gemm_gr decides (one_row_route); the test here only spares the
+    // scratch where a one-row call is offered to the int8 path and the answer is known to be no
+    if (!exl3_gemm_asks_int8(mul1))
+    {
+        at::Tensor xh_rows = at::empty_like(x_flat);
+        if (exl3_gemm_gr(x_flat, trellis, y_flat, suh, xh_rows, svh, -1, mcg, mul1, 0, nullptr, true) != EXACT_ROWS_NO_LAUNCH)
+        {
+            if (bias)
+            {
+                for (int64_t r = 0; r < rows; ++r)
+                {
+                    at::Tensor yr = y_flat.slice(0, r, r + 1);
+                    add_gr(yr, bias.value(), yr, nullptr);
+                }
+            }
+            exact_rows_count_one_launch();
+            return y;
+        }
+    }
+
     for (int64_t r = 0; r < rows; ++r)
     {
         at::Tensor xr = x_flat.slice(0, r, r + 1);

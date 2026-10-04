@@ -3,6 +3,7 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ATen.h>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "../util.h"
@@ -812,11 +813,15 @@ int exl3_mgemm
     );
 }
 
-// EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows. Row r of the
-// row-major A and C is the contiguous (G, 1, k) and (G, 1, n) block a one-row call passes, so every
-// row is exl3_mgemm_gr with that call's argument list: size_m 1, G inputs and outputs, and with them
-// the launch-autotune record of the one-row call. The rows share A_had, in stream order, as
-// successive one-row calls do
+// EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows, every row with
+// the bits of a one-row call. With the launch record of the one-row call in the process, the rows
+// are ONE launch under it (exl3_mgemm_gr, one_row_route), on matrix-major (G, rows, k) and (G, rows,
+// n) copies with a scratch of their own: the kernel addresses the rows of one matrix contiguously.
+// The grouped call is never offered to the int8 GEMV, so this does not depend on EXL3_INT8_GEMV.
+// Otherwise row r of the row-major A and C is the contiguous (G, 1, k) and (G, 1, n) block a one-row
+// call passes, and every row is exl3_mgemm_gr with that call's argument list: size_m 1, G inputs and
+// outputs, and with them the launch-autotune record of the one-row call, which the first row loads
+// or tunes. Those rows share A_had, in stream order, as successive one-row calls do
 int exl3_mgemm_rows
 (
     const at::Tensor& A,
@@ -860,6 +865,24 @@ int exl3_mgemm_rows
     TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.device() && A.device() == indices.device() &&
                 A.device() == B.device() && A.device() == suh.device() && A.device() == svh.device(),
                 "exl3_mgemm_rows: A, C, A_had, indices and the pointer tables must be on one CUDA device");
+
+    // One launch for the rows, where exl3_mgemm_gr makes it (one_row_route)
+    {
+        at::Tensor a = A.transpose(0, 1).contiguous();
+        at::Tensor a_had = at::empty_like(a);
+        at::Tensor c = at::empty({groups, rows, size_n}, C.options());
+        int one = exl3_mgemm_gr
+        (
+            a, B, c, suh, a_had, svh, indices, c10::nullopt, K_, -1, mcg, mul1, -1, -1, 0, nullptr, 1,
+            c10::nullopt, c10::nullopt, c10::nullopt, c10::nullopt, 0, true
+        );
+        if (one != EXACT_ROWS_NO_LAUNCH)
+        {
+            C.copy_(c.transpose(0, 1));
+            exact_rows_count_one_launch();
+            return one;
+        }
+    }
 
     int tag = 0;
     for (int64_t r = 0; r < rows; ++r)

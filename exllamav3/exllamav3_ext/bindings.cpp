@@ -211,6 +211,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_fp32_reduction", &hgemm_fp32_reduction, "hgemm_fp32_reduction");
     m.def("stable_arithmetic", &stable_arithmetic, "stable_arithmetic");
     m.def("exact_rows_caps", &exact_rows_caps, "exact_rows_caps");
+    m.def("exact_rows_one_launches", &exact_rows_one_launches, "exact_rows_one_launches");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");

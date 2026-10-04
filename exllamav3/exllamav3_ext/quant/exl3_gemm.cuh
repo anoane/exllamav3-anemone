@@ -102,9 +102,10 @@ int exl3_mgemm
     int num_had_src = 0
 );
 
-// EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows, every row the
-// exl3_mgemm call of a one-row step. A (rows, G, k) and C (rows, G, n) are row-major, A_had is the
-// one-row call's (G, 1, k) scratch, indices (1, G). Returns the launch tag the rows share
+// EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows, every row with
+// the bits of the exl3_mgemm call of a one-row step: one launch for the rows under that call's
+// launch record, or that call once per row. A (rows, G, k) and C (rows, G, n) are row-major, A_had
+// is the one-row call's (G, 1, k) scratch, indices (1, G). Returns the launch tag the rows share
 int exl3_mgemm_rows
 (
     const at::Tensor& A,
