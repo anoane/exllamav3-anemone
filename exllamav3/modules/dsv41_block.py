@@ -46,7 +46,7 @@ from typing_extensions import override
 from ..architecture.dsv41 import placement as dsv41_placement
 from ..ext import exllamav3_ext as ext
 from ..model.math_policy import (
-    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_HC, exact_rows_native,
+    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_HC, exact_rows_native, exact_rows_sum,
 )
 from ..util.device_copy import to_device
 from ..util.tensor import g_tensor_cache, to2
@@ -61,7 +61,39 @@ from .transformer import TransformerBlock
 ROWS_NATIVE = exact_rows_native(ext)
 
 
-def _collapse_rows(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
+# EXL3_EXACT_ROWS: {(device, operand shape): whether the torch sum over that operand gave every row
+# the bits of its per-row sum the first time a flagged call made it} (_sum_rows)
+ROWS_SUMMED = {}
+
+
+def _sum_rows(key, batched, rows) -> torch.Tensor:
+    """
+    EXL3_EXACT_ROWS: a torch sum of a flagged call inside the bound of exact_rows_sum, over all
+    rows at once (batched()) where that was seen to give the bits of the per-row form (rows()).
+    The bound is read from torch's reduce layout, which torch has no argument to pin and which
+    this tree does not hold. So the first flagged call with an operand shape on a device computes
+    both forms, compares them bitwise (through an int32 view: signed zeros and NaN payloads count)
+    and returns the per-row result; later calls with that key take the batched sum. A key whose
+    forms differed keeps the per-row form for the life of the process, with one printed line.
+    Either way the caller gets the bits of the per-row form. The comparison synchronizes once
+    per key.
+    """
+    ok = ROWS_SUMMED.get(key)
+    if ok:
+        return batched()
+    ones = rows()
+    if ok is None:
+        many = batched()
+        ok = many.shape == ones.shape and many.dtype == torch.float and ones.dtype == torch.float \
+            and torch.equal(many.view(torch.int32), ones.view(torch.int32))
+        ROWS_SUMMED[key] = ok
+        if not ok:
+            print(f" !! EXL3_EXACT_ROWS: torch's sum over the rows of {key[1]} on {key[0]} does not give "
+                  f"the bits of the per-row sums; that operand keeps one sum per row")
+    return ones
+
+
+def _rows_collapse(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
     """
     EXL3_EXACT_ROWS: the stream collapse (pre.unsqueeze(-1) * streams).sum(dim = 2) of pre
     (b, s, H) and streams (b, s, H, D), one token per call: (b, s, D). Every token runs the whole
@@ -77,6 +109,43 @@ def _collapse_rows(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
         return ext.hc_collapse_rows(pre, streams)
     return torch.cat([(pre[:, j:j + 1].unsqueeze(-1) * streams[:, j:j + 1]).sum(dim = 2)
                       for j in range(streams.shape[1])], dim = 1)
+
+
+def _rows_partials(partials: torch.Tensor) -> torch.Tensor:
+    """
+    EXL3_EXACT_ROWS: the chunk sum partials.sum(dim = 1) of the (R, chunks, M + 1) workspace of
+    hc_mix, one row per call, the operand of a one-row call each: (R, M + 1). By
+    ext.hc_partials_rows, the same loop with the same torch operators, where the extension has it.
+    """
+    R = partials.shape[0]
+    if ROWS_NATIVE & EXACT_ROWS_CAP_HC and 1 < R <= EXACT_ROWS_MAX:
+        return ext.hc_partials_rows(partials)
+    return torch.cat([partials[r:r + 1].sum(dim = 1) for r in range(R)], dim = 0)
+
+
+def _collapse_rows(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
+    """
+    EXL3_EXACT_ROWS: the stream collapse (pre.unsqueeze(-1) * streams).sum(dim = 2) of a flagged
+    call, every token with the bits of its one-token call: (b, s, D).
+
+    The product is pointwise. Its sum has H terms per output: with contiguous FP32 CUDA operands
+    and H inside exact_rows_sum, one thread adds an output's terms in the order a one-token call
+    adds them, whatever the token count, so the expression of an unflagged call serves all tokens
+    (checked against the per-token form on first use, _sum_rows). Any other operand keeps one
+    token per call (_rows_collapse).
+    """
+    if (
+        streams.dim() == 4 and streams.is_cuda and pre.device == streams.device
+        and pre.dtype == torch.float and streams.dtype == torch.float
+        and pre.shape == streams.shape[:-1]
+        and pre.is_contiguous() and streams.is_contiguous()
+        and exact_rows_sum(streams.shape[2], streams.shape[3])
+    ):
+        return _sum_rows(
+            (streams.device, tuple(streams.shape)),
+            lambda: (pre.unsqueeze(-1) * streams).sum(dim = 2),
+            lambda: _rows_collapse(pre, streams))
+    return _rows_collapse(pre, streams)
 
 
 class DSV41HyperConnection(HyperConnection):
@@ -98,8 +167,9 @@ class DSV41HyperConnection(HyperConnection):
 
         In a flagged forward of EXL3_EXACT_ROWS (params["exact_rows"]) every token gets the
         mix of a one-token call: the fused kernel with that call's column partition, the torch
-        sums one token per call. The torch body is refused there: its projection and
-        reductions follow the shape of the call.
+        sums over all tokens where their term counts make them row-exact (exact_rows_sum,
+        _sum_rows), else one token per call. The torch body is refused there: its projection
+        and reductions follow the shape of the call.
         """
         b, s, H, D = streams.shape
         exact = EXACT_ROWS and bool(params.get("exact_rows")) and b * s > 1
@@ -160,9 +230,10 @@ class DSV41HyperConnection(HyperConnection):
         the chunk count of one row, and the kernel takes its column partition from the workspace
         (hc_mix.cu, hc_mix_launch: n_chunks_a = partials.size(1)); a block of it reads one row,
         and a row's partials are reduced, mixed and Sinkhorn-normalized by that row's own block.
-        The chunk sums are added per row here, the operand of a one-row call each (by
-        ext.hc_partials_rows, the same loop with the same torch operators, where the extension
-        has it).
+        The chunk sums are one torch sum over the rows where the chunk count and the partials'
+        width are inside exact_rows_sum (80 chunks of 25 values here: one thread adds an
+        output's chunks in the order of a one-row call, checked on first use by _sum_rows), else
+        one sum per row, the operand of a one-row call each (_rows_partials).
         """
         b, s, H, D = streams.shape
         R = b * s
@@ -190,12 +261,12 @@ class DSV41HyperConnection(HyperConnection):
                    self.sinkhorn_iters, partials, post, comb, unused)
         if STABLE_ARITHMETIC:
             p = partials[:, 0]
-        elif exact and ROWS_NATIVE & EXACT_ROWS_CAP_HC and R <= EXACT_ROWS_MAX:
-            p = ext.hc_partials_rows(partials)
-        elif exact:
-            p = torch.cat([partials[r:r + 1].sum(dim = 1) for r in range(R)], dim = 0)
-        else:
+        elif not exact:
             p = partials.sum(dim = 1)
+        elif exact_rows_sum(chunks, M1):
+            p = _sum_rows((dev, (R, chunks, M1)), lambda: partials.sum(dim = 1), lambda: _rows_partials(partials))
+        else:
+            p = _rows_partials(partials)
         rmr = torch.rsqrt(p[:, M1 - 1:] / (H * D) + self.rms_eps)
         pre = torch.sigmoid(p[:, :H] * rmr * self.scale[0] + self.base[:H]) + self.hc_eps
         return post.view(b, s, H), comb.view(b, s, H, H), pre.view(b, s, H)
