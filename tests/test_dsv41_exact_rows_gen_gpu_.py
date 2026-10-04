@@ -41,7 +41,13 @@ launches per row, as an extension without the single launch does. The tokens and
 show which route ran, so each case also reads the extension's count of such calls
 (exact_rows_one_launches) around its drafted run: with the int8 path off a run with verify
 forwards must have made some (about the EXL3 linears and grouped projections of a forward, per
-forward; printed), with it on none. Run it under both settings, each with one autotune file:
+forward; printed), with it on none. The other batched forms of a verify forward give the same
+bits as their per-row forms too, so each case also checks that they ran in its drafted run: the
+index selection as one pass for the rows (select_topk calls that served with one_row, and those
+that refused it, printed), the hyper-connection sums over the rows (dsv41_block.ROWS_SUMMED: every
+operand shape recorded as row-exact), and, where the extension reports them, the MoE launch pairs
+with the rows grouped by expert and the router projections made with one launch
+(exact_rows_served). Run it under both settings, each with one autotune file:
 
     EXL3_EXACT_ROWS=1 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
     EXL3_EXACT_ROWS=1 EXL3_INT8_GEMV=0 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
@@ -64,6 +70,28 @@ REPEAT = "The quick brown fox jumps over the lazy dog. " * 8
 PROSE = ("The lighthouse at the end of the northern pier had been dark for eleven years when the harbour board "
          "finally agreed to sell it. Nobody in the town expected a buyer, and nobody expected the buyer to be")
 DRAFT_TOKENS = 7
+
+
+class Selections:
+    """The select_topk calls a flagged forward makes with one_row, for the block: [rows sharing one
+    pass, calls that refused the pass (the row loop served)]."""
+
+    def __init__(self):
+        import exllamav3.modules.dsv41 as m_dsv41
+        self.module, self.orig, self.counts = m_dsv41, m_dsv41.select_topk, [0, 0]
+
+    def __enter__(self):
+        def select(*args, **kw):
+            out = self.orig(*args, **kw)
+            if kw.get("one_row"):
+                self.counts[0 if out is not None else 1] += 1
+            return out
+        self.module.select_topk = select
+        return self.counts
+
+    def __exit__(self, *exc):
+        self.module.select_topk = self.orig
+        return False
 
 
 class Forwards:
@@ -205,6 +233,11 @@ def main() -> int:
     int8_off = int(os.environ.get("EXL3_INT8_GEMV", "2")) == 0
     verified_gpu = any(tuple(torch.cuda.get_device_capability(i)) in ((8, 0), (8, 9), (12, 0))
                        for i in range(torch.cuda.device_count()))
+    # The batched forms the extension makes when asked (128: the MoE rows grouped by expert, 256: the
+    # router's projection as one launch) and counts; the hyper-connection sums record themselves
+    import exllamav3.modules.dsv41_block as m_block
+    served_of = (lambda: {bit: int(ext.exact_rows_served(bit)) for bit in (128, 256) if caps & bit}) \
+        if hasattr(ext, "exact_rows_served") else (lambda: {})
     print(f"  --  exact rows, generator: row-exact entry points of the extension: {caps or 'none'}; "
           f"EXL3_INT8_GEMV={os.environ.get('EXL3_INT8_GEMV', 'unset (2)')}; the rows of a linear or of the grouped "
           f"projection as one launch: {'counted' if one_launches else 'not in this extension'}", flush = True)
@@ -216,6 +249,9 @@ def main() -> int:
     model.load(progressbar = False, max_chunk_size = args.chunk)
     tok = Tokenizer.from_config(config)
     assert model.caps.get("exact_rows"), "not a model EXL3_EXACT_ROWS covers"
+    # (compress ratio, index_topk) of every index source: from which position its rows select
+    blocks = model.modules[model.first_block_idx : model.first_block_idx + config.num_hidden_layers]
+    sources = [(b.attn.compress_ratio, b.attn.index_topk) for b in blocks if getattr(b.attn, "is_index_source", False)]
     encode = lambda text: tok.encode(text, add_bos = True)
     repeat, prose = encode(REPEAT), encode(PROSE)
 
@@ -251,11 +287,37 @@ def main() -> int:
             common = dict(ngram_min = args.ngram_min, chunk = args.chunk, **kw)
             plain = run(torch, model, cache, tok, ids, draft = False, **common)
             before = one_launches() if one_launches else 0
-            drafted = run(torch, model, cache, tok, ids, draft = True, **common)
+            forms_before = served_of()
+            with Selections() as passes:
+                drafted = run(torch, model, cache, tok, ids, draft = True, **common)
             served = one_launches() - before if one_launches else 0
+            forms = {bit: count - forms_before[bit] for bit, count in served_of().items()}
             prompt_len = ids.shape[-1]
             bad = check(model, name, prompt_len, plain, drafted, **expect)
             verifies = sum(1 for _, rows, flagged in drafted["forwards"] if rows > 1 and flagged)
+            # Verify forwards in which some index source selects (its first row sees more than
+            # index_topk entries of the source's pool)
+            selecting = sum(1 for p, rows, flagged in drafted["forwards"] if rows > 1 and flagged
+                            and any((p + 1) // ratio > topk for ratio, topk in sources))
+            sums = dict(m_block.ROWS_SUMMED)
+            print(f"       batched forms of the drafted run: {passes[0]} selections as one pass, {passes[1]} by the row "
+                  f"loop, in {selecting} selecting verify forwards; hyper-connection sums over the rows for "
+                  f"{sum(sums.values())} of {len(sums)} operand shapes; grouped MoE launch pairs "
+                  f"{forms.get(128, 'not in this extension')}, one-launch router projections "
+                  f"{forms.get(256, 'not in this extension')}", flush = True)
+            if verifies:
+                if not sums or not all(sums.values()):
+                    bad.append(f"the hyper-connection sums over the rows were not recorded as row-exact for every "
+                               f"operand shape ({sum(sums.values())} of {len(sums)}): the per-row sums served")
+                    print(f"       {bad[-1]}", flush = True)
+                if selecting and not passes[0]:
+                    bad.append(f"{selecting} selecting verify forwards and no selection as one pass")
+                    print(f"       {bad[-1]}", flush = True)
+                for bit, what in ((128, "MoE launch pair with the rows grouped"), (256, "router projection as one launch")):
+                    if bit in forms and verified_gpu and not forms[bit]:
+                        bad.append(f"{verifies} verify forwards and no {what}: the extension reports the form "
+                                   f"(exact_rows_caps() & {bit}) and did not make it")
+                        print(f"       {bad[-1]}", flush = True)
             if one_launches:
                 print(f"       one-launch calls of the drafted run: {served} in {verifies} verify forwards"
                       + (f" ({served / verifies:.1f} per forward)" if verifies else ""), flush = True)
