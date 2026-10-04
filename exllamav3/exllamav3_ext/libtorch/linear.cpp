@@ -89,6 +89,13 @@ at::Tensor BC_LinearEXL3::run_alloc_rows(const at::Tensor& x, int64_t out_featur
     const int64_t rows = x.numel() / in_features;
     TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
                 "run_alloc_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+    // What exl3_gemm_gr checks for every row, before the result is allocated, and the device: the
+    // rows are launched on the device of x with the module's weight and workspace pointers
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DIM(trellis, 3);
+    TORCH_CHECK(in_features == trellis.size(0) * 16 && out_features == trellis.size(1) * 16,
+                "run_alloc_rows: x or out_features does not match the quantized weight");
+    TORCH_CHECK(x.device() == trellis.device(), "run_alloc_rows: x must be on the module's device");
 
     std::vector<int64_t> out_shape = x.sizes().vec();
     out_shape.back() = out_features;
