@@ -946,26 +946,37 @@ class DSV41Attention(DSV4Attention):
                 cand_in = DeviceMemo.get(params, ("dsv41_candidates", b), cands[b], q_idx.device)
 
         if EXACT_ROWS and params.get("exact_rows") and seq > 1:
-            # EXL3_EXACT_ROWS: one selection per row, the call a one-row step at that row's position
-            # makes (its own entry count, hence its tile width, score stride and scoring kernel:
-            # the scorer takes another kernel from 5 rows on). A flagged call never mixes dense and
-            # selecting rows (DeepseekV41Model.exact_rows_span), and a dense row selects nothing
+            # EXL3_EXACT_ROWS: every row gets the selection a one-row step at its position makes
+            # (its own entry count, hence its tile width, score stride and scoring kernel: the
+            # scorer takes another kernel from 5 rows on). A flagged call never mixes dense and
+            # selecting rows (DeepseekV41Model.exact_rows_span), and a dense row selects nothing.
+            # The rows share one pass where their one-row calls share the tile width and need one
+            # tile, with the scorer pinned to the kernel of a one-row call (select_topk, one_row).
+            # Otherwise (the rows straddle a tile width, more than one tile) select_topk returns
+            # None before it launches anything and each row is the one-row call itself
             m = self.compress_ratio
             if (pos0 + 1) // m <= self.index_topk:
                 raise RuntimeError(
                     f"{self.key}: EXL3_EXACT_ROWS=1: a draft verification of {seq} rows at position "
                     f"{pos0} selects although its first row is still dense ({(pos0 + 1) // m} entries, "
                     f"index_topk {self.index_topk}); such a call must not carry params['exact_rows']")
-            rows = [select_topk(
-                q_idx[0][j:j + 1], wts[j:j + 1], idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0 + j,
-                m = m, ec = (pos0 + j + 1) // m, topk = self.index_topk,
-                cand_in = None if cand_in is None else cand_in[j:j + 1],
+            r = select_topk(
+                q_idx[0], wts, idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0, m = m,
+                ec = (pos0 + seq) // m, topk = self.index_topk, cand_in = cand_in,
                 want_cand = self.is_candidate_source, block = self.candidate_block_size,
-                n_blocks = self.candidate_topk_blocks,
-            ) for j in range(seq)]
-            r = SelectResult(
-                torch.cat([row.indices for row in rows], dim = 0), rows[0].k_len,
-                None if rows[0].cand is None else torch.cat([row.cand for row in rows], dim = 0))
+                n_blocks = self.candidate_topk_blocks, one_row = True,
+            )
+            if r is None:
+                rows = [select_topk(
+                    q_idx[0][j:j + 1], wts[j:j + 1], idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0 + j,
+                    m = m, ec = (pos0 + j + 1) // m, topk = self.index_topk,
+                    cand_in = None if cand_in is None else cand_in[j:j + 1],
+                    want_cand = self.is_candidate_source, block = self.candidate_block_size,
+                    n_blocks = self.candidate_topk_blocks,
+                ) for j in range(seq)]
+                r = SelectResult(
+                    torch.cat([row.indices for row in rows], dim = 0), rows[0].k_len,
+                    None if rows[0].cand is None else torch.cat([row.cand for row in rows], dim = 0))
         else:
             r = select_topk(
                 q_idx[0], wts, idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0,
