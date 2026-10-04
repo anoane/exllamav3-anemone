@@ -228,12 +228,15 @@ class DeepseekV41AttentionTests(unittest.TestCase):
             self.assertEqual(slabs.scores_fn.call_count, 4)
             for call in slabs.scores_fn.call_args_list:
                 self.assertIs(call.kwargs["few_query"], not stable)
+        # one_row (EXL3_EXACT_ROWS) pins the few-query kernel instead, at every row count
         code = condition("exllamav3/modules/attention_fn/dsa_triton.py", None, "dsa_indexer_scores",
-                         "few_query")
+                         "R <= 4")
         for rows in range(1, 9):
             for few_query in (True, False):
-                self.assertEqual(bool(eval(code, dict(R = rows, few_query = few_query))),
+                self.assertEqual(bool(eval(code, dict(R = rows, few_query = few_query, one_row = False))),
                                  rows <= 4 and few_query)
+                self.assertEqual(bool(eval(code, dict(R = rows, few_query = few_query, one_row = True))),
+                                 few_query)
 
 
 class DeepseekV41CompressorTests(unittest.TestCase):

@@ -1165,6 +1165,7 @@ def dsa_indexer_scores(
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
     few_query = True,        # False: the query-tiled kernel at every row count
+    one_row = False,         # True: the few-query kernel, the one of a one-row call, at every row count
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk.
@@ -1173,7 +1174,13 @@ def dsa_indexer_scores(
     reduce over the heads in different orders, so the same row can score differently in the
     last bit in a decode and in a prefill call. With few_query = False every row count takes
     the query-tiled kernel, in which a row's scores do not depend on the other rows of the
-    call."""
+    call. With one_row = True (EXL3_EXACT_ROWS) every row count takes the few-query kernel, the
+    kernel of a one-row call: a program of it is one (query row, key tile), reads that row's
+    queries and head weights and writes that row's scores, so a row's scores then do not depend
+    on the other rows of the call either. The two pins exclude each other."""
+    if one_row and not few_query:
+        raise ValueError("dsa_indexer_scores: one_row pins the few-query kernel, few_query = False the "
+                         "query-tiled one")
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
@@ -1203,7 +1210,7 @@ def dsa_indexer_scores(
             and scores.stride(1) == 1 and scores.stride(0) == S_stride, \
             "dsa_indexer_scores: score backing must be a row-contiguous (>= R, >= T rounded to the tile) view"
     with torch.cuda.device(q_idx.device):
-        if R <= 4 and few_query:
+        if few_query and (one_row or R <= 4):
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
             # the query-tiled kernel degenerates to a serial head loop over padding here
             f_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0)
