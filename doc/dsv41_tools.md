@@ -18,6 +18,7 @@ scorer and the capture tool stay torch-free.
 | `tools/dsv41_topology_check.py` | Do the layers that carry compressors, indexers and engrams match the topology config.json declares? | config.json, shard headers |
 | `tools/dsv41_fit.py` | How much GPU memory and host RAM does a layout need, and does it fit? | config.json, shard headers |
 | `tools/dsv41_validate.py` | Does the loaded model reproduce vLLM's prompt logprobs, and do its cached, chunked and token-by-token paths agree with its stateless one? | the model, a vLLM capture |
+| `tools/dsv41_rowprobe.py` | Does a row of a 1+N-row verify forward get the bits a one-row decode step gives it, and which operation differs first? | the model, a token sequence |
 | `tools/dsv41_refcompare.py` | (library) The scorer and gates the harness uses | |
 | `tools/dsv41_capture_ref.py` | Capture vLLM prompt logprobs to compare against | a vLLM server |
 
@@ -652,6 +653,60 @@ Gates). Read the per-ablation lines; at
 at 20000 all six are exercised.
 
 (`--model` defaults to `DSV41_MODEL_DIR` and `--ref` to `DSV41_VLLM_REF`.)
+
+### `tools/dsv41_rowprobe.py`
+
+    python tools/dsv41_rowprobe.py --model <checkpoint-dir> --ref <capture.json> [--case n1500r0] [options]
+
+The generator verifies a draft with one forward of 1+N rows and keeps a draft token only when it
+equals the trunk's own sample, so drafted output equals undrafted output exactly when each row of
+that forward gets the bits a one-row decode step gives it. This tool measures that, operation by
+operation, in the arithmetic of the calling environment. It loads the full model with a Cache;
+run it alone on the host.
+
+After prefilling `--prefix` tokens (default 1200, past the 512-entry threshold of every pool, so
+the top-k selection is active; a short prefix such as 40 probes the dense regime), it runs, for
+each row count K of `--rows` (default 2 to 8) and from the same job state, K one-row forwards
+with the generator's decode params and one K-row forward with its verify params. Wrappers around
+the Python methods and native calls of each block and of the head capture every row's inputs and
+outputs in both arms. The state is restored between the arms by the engine's own rewind, the one
+the generator uses to reject draft tokens.
+
+Per K it prints, in execution order, each captured output with `=` or `DIFF`, the first layer
+and row that differ, the count of differing units and elements, the largest absolute and relative
+difference, and how many units are an origin: the output differs while every input of the
+operation, the state it reads included, is bit-equal. Then the first diverging operation of the
+forward, the call facts that differ between the arms (mHC chunk count, indexer kernel, attention
+split count), and per row the logits' bit equality, both argmaxes and the top-2 gap.
+
+The replay table isolates each operation: inside the K-row forward the operation is run again one
+row at a time on the inputs the K-row call had. `=` there means the operation gives a row the
+same bits at 1 and at K rows, whatever differs upstream. For the EXL3 linears a second replay
+with the int8 GEMV off (`EXL3_INT8_GEMV=0`, set in-process for those calls only) separates the
+int8-versus-FP16 switch from the row buckets of the launch autotuner, and a table lists the
+kernel each linear launches at 1 to 8 rows with its autotune records. `--no-replay` and
+`--no-int8-split` turn these off.
+
+Every run checks itself, bit for bit: two unhooked runs agree (determinism), hooked logits equal
+unhooked ones, the one-row arm repeated after the K-row arm equals its first run on every
+captured tensor (the rewind is exact), and the replay run equals the capture run on every
+captured tensor. Exit status 0 means the probe ran and these checks passed, whatever it found;
+1 a check failed; 2 refused.
+
+The launch autotuner keeps its choices in `coop_autotune_v1.bin` (see `EXLLAMAV3_TUNE_CACHE`).
+By default the tool works on a private copy next to its report (`--tune-cache copy`), so it
+reads the records serving uses and never writes that file; `live` uses the file itself.
+
+`--stable-check` only prints the switches of `exllamav3/model/math_policy.py` as the environment
+sets them, without importing torch. Under `EXL3_STABLE_ARITHMETIC=1` the tool refuses to run
+unless `--allow-stable` is given: every operation should then come out equal, which validates
+the probe.
+
+```sh
+python tools/dsv41_rowprobe.py --stable-check
+python tools/dsv41_rowprobe.py --model /mnt/models/DeepSeek-V4.1-Flash-exl3 --ref capture.json \
+    --case n1500r0 --placement "0-11=cuda:0; 12-39=cuda:1" --out rowprobe.json
+```
 
 ### `tools/dsv41_refcompare.py`
 
