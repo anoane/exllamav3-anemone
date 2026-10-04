@@ -82,7 +82,7 @@ at::Tensor BC_LinearEXL3::run_alloc(const at::Tensor& x, int64_t out_features, b
 at::Tensor BC_LinearEXL3::run_alloc_rows(const at::Tensor& x, int64_t out_features, bool output_fp32)
 {
     TORCH_CHECK(x.dim() >= 2, "run_alloc_rows: x must have at least 2 dimensions");
-    TORCH_CHECK(x.is_contiguous(), "run_alloc_rows: x must be contiguous");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "run_alloc_rows: x must be a contiguous CUDA tensor");
     TORCH_CHECK(out_features > 0, "run_alloc_rows: out_features must be positive");
     const int64_t in_features = x.size(-1);
     TORCH_CHECK(in_features > 0, "run_alloc_rows: x has no columns");

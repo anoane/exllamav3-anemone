@@ -700,8 +700,8 @@ static void routing_ds3_nogroup_impl
         TORCH_CHECK_DTYPE(scores, kHalf);
         TORCH_CHECK_SHAPES(hidden, -1, gate, 0, 1);
         TORCH_CHECK_SHAPES(gate, 1, scores, -1, 1);
-        TORCH_CHECK(hidden.device() == scores.device() && gate.device() == scores.device(),
-                    "routing_ds3_nogroup_rows: hidden, gate and scores must be on one device");
+        TORCH_CHECK(scores.is_cuda() && hidden.device() == scores.device() && gate.device() == scores.device(),
+                    "routing_ds3_nogroup_rows: hidden, gate and scores must be on one CUDA device");
         if (gate_t.has_value())
         {
             const at::Tensor& gt = gate_t.value();

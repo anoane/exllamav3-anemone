@@ -135,8 +135,8 @@ void BC_BlockSparseMLP::run_bszN_rows
                 selected_experts.is_contiguous() && routing_weights.is_contiguous() &&
                 selected_experts.size(0) == rows && selected_experts.size(1) >= 1,
                 "run_bszN_rows: selected_experts and routing_weights must be contiguous (rows, topk)");
-    TORCH_CHECK(y.device() == selected_experts.device() && y.device() == routing_weights.device(),
-                "run_bszN_rows: y, selected_experts and routing_weights must be on one device");
+    TORCH_CHECK(y.is_cuda() && y.device() == selected_experts.device() && y.device() == routing_weights.device(),
+                "run_bszN_rows: y, selected_experts and routing_weights must be on one CUDA device");
     TORCH_CHECK(sh_coop || !shared_experts, "run_bszN_rows: the shared expert is not a fused launch (rows_exact_ok)");
     const int num_tokens = (int) rows;
 

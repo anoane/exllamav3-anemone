@@ -768,8 +768,8 @@ int exl3_mgemm_rows
     TORCH_CHECK(groups > 0 && size_k > 0 && size_n > 0, "exl3_mgemm_rows: A or C is empty");
     TORCH_CHECK(indices.size(1) == groups, "exl3_mgemm_rows: indices must hold one entry per group");
     TORCH_CHECK(A_had.numel() >= groups * size_k, "exl3_mgemm_rows: A_had must hold G * k elements");
-    TORCH_CHECK(A.device() == C.device() && A.device() == A_had.device(),
-                "exl3_mgemm_rows: A, C and A_had must be on one device");
+    TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.device(),
+                "exl3_mgemm_rows: A, C and A_had must be on one CUDA device");
 
     int tag = 0;
     for (int64_t r = 0; r < rows; ++r)
