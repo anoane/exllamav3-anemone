@@ -1037,6 +1037,7 @@ at::Tensor hc_collapse_rows
     TORCH_CHECK(pre.size(0) == streams.size(0) && pre.size(1) == streams.size(1) && pre.size(2) == streams.size(2),
                 "hc_collapse_rows: pre must have the shape of streams without its last dimension");
     TORCH_CHECK(streams.size(0) == 1, "hc_collapse_rows: a row-exact call is one sequence");
+    TORCH_CHECK(streams.size(2) >= 1 && streams.size(3) >= 1, "hc_collapse_rows: streams is empty");
     const int64_t rows = streams.size(1);
     TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
                 "hc_collapse_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
@@ -1061,6 +1062,7 @@ at::Tensor hc_partials_rows
     const int64_t rows = partials.size(0);
     TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
                 "hc_partials_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+    TORCH_CHECK(partials.size(1) >= 1 && partials.size(2) >= 1, "hc_partials_rows: partials has no chunks or no columns");
 
     std::vector<at::Tensor> parts;
     parts.reserve((size_t) rows);
