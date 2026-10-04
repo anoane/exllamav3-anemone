@@ -1,10 +1,13 @@
 #include <cuda_fp16.h>
 #include "hc_mix.cuh"
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <vector>
 #include "util.h"
 #include "util.cuh"
 #include "graph.cuh"
+#include "exact_rows.h"
 
 /*
 
@@ -1009,6 +1012,61 @@ void hc_apply
     }
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
+}
+
+// EXL3_EXACT_ROWS (exact_rows.h). torch chooses the layout of a reduction from its operand, so a row
+// has the bits of a one-row call only if its sum reduces the operand that call reduces. Both
+// functions run the Python expression of one row per row, with the same operators on operands of the
+// same sizes and strides (slice, unsqueeze, mul, sum over one dim, cat): only the interpreter between
+// the rows is gone
+
+static const int64_t hc_rows_dim1[] = { 1 };
+static const int64_t hc_rows_dim2[] = { 2 };
+
+at::Tensor hc_collapse_rows
+(
+    const at::Tensor& pre,               // (1, s, H) float
+    const at::Tensor& streams            // (1, s, H, D) float
+)
+{
+    TORCH_CHECK_DIM(pre, 3);
+    TORCH_CHECK_DIM(streams, 4);
+    TORCH_CHECK_DTYPE(pre, kFloat);
+    TORCH_CHECK_DTYPE(streams, kFloat);
+    TORCH_CHECK(pre.device() == streams.device(), "hc_collapse_rows: pre and streams must be on one device");
+    TORCH_CHECK(pre.size(0) == streams.size(0) && pre.size(1) == streams.size(1) && pre.size(2) == streams.size(2),
+                "hc_collapse_rows: pre must have the shape of streams without its last dimension");
+    TORCH_CHECK(streams.size(0) == 1, "hc_collapse_rows: a row-exact call is one sequence");
+    const int64_t rows = streams.size(1);
+    TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
+                "hc_collapse_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+
+    std::vector<at::Tensor> parts;
+    parts.reserve((size_t) rows);
+    for (int64_t j = 0; j < rows; ++j)
+    {
+        at::Tensor product = at::mul(pre.slice(1, j, j + 1).unsqueeze(-1), streams.slice(1, j, j + 1));
+        parts.push_back(at::sum(product, at::IntArrayRef(hc_rows_dim2, 1), false));
+    }
+    return at::cat(parts, 1);
+}
+
+at::Tensor hc_partials_rows
+(
+    const at::Tensor& partials           // (R, chunks, M + 1) float
+)
+{
+    TORCH_CHECK_DIM(partials, 3);
+    TORCH_CHECK_DTYPE(partials, kFloat);
+    const int64_t rows = partials.size(0);
+    TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
+                "hc_partials_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+
+    std::vector<at::Tensor> parts;
+    parts.reserve((size_t) rows);
+    for (int64_t r = 0; r < rows; ++r)
+        parts.push_back(at::sum(partials.slice(0, r, r + 1), at::IntArrayRef(hc_rows_dim1, 1), false));
+    return at::cat(parts, 0);
 }
 
 void gr_mix

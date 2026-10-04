@@ -45,7 +45,9 @@ from typing_extensions import override
 
 from ..architecture.dsv41 import placement as dsv41_placement
 from ..ext import exllamav3_ext as ext
-from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS
+from ..model.math_policy import (
+    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_HC, exact_rows_native,
+)
 from ..util.device_copy import to_device
 from ..util.tensor import g_tensor_cache, to2
 from . import Module
@@ -54,13 +56,25 @@ from .hyperconnections import HyperConnection
 from .transformer import TransformerBlock
 
 
+# EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
+# extension built before them: the Python row loops)
+ROWS_NATIVE = exact_rows_native(ext)
+
+
 def _collapse_rows(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
     """
     EXL3_EXACT_ROWS: the stream collapse (pre.unsqueeze(-1) * streams).sum(dim = 2) of pre
     (b, s, H) and streams (b, s, H, D), one token per call: (b, s, D). Every token runs the whole
     expression on its own (b, 1, ..) slices, so its sum reduces the freshly allocated (b, 1, H, D)
     product a one-token step reduces: torch chooses the layout of a reduction from its operand.
+    Where the extension has the entry point, it runs this loop with the same torch operators
+    (ext.hc_collapse_rows: one sequence of 2 to EXACT_ROWS_MAX tokens, FP32).
     """
+    if (
+        ROWS_NATIVE & EXACT_ROWS_CAP_HC and streams.shape[0] == 1 and 1 < streams.shape[1] <= EXACT_ROWS_MAX
+        and pre.dtype == torch.float and streams.dtype == torch.float
+    ):
+        return ext.hc_collapse_rows(pre, streams)
     return torch.cat([(pre[:, j:j + 1].unsqueeze(-1) * streams[:, j:j + 1]).sum(dim = 2)
                       for j in range(streams.shape[1])], dim = 1)
 
@@ -146,7 +160,9 @@ class DSV41HyperConnection(HyperConnection):
         the chunk count of one row, and the kernel takes its column partition from the workspace
         (hc_mix.cu, hc_mix_launch: n_chunks_a = partials.size(1)); a block of it reads one row,
         and a row's partials are reduced, mixed and Sinkhorn-normalized by that row's own block.
-        The chunk sums are added per row here, the operand of a one-row call each.
+        The chunk sums are added per row here, the operand of a one-row call each (by
+        ext.hc_partials_rows, the same loop with the same torch operators, where the extension
+        has it).
         """
         b, s, H, D = streams.shape
         R = b * s
@@ -174,6 +190,8 @@ class DSV41HyperConnection(HyperConnection):
                    self.sinkhorn_iters, partials, post, comb, unused)
         if STABLE_ARITHMETIC:
             p = partials[:, 0]
+        elif exact and ROWS_NATIVE & EXACT_ROWS_CAP_HC and R <= EXACT_ROWS_MAX:
+            p = ext.hc_partials_rows(partials)
         elif exact:
             p = torch.cat([partials[r:r + 1].sum(dim = 1) for r in range(R)], dim = 0)
         else:

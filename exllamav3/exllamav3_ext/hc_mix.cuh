@@ -43,6 +43,17 @@ void hc_apply
     const c10::optional<at::Tensor>& comb
 );
 
+// EXL3_EXACT_ROWS (exact_rows.h): the reductions DeepSeek-V4.1's delayed mix makes in torch, for 2 to
+// EXACT_ROWS_MAX rows of one sequence, every row with the operators and operand shapes of a one-row
+// call (modules/dsv41_block.py)
+
+// (pre.unsqueeze(-1) * streams).sum(dim = 2) per token: pre (1, s, H), streams (1, s, H, D), both
+// float -> (1, s, D)
+at::Tensor hc_collapse_rows(const at::Tensor& pre, const at::Tensor& streams);
+
+// partials.sum(dim = 1) per row: partials (R, chunks, M + 1) float -> (R, M + 1)
+at::Tensor hc_partials_rows(const at::Tensor& partials);
+
 void gr_mix
 (
     const at::Tensor& streams,
