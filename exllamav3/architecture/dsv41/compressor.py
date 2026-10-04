@@ -53,7 +53,7 @@ _MIN_EPS = 2.0 ** -126
 _MAX_EPS = float.fromhex("0x1.fffffep+127")
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
+def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float, per_row: bool = False) -> torch.Tensor:
     """
     RMSNorm in fp32 with a scaled sum of squares.
 
@@ -69,9 +69,16 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     modules/dsv41_compress.py instead, the same formula with one fixed reduction per row, so
     the cached and the stateless compression paths normalise a latent identically whatever
     the row count of the call. The CPU path is the same in both cases.
+
+    per_row (EXL3_EXACT_ROWS): every row of a (rows, d) input gets the bits of its one-row
+    call. The mean is then one reduction per row, on the freshly allocated (1, d) square a
+    one-row call reduces. Everything else serves all rows at once: the maximum of absolute
+    values has one bit pattern under any reduction order, and the rest is elementwise.
     """
     if not math.isfinite(eps) or not _MIN_EPS <= eps <= _MAX_EPS:
         raise ValueError("compressor RMSNorm requires epsilon in the positive normal FP32 range")
+    if per_row and x.dim() != 2:
+        raise ValueError(f"compressor RMSNorm: per_row takes (rows, d) latents, got {tuple(x.shape)}")
     x = x.float()
     if STABLE_ARITHMETIC and x.is_cuda:
         # imported here so this module, which the CPU reference tests load, never needs Triton
@@ -80,7 +87,12 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     scale = x.abs().amax(dim = -1, keepdim = True).clamp_min(math.sqrt(eps))
     scaled = x / scale
     eps_scaled = math.sqrt(eps) / scale
-    y = scaled * torch.rsqrt(scaled.square().mean(dim = -1, keepdim = True) + eps_scaled.square())
+    if per_row and x.shape[0] > 1:
+        mean = torch.cat([scaled[i:i + 1].square().mean(dim = -1, keepdim = True) for i in range(x.shape[0])],
+                         dim = 0)
+    else:
+        mean = scaled.square().mean(dim = -1, keepdim = True)
+    y = scaled * torch.rsqrt(mean + eps_scaled.square())
     return y if weight is None else y * weight.float()
 
 

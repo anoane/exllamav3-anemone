@@ -90,8 +90,10 @@ class CompressCarry:
     than assuming bitwise equality for all schedules or input ranges, except under
     EXL3_STABLE_ARITHMETIC=1, where rms_norm reduces each row alone and chunked latents
     are bitwise equal (tests/test_dsv41_stable_norm_gpu_.py). With per_row (EXL3_EXACT_ROWS)
-    every closed entry is pooled and normalized by a call of its own, the call a one-row step
-    that closes it makes.
+    every closed entry gets the bits of the one-row step that closes it: the pooling is
+    elementwise but for reductions over the two rows of a group, which have one result in any
+    order, so it serves all entries at once; of the norm only the mean follows the row count,
+    and it is reduced one entry per call (rms_norm, per_row).
     """
 
     @staticmethod
@@ -101,8 +103,8 @@ class CompressCarry:
         carry   (R, 2 * hd) fp32 ring of this slot, or None at rate 1
         kv      (seq, hd) raw compressor kv rows of this chunk
         score   (seq, hd) raw gate rows (None at rate 1)
-        per_row pool and normalize one closed entry per call (the carry ring is read and
-                written as without it)
+        per_row every closed entry with the bits of a one-row step: the mean of the norm one
+                entry per call (the carry ring is read and written as without it)
         returns (latents (n, hd) fp32 pre-RoPE, first_entry)
                 n = (pos0 + seq) // m - pos0 // m, first_entry = pos0 // m
         """
@@ -111,9 +113,7 @@ class CompressCarry:
         first = pos0 // m
         if m == 1:
             # a softmax over one row is 1: every token closes its own group, no state
-            if per_row and seq > 1:
-                return torch.cat([rms_norm(kv[i:i + 1], norm_weight, eps) for i in range(seq)], dim = 0), first
-            return rms_norm(kv, norm_weight, eps), first
+            return rms_norm(kv, norm_weight, eps, per_row), first
         assert carry is not None and score is not None and score.shape == kv.shape
         R = carry.shape[0]
         assert carry.shape[1] == 2 * hd and R >= m, f"carry ring {tuple(carry.shape)} for hd {hd}"
@@ -132,14 +132,10 @@ class CompressCarry:
         closed = kvf.shape[0] // m * m
         if closed == 0:
             return kvf.new_zeros((0, hd)), first
-        if per_row and closed > m:
-            # a one-row step that closes a group pools its (1, m, hd) rows, the pending ones from
-            # the carry ring: the same FP32 values as the rows of this call
-            return torch.cat([
-                rms_norm(group_pool(kvf[g:g + m].view(1, m, hd), scf[g:g + m].view(1, m, hd)), norm_weight, eps)
-                for g in range(0, closed, m)], dim = 0), first
+        # per_row: a one-row step that closes a group pools its (1, m, hd) rows, the pending ones
+        # from the carry ring: the same FP32 values as the rows of this call
         lat = group_pool(kvf[:closed].view(-1, m, hd), scf[:closed].view(-1, m, hd))
-        return rms_norm(lat, norm_weight, eps), first
+        return rms_norm(lat, norm_weight, eps, per_row), first
 
 
 # ---------------------------------------------------------------------------------------------
