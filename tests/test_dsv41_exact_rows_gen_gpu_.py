@@ -13,8 +13,9 @@ Cases:
   plan      a prompt of under 120 tokens generating past position 1100: the generation crosses the
             positions where a one-token step changes its attention plan (128, 257, 512, 1025 on
             DeepSeek-V4.1-Flash), at which a draft window is cut
-  requeue   a small max_rq_tokens: the job requeues, at the same token in both runs, and the
-            requeued job prefills the same forwards (none, when the requeue is on a checkpoint)
+  requeue   a small max_rq_tokens and a recurrent checkpoint on every page: the job requeues, at
+            the same token in both runs, and the requeued job prefills the same forwards (none,
+            when the requeue is on a checkpoint); no verify forward reaches a checkpoint position
   budget    max_new_tokens unset: both runs generate until the Cache is full, the same number of
             tokens, across recurrent checkpoints
   sampled   a seeded sampler with temperature
@@ -23,7 +24,14 @@ Cases:
 In the drafted run every trunk forward is recorded: a verify forward has at most 8 rows and
 carries params["exact_rows"] (no row of it changes the attention plan), and accepted + rejected
 draft tokens add up to the drafted ones. Over all cases some draft tokens must be accepted and
-some rejected. Tokens per second of both runs are printed (drafting pays only at high acceptance).
+some rejected.
+
+Tokens per second of both runs are printed, over the generation only (the job's time_generate:
+first forward to last token, without the prompt). Before the cases, one undrafted and one drafted
+generation run without being compared or timed (the plan case's, which passes the positions where
+the selection starts): compilation and the first use of a launch bucket, which the launch
+autotuner may time with another configuration, then fall in neither run of a case. --no-warmup
+skips them.
 
     EXL3_EXACT_ROWS=1 python tests/test_dsv41_exact_rows_gen_gpu_.py [checkpoint-dir] [options]
 
@@ -36,7 +44,6 @@ import argparse
 import hashlib
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,11 +88,10 @@ def run(torch, model, cache, tok, ids, *, draft, ngram_min, chunk, max_new_token
     j = Job(input_ids = ids, max_new_tokens = max_new_tokens, return_logits = logits,
             sampler = DefaultSampler() if sampled else ArgmaxSampler(), seed = 20261004 if sampled else None,
             **(job or {}))
-    out = {"tokens": [], "requeue_at": [], "reason": None}
+    out = {"tokens": [], "requeue_at": [], "reason": None, "seconds": None}
     digest = hashlib.sha256()
     with Forwards(model) as fw:
         gen.enqueue(j)
-        t0 = time.time()
         while gen.num_remaining_jobs():
             for r in gen.iterate():
                 if r.get("stage") == "error":
@@ -99,17 +105,19 @@ def run(torch, model, cache, tok, ids, *, draft, ngram_min, chunk, max_new_token
                     out["requeue_at"].append(len(out["tokens"]))
                 if r.get("eos"):
                     out["reason"] = r.get("eos_reason")
-        for device in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(device)
-        out["seconds"] = time.time() - t0
+                    # generation only, summed over the requeues of the job
+                    out["seconds"] = r.get("time_generate")
     out.update(logits = digest.hexdigest() if logits else None, forwards = fw.gen, prefills = fw.pre,
                accepted = j.accepted_draft_tokens, rejected = j.rejected_draft_tokens,
                drafted = sum(rows - 1 for _, rows, _ in fw.gen))
     return out
 
 
-def check(model, name, prompt_len, plain, drafted, expect_draft = True, expect_requeue = False) -> list:
-    """The failures of one case (empty when it passed)."""
+def check(model, name, prompt_len, plain, drafted, expect_draft = True, expect_requeue = False,
+          page_checkpoints = False) -> list:
+    """The failures of one case (empty when it passed). page_checkpoints: the run stashes a recurrent
+    checkpoint at the end of every page."""
+    from exllamav3.constants import PAGE_SIZE
     from exllamav3.model.math_policy import EXACT_ROWS_MAX
     bad = []
     if plain["tokens"] != drafted["tokens"]:
@@ -129,6 +137,10 @@ def check(model, name, prompt_len, plain, drafted, expect_draft = True, expect_r
                        f"{'carried' if flagged else 'did not carry'} params['exact_rows'] "
                        f"(the attention plan holds for {model.exact_rows_span(position, rows)} rows)")
             break
+    if page_checkpoints:
+        crossing = [(p, rows) for p, rows, _ in drafted["forwards"] if (p + rows - 1) // PAGE_SIZE != p // PAGE_SIZE]
+        if crossing:
+            bad.append(f"verify forwards reach a checkpoint position (position, rows): {crossing[:4]}")
     if drafted["accepted"] + drafted["rejected"] != drafted["drafted"]:
         bad.append(f"{drafted['accepted']} accepted + {drafted['rejected']} rejected draft tokens, "
                    f"{drafted['drafted']} drafted")
@@ -137,7 +149,7 @@ def check(model, name, prompt_len, plain, drafted, expect_draft = True, expect_r
     if expect_requeue and not plain["requeue_at"]:
         bad.append("the undrafted run did not requeue: the case does not test what it is for")
     n = len(plain["tokens"])
-    rate = lambda r: len(r["tokens"]) / max(r["seconds"], 1e-9)
+    rate = lambda r: len(r["tokens"]) / max(r["seconds"] or 0.0, 1e-9)
     windows = sorted({rows for _, rows, _ in drafted["forwards"] if rows > 1})
     print(f"  {'FAIL' if bad else 'OK  '} {name}: prompt {prompt_len}, {n} tokens, eos {plain['reason']}, requeues at "
           f"{plain['requeue_at']}; drafted {drafted['drafted']} (accepted {drafted['accepted']}, rejected "
@@ -155,6 +167,7 @@ def main() -> int:
     ap.add_argument("--chunk", type = int, default = 2048, help = "max_chunk_size of the load and of every Generator")
     ap.add_argument("--ngram-min", type = int, default = 2, help = "ngram_match_min of the drafted runs")
     ap.add_argument("--cases", default = None, help = "comma-separated subset of the cases")
+    ap.add_argument("--no-warmup", action = "store_true", help = "skip the two generations that run before the cases")
     args = ap.parse_args()
     if not args.model:
         print("  --  exact rows, generator: no checkpoint (pass a directory or set DSV41_MODEL_DIR), skipped")
@@ -184,7 +197,8 @@ def main() -> int:
         ("prose", prose, dict(max_new_tokens = 160, logits = True), {}),
         ("plan", repeat, dict(max_new_tokens = 1150), {}),
         ("requeue", repeat, dict(max_new_tokens = 700, generator = dict(recurrent_checkpoint_interval = 256),
-                                 job = dict(max_rq_tokens = 300)), dict(expect_requeue = True)),
+                                 job = dict(max_rq_tokens = 300)),
+         dict(expect_requeue = True, page_checkpoints = True)),
         ("budget", repeat, dict(max_new_tokens = None), {}),
         ("sampled", prose, dict(max_new_tokens = 160, sampled = True, logits = True), {}),
         ("banned", repeat, dict(max_new_tokens = 96, job = dict(banned_strings = ["qzxqzx"])), dict(expect_draft = False)),
@@ -197,6 +211,13 @@ def main() -> int:
 
     failures, accepted, rejected = [], 0, 0
     try:
+        if not args.no_warmup:
+            # results discarded: compilation and the first use of every launch bucket happen here
+            warm = dict(next(kw for name, _, kw, _ in cases if name == "plan"), ngram_min = args.ngram_min,
+                        chunk = args.chunk)
+            for draft in (False, True):
+                run(torch, model, cache, tok, repeat, draft = draft, **warm)
+            print("  --  warm-up: one undrafted and one drafted generation, not compared", flush = True)
         for name, ids, kw, expect in cases:
             if wanted is not None and name not in wanted:
                 continue
