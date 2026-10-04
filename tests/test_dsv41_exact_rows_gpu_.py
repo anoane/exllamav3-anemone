@@ -677,6 +677,8 @@ class ExactRows(unittest.TestCase):
             self.refused("run_alloc_rows: 1 dimension", lambda: run(half(n)))
             self.refused("run_alloc_rows: non-contiguous", lambda: run(half(1, 4, 2 * n)[..., ::2]))
             self.refused("run_alloc_rows: CPU", lambda: run(half(1, 4, n).cpu()))
+            self.refused("run_alloc_rows: FP32", lambda: run(half(1, 4, n).float()))
+            self.refused("run_alloc_rows: width", lambda: run(half(1, 4, n + 8)))
         if self.caps & CAP_MGEMM:
             at = b.attn
             if not at.woa_multi_ready and at.device is not None:
@@ -692,6 +694,13 @@ class ExactRows(unittest.TestCase):
             self.refused("exl3_mgemm_rows: A and C groups", lambda: run(half(3, G, k), half(3, G + 1, n)))
             self.refused("exl3_mgemm_rows: non-contiguous", lambda: run(half(3, G, 2 * k)[..., ::2], half(3, G, n)))
             self.refused("exl3_mgemm_rows: 2 dimensions", lambda: run(half(3, G * k), half(3, G, n)))
+            tables = lambda B, indices: ext.exl3_mgemm_rows(half(3, G, k), B, half(3, G, n), mu.ptrs_suh, ah, mu.ptrs_svh,
+                                                            indices, mu.K, mu.mcg, mu.mul1)
+            self.refused("exl3_mgemm_rows: int32 indices", lambda: tables(mu.ptrs_trellis, at.woa_indices.int()))
+            self.refused("exl3_mgemm_rows: no indices", lambda: tables(mu.ptrs_trellis, at.woa_indices[:0]))
+            self.refused("exl3_mgemm_rows: CPU indices", lambda: tables(mu.ptrs_trellis, at.woa_indices.cpu()))
+            self.refused("exl3_mgemm_rows: CPU pointer table", lambda: tables(mu.ptrs_trellis.cpu(), at.woa_indices))
+            self.refused("exl3_mgemm_rows: short pointer table", lambda: tables(mu.ptrs_trellis[:G - 1], at.woa_indices))
         mlp = b.mlp
         cfg = mlp.routing_cfg
         E, topk, hidden = cfg.num_experts, cfg.num_experts_per_tok, mlp.hidden_size
@@ -706,6 +715,12 @@ class ExactRows(unittest.TestCase):
             self.refused("routing_ds3_nogroup_rows: 9 rows", lambda: run(half(9, hidden), 9))
             self.refused("routing_ds3_nogroup_rows: hidden and scores rows", lambda: run(half(3, hidden), 4))
             self.refused("routing_ds3_nogroup_rows: non-contiguous", lambda: run(half(3, 2 * hidden)[..., ::2], 3))
+            topk_out = lambda sel_t, w_t: ext.routing_ds3_nogroup_rows(
+                half(3, hidden), cfg.gate_tensor, half(3, E), _esb_h(cfg), sel_t, w_t, cfg.routed_scaling_factor,
+                cfg.gate_tensor_t, ROUTING_ACT_SQRTSP, cfg.gate_i8, cfg.gate_sb)
+            self.refused("routing_ds3_nogroup_rows: int32 topk_indices", lambda: topk_out(sel(3).int(), half(3, topk)))
+            self.refused("routing_ds3_nogroup_rows: CPU topk_weights", lambda: topk_out(sel(3), half(3, topk).cpu()))
+            self.refused("routing_ds3_nogroup_rows: topk shapes", lambda: topk_out(sel(3), half(3, topk + 1)))
         if self.caps & CAP_MOE and mlp.bc is not None:
             run = lambda y, rows: mlp.bc.run_bszN_rows(y, sel(rows), half(rows, topk))
             self.refused("run_bszN_rows: 1 row", lambda: run(half(1, hidden), 1))
@@ -713,6 +728,9 @@ class ExactRows(unittest.TestCase):
             self.refused("run_bszN_rows: y and selection rows", lambda: run(half(3, hidden), 4))
             self.refused("run_bszN_rows: non-contiguous", lambda: run(half(3, 2 * hidden)[..., ::2], 3))
             self.refused("run_bszN_rows: weights shape", lambda: mlp.bc.run_bszN_rows(half(3, hidden), sel(3), half(3, topk + 1)))
+            # more picks than any scratch holds (256 slots): refused ahead of the shared expert's launch pair
+            wide = torch.zeros((3, 128), dtype = torch.long, device = device)
+            self.refused("run_bszN_rows: picks exceed the scratch", lambda: mlp.bc.run_bszN_rows(half(3, hidden), wide, half(3, 128)))
         if self.caps & CAP_HC:
             f32 = lambda *shape: self.randn(shape, device, torch.float)
             self.refused("hc_collapse_rows: 1 row", lambda: ext.hc_collapse_rows(f32(1, 1, 4), f32(1, 1, 4, 64)))
@@ -723,6 +741,8 @@ class ExactRows(unittest.TestCase):
             self.refused("hc_partials_rows: 1 row", lambda: ext.hc_partials_rows(f32(1, 5, 25)))
             self.refused("hc_partials_rows: 9 rows", lambda: ext.hc_partials_rows(f32(9, 5, 25)))
             self.refused("hc_partials_rows: 2 dimensions", lambda: ext.hc_partials_rows(f32(3, 25)))
+            self.refused("hc_partials_rows: no chunks", lambda: ext.hc_partials_rows(f32(3, 0, 25)))
+            self.refused("hc_collapse_rows: empty", lambda: ext.hc_collapse_rows(f32(1, 3, 4), f32(1, 3, 4, 0)))
 
     @torch.inference_mode()
     def test_router_refuses_flagged_rows_without_the_entry_point(self):
