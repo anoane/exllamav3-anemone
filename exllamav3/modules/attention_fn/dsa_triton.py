@@ -1176,8 +1176,22 @@ def dsa_indexer_scores(
     the query-tiled kernel, in which a row's scores do not depend on the other rows of the
     call. With one_row = True (EXL3_EXACT_ROWS) every row count takes the few-query kernel, the
     kernel of a one-row call: a program of it is one (query row, key tile), reads that row's
-    queries and head weights and writes that row's scores, so a row's scores then do not depend
-    on the other rows of the call either. The two pins exclude each other."""
+    queries and head weights and writes that row's scores, so no other row's queries or weights
+    reach a row's scores. The two pins exclude each other.
+
+    one_row does not by itself make a row's scores those of its one-row call: a program also
+    reads the call's T and bound_max, and a caller that shares a call between rows passes the
+    entry count of the last row. The causal bound stays the row's own
+    (min((q_pos0 + r + 1) // compress_rate, bound_max), with bound_max no smaller than it). The
+    key mask does not: the key columns from the row's own entry count up to T are loaded as the
+    real keys where the row's one-row call (T = its own count) loads zeros, in the key tile
+    that also holds the row's last entries. The scores below the row's own count are then the
+    one-row call's only if an element of tl.dot's result is computed from its own row of the
+    queries and its own column of the keys, whatever the other key columns of the tile hold: a
+    property of the tensor-core instruction, which no source shows. The caller shares a call
+    only on the GPU types on which those scores are compared bit for bit with the one-row
+    calls (dsv41_select._rows_share_pass, ROWS_PASS_SM; tests/test_dsv41_exact_rows_gpu_.py,
+    select_rows and test_select_rows_equal_one_row_calls)."""
     if one_row and not few_query:
         raise ValueError("dsa_indexer_scores: one_row pins the few-query kernel, few_query = False the "
                          "query-tiled one")

@@ -79,6 +79,15 @@ _NEG_INF = float("-inf")
 # row * stride in int32
 INT32_LIMIT = 2 ** 31
 
+# EXL3_EXACT_ROWS: the GPU types (compute capability) on which the rows of a call share one scorer
+# call (_rows_share_pass): those on which the scores of such a call are compared bit for bit with
+# the one-row calls (tests/test_dsv41_exact_rows_gpu_.py, select_rows). The same list as
+# exact_rows_device_ok (exllamav3_ext/exact_rows.cpp), which gates the native forms that rest on a
+# property of a tensor-core instruction: keep the two in step
+ROWS_PASS_SM = ((8, 0), (8, 9), (12, 0))
+# {device: whether its compute capability is in ROWS_PASS_SM}, filled on first use
+_ROWS_PASS_DEVICES = {}
+
 
 class SelectResult(NamedTuple):
     indices: torch.Tensor | None    # (seq, ceil32(topk)) int32 ascending, -1 padded; None = dense
@@ -113,8 +122,17 @@ def _effective_tile(rows_max: int, ec: int, slab_rows: int, tile_entries: int, q
     return tile
 
 
-def _rows_share_pass(backend: str, seq: int, pos0: int, m: int, ec: int, topk: int, slab: int,
-                     tile: int, tile_entries: int, quantum: int) -> bool:
+def _rows_pass_device(device: torch.device) -> bool:
+    """Whether `device` is a GPU of one of the types of ROWS_PASS_SM (looked up once per device)."""
+    ok = _ROWS_PASS_DEVICES.get(device)
+    if ok is None:
+        ok = device.type == "cuda" and tuple(torch.cuda.get_device_capability(device)) in ROWS_PASS_SM
+        _ROWS_PASS_DEVICES[device] = ok
+    return ok
+
+
+def _rows_share_pass(backend: str, device: torch.device, seq: int, pos0: int, m: int, ec: int, topk: int,
+                     slab: int, tile: int, tile_entries: int, quantum: int) -> bool:
     """
     EXL3_EXACT_ROWS: whether the rows of a call can take ONE selection pass in which every row
     gets what its own one-row call computes (row r: seq 1, pos0 + r, ec (pos0 + r + 1) // m).
@@ -123,6 +141,13 @@ def _rows_share_pass(backend: str, seq: int, pos0: int, m: int, ec: int, topk: i
       * the ext backend, without EXL3_STABLE_ARITHMETIC: the scorer can be pinned to the kernel
         of a one-row call (dsa_indexer_scores, one_row). The torch backend scores with
         torch.matmul, which picks its algorithm by row count;
+      * a GPU of one of the types of ROWS_PASS_SM. The shared scorer call takes the entry count
+        of its last row, so a row's key tile holds, from the row's own count on, the keys of the
+        later rows where the row's one-row call loads zeros. The row's scores below its count
+        are the one-row call's only if the tensor-core instruction computes an output element
+        from its own query row and its own key column, whatever the other columns hold. No
+        source shows that: it is compared bit for bit on those GPU types, and every other one
+        keeps the one-row calls;
       * 2 to EXACT_ROWS_MAX rows, inside one slab;
       * ec is the last row's own entry count, so every row's visible count is its one-row ec;
       * no dense row: the first row already selects (the entry count only grows with the row);
@@ -132,9 +157,10 @@ def _rows_share_pass(backend: str, seq: int, pos0: int, m: int, ec: int, topk: i
       * one tile, as every one-row call is (ec <= tile): no tiled merge, whose slots follow the
         tile count of the call.
 
-    Integer arithmetic on the arguments only; nothing here reads device data.
+    Integer arithmetic on the arguments and the device's type only; nothing here reads device
+    data.
     """
-    if backend != "ext" or STABLE_ARITHMETIC:
+    if backend != "ext" or STABLE_ARITHMETIC or not _rows_pass_device(device):
         return False
     if m < 1 or pos0 < 0 or not 1 < seq <= min(slab, EXACT_ROWS_MAX):
         return False
@@ -319,8 +345,8 @@ def select_topk(
                       of the candidate source reduced row by row, everything else the row-local
                       integer and selection work of any call. Returns None, before anything is
                       allocated or launched, when the rows cannot share a pass
-                      (_rows_share_pass); the caller then makes the one-row calls. Without
-                      effect on a one-row call.
+                      (_rows_share_pass: the GPU type among its conditions); the caller then
+                      makes the one-row calls. Without effect on a one-row call.
     :return: SelectResult(indices (seq, ceil32(topk)) int32 | None, k_len, cand | None).
              indices is None (dense: every entry selected) when ec <= topk; so is cand,
              since nothing is selected and the mask would be a no-op.
@@ -350,7 +376,8 @@ def select_topk(
     rows_max = min(slab, seq)
     tile = _effective_tile(rows_max, ec, slab, tile_entries, quantum)
     one_row = one_row and seq > 1
-    if one_row and not _rows_share_pass(backend, seq, pos0, m, ec, topk, slab, tile, tile_entries, quantum):
+    if one_row and not _rows_share_pass(backend, device, seq, pos0, m, ec, topk, slab, tile, tile_entries,
+                                        quantum):
         return None
     # Refused before any backend runs: the defaults stay at 2^24 elements (256 x 65,536, or
     # a widened decode tile within the same budget), but a larger slab x tile budget would
@@ -403,6 +430,9 @@ class _Slabs:
         blk = self.new_block_buffer(rows, nb) if self.want_cand else None
         flags = _cand_flags(cand_rows, nb, self.device) if self.has_cand_in else None
         tiles = list(range(0, T_slab, self.tile))
+        if self.one_row and len(tiles) != 1:
+            # _block_max_rows fills the block maxima from one tile; _rows_share_pass admits no other
+            raise RuntimeError(f"select_topk: one_row takes one tile, this slab has {len(tiles)}")
         self.begin(rows, len(tiles))
         for n, t0 in enumerate(tiles):
             t1 = min(t0 + self.tile, T_slab)
@@ -433,7 +463,8 @@ class _Slabs:
         of several NaNs), the top-k ranks by the bit pattern, and the order torch reduces in may
         follow the shape of the operand. Blocks past the row's own count hold only entries
         beyond its causal bound: -inf, as their maximum would be. The row's block count is
-        Python integers, no device read. One tile (select_topk), so sv holds every block.
+        Python integers, no device read. One tile, so sv holds every block and the buffer is
+        filled whole (slab refuses a one_row call of several tiles).
         """
         blk.fill_(_NEG_INF)
         for r in range(blk.shape[0]):
@@ -540,7 +571,11 @@ class _ExtSlabs(_Slabs):
         # few-query kernel that decode would take reduces over the heads in another order)
         few_query = not STABLE_ARITHMETIC
         # EXL3_EXACT_ROWS (one_row): the few-query kernel, the one of a one-row call, at every
-        # row count; a row's scores below its own causal bound are then those of its one-row call
+        # row count. The call's entry count (t1 - t0) is the last row's: an earlier row's key
+        # tile also holds the keys from its own count up to that one, which its one-row call
+        # loads as zeros. Its scores below its own causal bound are those of its one-row call
+        # where an element of the kernel's dot depends on its own key column alone, on the GPU
+        # types of ROWS_PASS_SM (_rows_share_pass)
         one_row = self.one_row
         if self.bt is None:
             self.scores_fn(q, w, self.pool_flat[t0 : t1], qp, self.m, t1 - t0,
