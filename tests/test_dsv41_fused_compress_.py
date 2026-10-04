@@ -70,12 +70,14 @@ def test_cached_compression_follows_the_rings():
         calls.append(("fused", kv.dtype, gate.dtype, tuple(kv.shape), pos0_, ck.data_ptr(), cg.data_ptr()))
         return torch.zeros(((pos0_ + kv.shape[0]) // 2 - pos0_ // 2, D)), pos0_ // 2
 
-    def step(carry, kv, score, pos0_, m, weight, eps):
+    def step(carry, kv, score, pos0_, m, weight, eps, per_row):
+        # per_row is EXL3_EXACT_ROWS' per-entry pooling: off here, and never asked for without the switch
+        assert per_row is False
         calls.append(("torch", None if carry is None else carry.data_ptr(), m))
         return torch.zeros(((pos0_ + kv.shape[0]) // m - pos0_ // m, D)), pos0_ // m
 
     ns = dict(torch = torch, fused_compress = fused_compress, CompressCarry = types.SimpleNamespace(step = step),
-              emission_range = lambda p, s, m: (p // m, (p + s) // m))
+              emission_range = lambda p, s, m: (p // m, (p + s) // m), EXACT_ROWS = False)
     store = helpers.method("exllamav3/modules/dsv41.py", "DSV41Attention", "_compress_store", ns)
     projection = lambda: types.SimpleNamespace(forward = lambda x, p: torch.ones((1, seq, D), dtype = torch.float))
     stored = []

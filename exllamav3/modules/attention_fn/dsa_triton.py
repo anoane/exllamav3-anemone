@@ -43,6 +43,14 @@ import triton.language as tl
 from .triton_paged import _rot_h32, _qc_load_v, _get_h32
 from .smem import pick_config, shared_bytes, halving_ladder
 
+# dsa_attn's automatic softmax split (n_splits = 0): a call of up to SPLIT_MAX_ROWS query rows
+# takes the flash-decoding split, with auto_splits(est) key partitions for an estimate of est keys
+# per row. Callers that must know the partition of a call without making it use the same two
+SPLIT_MAX_ROWS = 8
+
+def auto_splits(est: int) -> int:
+    return 16 if est > 256 else 8
+
 @triton.jit(do_not_specialize = [
     "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
     "win_floor", "ring_beg",
@@ -1022,10 +1030,10 @@ def dsa_attn(
     if multirow is not None:
         n_splits = n_splits or 8
     if n_splits == 0:
-        if R <= 8:
+        if R <= SPLIT_MAX_ROWS:
             est = (win_len if has_window else 0) + \
                   (k_len if indices is not dummy_i else min(pool_len, (q_pos0 + R) // max(compress_rate, 1)))
-            n_splits = 16 if est > 256 else 8
+            n_splits = auto_splits(est)
         else:
             n_splits = 1
 

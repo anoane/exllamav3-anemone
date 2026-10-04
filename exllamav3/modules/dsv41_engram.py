@@ -95,7 +95,7 @@ from .dsv41_engram_math import stable_engram_gate
 from .linear import Linear
 from ..ext import exllamav3_ext as ext
 from ..loader.safetensors import DiskTensorHandle, convert_dtype
-from ..model.math_policy import STABLE_ARITHMETIC
+from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS
 from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
 from .ngram_row_cache import Landing, CachedTicket
@@ -716,6 +716,16 @@ class DSV41Engram(Module):
 
     # ---- forward ----
 
+    def _gate(self, h, key, eps):
+        """
+        The gate of the tokens of h and key (B, L, H, D) fp32, (B, L, H): torch reductions over
+        the call, whose layout follows its shape. forward's docstring has the formula.
+        """
+        D = h.shape[-1]
+        rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
+        dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
+        return torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+
     def forward(self, x, params, out_dtype = None):
         """
         streams (B, L, H, D) fp32 -> streams with the gated n-gram value added.
@@ -788,10 +798,11 @@ class DSV41Engram(Module):
             # with the token count of the call; the row-local kernel reduces each (token, stream)
             # alone (the same gate, scaled against overflow: dsv41_engram_math.py)
             gate = stable_engram_gate(h, key, self.qk, eps)
+        elif EXACT_ROWS and params.get("exact_rows") and L > 1:
+            # EXL3_EXACT_ROWS: one token per call, the operands of a one-token step
+            gate = torch.cat([self._gate(h[:, l:l + 1], key[:, l:l + 1], eps) for l in range(L)], dim = 1)
         else:
-            rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
-            dot = (h * self.qk * key).sum(-1) * rstd * D ** -0.5
-            gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+            gate = self._gate(h, key, eps)
         dead = hist[:, self.ctx:] == DEAD
         if dead.any():
             # DeepSeek's token_mask: a dead token (an id outside the text vocab; image spans in

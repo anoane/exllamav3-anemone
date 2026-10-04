@@ -293,7 +293,9 @@ class DeepseekV41EngramTests(unittest.TestCase):
         node = next(n for n in ast.walk(function(path, "DSV41Engram", "forward"))
                     if isinstance(n, ast.If) and "STABLE_ARITHMETIC" in ast.unparse(n.test))
         self.assertIn("stable_engram_gate(h, key, self.qk, eps)", ast.unparse(node.body))
-        self.assertIn("torch.copysign", ast.unparse(node.orelse))
+        # (_gate, which EXL3_EXACT_ROWS calls once per token and every other call once)
+        self.assertIn("self._gate(h, key, eps)", ast.unparse(node.orelse))
+        self.assertIn("torch.copysign", ast.unparse(function(path, "DSV41Engram", "_gate")))
 
 
 def _extension_missing():

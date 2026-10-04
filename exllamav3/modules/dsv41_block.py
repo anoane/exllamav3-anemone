@@ -45,13 +45,26 @@ from typing_extensions import override
 
 from ..architecture.dsv41 import placement as dsv41_placement
 from ..ext import exllamav3_ext as ext
-from ..model.math_policy import STABLE_ARITHMETIC
+from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS
 from ..util.device_copy import to_device
 from ..util.tensor import g_tensor_cache, to2
 from . import Module
 from .dsv41_ablation import ablations
 from .hyperconnections import HyperConnection
 from .transformer import TransformerBlock
+
+
+def _collapse(pre: torch.Tensor, streams: torch.Tensor, per_row: bool) -> torch.Tensor:
+    """
+    The stream collapse sum_h pre[h] * streams[h]: pre (b, s, H), streams (b, s, H, D), returns
+    (b, s, D). With per_row (EXL3_EXACT_ROWS) every token's sum is a call of its own, on the
+    (b, 1, H, D) operand of a one-row step: torch chooses the layout of a reduction from the shape
+    of the call. The product is pointwise.
+    """
+    t = pre.unsqueeze(-1) * streams
+    if per_row:
+        return torch.cat([t[:, j:j + 1].sum(dim = 2) for j in range(t.shape[1])], dim = 1)
+    return t.sum(dim = 2)
 
 
 class DSV41HyperConnection(HyperConnection):
@@ -70,19 +83,31 @@ class DSV41HyperConnection(HyperConnection):
 
         post, comb and pre are V4's mixes; only the collapse differs. On a GPU they come
         from V4's fused ext.hc_mix (mix_fused), else from V4's torch body (mix_torch).
+
+        In a flagged forward of EXL3_EXACT_ROWS (params["exact_rows"]) every token gets the
+        mix of a one-token call: the fused kernel with that call's column partition, the torch
+        sums one token per call. The torch body is refused there: its projection and
+        reductions follow the shape of the call.
         """
         b, s, H, D = streams.shape
+        exact = EXACT_ROWS and bool(params.get("exact_rows")) and b * s > 1
         if self.hc_mult == 4 and streams.is_cuda and streams.dtype == torch.float and D % 4 == 0 \
                 and streams.is_contiguous():
-            post, comb, pre = self.mix_fused(streams)
+            post, comb, pre = self.mix_fused(streams, exact)
         else:
+            if exact:
+                raise RuntimeError(
+                    f"{self.key}: EXL3_EXACT_ROWS=1 computes the hyper-connection mix of a draft "
+                    f"verification with the fused kernel only (4 contiguous FP32 CUDA streams, width a "
+                    f"multiple of 4); got hc_mult {self.hc_mult}, {streams.dtype} on {streams.device}, "
+                    f"width {D}, contiguous {streams.is_contiguous()}")
             post, comb, pre = self.mix_torch(streams, params)
         if own_pre:
-            collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2)
+            collapsed = _collapse(pre, streams, exact)
         elif carried_pre is None:
             collapsed = streams[:, :, 0]
         else:
-            collapsed = (carried_pre.unsqueeze(-1) * streams).sum(dim = 2)
+            collapsed = _collapse(carried_pre, streams, exact)
         return post, comb, collapsed, pre
 
     def mix_torch(self, streams: torch.Tensor, params: dict):
@@ -103,7 +128,7 @@ class DSV41HyperConnection(HyperConnection):
             comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
         return post.contiguous(), comb.contiguous(), pre
 
-    def mix_fused(self, streams: torch.Tensor):
+    def mix_fused(self, streams: torch.Tensor, exact: bool = False):
         """
         post and comb (the Sinkhorn iterations) from V4's fused ext.hc_mix; this site's pre-mix
         re-derived from the kernel's per-chunk partial dots, which the kernel leaves in its
@@ -116,6 +141,12 @@ class DSV41HyperConnection(HyperConnection):
         hc_mix_num_chunks: the kernel writes exactly that many chunks, which are summed here.
         Under EXL3_STABLE_ARITHMETIC=1 the workspace has one chunk at every row count (see
         below), and that chunk is the sum.
+
+        exact (EXL3_EXACT_ROWS): every row gets the bits of a one-row call. The workspace takes
+        the chunk count of one row, and the kernel takes its column partition from the workspace
+        (hc_mix.cu, hc_mix_launch: n_chunks_a = partials.size(1)); a block of it reads one row,
+        and a row's partials are reduced, mixed and Sinkhorn-normalized by that row's own block.
+        The chunk sums are added per row here, the operand of a one-row call each.
         """
         b, s, H, D = streams.shape
         R = b * s
@@ -126,7 +157,7 @@ class DSV41HyperConnection(HyperConnection):
         # on), so the FP32 dot products of the same row are parenthesized differently in decode
         # and prefill.
         # Stable arithmetic keeps one chunk, the large-prefill partition, at every row count
-        chunks = 1 if STABLE_ARITHMETIC else ext.hc_mix_num_chunks(R, H * D)
+        chunks = 1 if STABLE_ARITHMETIC else ext.hc_mix_num_chunks(1 if exact else R, H * D)
         dev = streams.device
 
         # Decode-sized calls take bucketed static workspaces, as V4's mix does (tags of their
@@ -141,7 +172,12 @@ class DSV41HyperConnection(HyperConnection):
         unused = ws(R * D, torch.half, "dsv41_hc_coll").view(R, D)
         ext.hc_mix(st, self.fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                    self.sinkhorn_iters, partials, post, comb, unused)
-        p = partials[:, 0] if STABLE_ARITHMETIC else partials.sum(dim = 1)
+        if STABLE_ARITHMETIC:
+            p = partials[:, 0]
+        elif exact:
+            p = torch.cat([partials[r:r + 1].sum(dim = 1) for r in range(R)], dim = 0)
+        else:
+            p = partials.sum(dim = 1)
         rmr = torch.rsqrt(p[:, M1 - 1:] / (H * D) + self.rms_eps)
         pre = torch.sigmoid(p[:, :H] * rmr * self.scale[0] + self.base[:H]) + self.hc_eps
         return post.view(b, s, H), comb.view(b, s, H, H), pre.view(b, s, H)
@@ -280,4 +316,4 @@ class DSV41HeadCollapse(Module):
             "DSV41HeadCollapse: no pre-mix from the last layer -- did the final block run?"
         pre = to_device(pre, x.device)
         assert pre.shape == x.shape[:-1], f"pre-mix {tuple(pre.shape)} vs streams {tuple(x.shape)}"
-        return (pre.unsqueeze(-1) * x).sum(dim = 2)
+        return _collapse(pre, x, EXACT_ROWS and bool(params.get("exact_rows")) and x.shape[1] > 1)

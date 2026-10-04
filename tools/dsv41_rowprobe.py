@@ -1004,12 +1004,12 @@ class Probe:
         self.patch(at, "_project_qkv", make)
 
     def _make_carry_step(self, orig):
-        def step(carry, kv, score, pos0, m, norm_weight = None, eps = 1e-6):
+        def step(carry, kv, score, pos0, m, norm_weight = None, eps = 1e-6, per_row = False):
             if not self.on():
-                return orig(carry, kv, score, pos0, m, norm_weight, eps)
+                return orig(carry, kv, score, pos0, m, norm_weight, eps, per_row)
             prev, self.entry = self.entry, (pos0 // m, m)
             try:
-                return orig(carry, kv, score, pos0, m, norm_weight, eps)
+                return orig(carry, kv, score, pos0, m, norm_weight, eps, per_row)
             finally:
                 self.entry = prev
         return step

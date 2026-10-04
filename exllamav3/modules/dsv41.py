@@ -48,19 +48,24 @@ from .rmsnorm import RMSNorm
 from .dsv4 import DSV4Attention, _ext_rope
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle
-from .attention_fn.dsa_triton import dsa_attn
+from .attention_fn.dsa_triton import dsa_attn, auto_splits, SPLIT_MAX_ROWS
 from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
 from ..constants import PAGE_SIZE
-from ..model.math_policy import STABLE_ARITHMETIC
+from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX
 from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
 from ..cache.dsv41_replica import sync_pool_replica
-from .dsv41_select import select_topk, INT32_LIMIT
+from .dsv41_select import select_topk, SelectResult, INT32_LIMIT
 from .dsv41_ablation import ablated
 from .dsv41_compress import fused_compress
 from . import dsv41_rounding as rounding
 from ..architecture.dsv41 import numerics as dsv41_numerics
 from .dsv41_cached import emission_range, entry_rows, rope_positions, CompressCarry, ring_update
+
+# EXL3_EXACT_ROWS leaves dsa_attn one call for the rows of a verify forward: every such call must
+# take the split softmax of a one-row step, which dsa_attn gives calls of up to SPLIT_MAX_ROWS rows
+assert EXACT_ROWS_MAX <= SPLIT_MAX_ROWS, \
+    f"EXACT_ROWS_MAX {EXACT_ROWS_MAX} exceeds dsa_attn's split-softmax row limit {SPLIT_MAX_ROWS}"
 
 
 def check_row_limit(key: str, rows: int, num_heads: int, head_dim: int):
@@ -934,18 +939,57 @@ class DSV41Attention(DSV4Attention):
             if cands[b] is not None:
                 cand_in = DeviceMemo.get(params, ("dsv41_candidates", b), cands[b], q_idx.device)
 
-        r = select_topk(
-            q_idx[0], wts, idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0,
-            m = self.compress_ratio, ec = ec, topk = self.index_topk, cand_in = cand_in,
-            want_cand = self.is_candidate_source, block = self.candidate_block_size,
-            n_blocks = self.candidate_topk_blocks,
-        )
+        if EXACT_ROWS and params.get("exact_rows") and seq > 1:
+            # EXL3_EXACT_ROWS: one selection per row, the call a one-row step at that row's position
+            # makes (its own entry count, hence its tile width, score stride and scoring kernel:
+            # the scorer takes another kernel from 5 rows on). A flagged call never mixes dense and
+            # selecting rows (DeepseekV41Model.exact_rows_span), and a dense row selects nothing
+            m = self.compress_ratio
+            if (pos0 + 1) // m <= self.index_topk:
+                raise RuntimeError(
+                    f"{self.key}: EXL3_EXACT_ROWS=1: a draft verification of {seq} rows at position "
+                    f"{pos0} selects although its first row is still dense ({(pos0 + 1) // m} entries, "
+                    f"index_topk {self.index_topk}); such a call must not carry params['exact_rows']")
+            rows = [select_topk(
+                q_idx[0][j:j + 1], wts[j:j + 1], idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0 + j,
+                m = m, ec = (pos0 + j + 1) // m, topk = self.index_topk,
+                cand_in = None if cand_in is None else cand_in[j:j + 1],
+                want_cand = self.is_candidate_source, block = self.candidate_block_size,
+                n_blocks = self.candidate_topk_blocks,
+            ) for j in range(seq)]
+            r = SelectResult(
+                torch.cat([row.indices for row in rows], dim = 0), rows[0].k_len,
+                None if rows[0].cand is None else torch.cat([row.cand for row in rows], dim = 0))
+        else:
+            r = select_topk(
+                q_idx[0], wts, idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0,
+                m = self.compress_ratio, ec = ec, topk = self.index_topk, cand_in = cand_in,
+                want_cand = self.is_candidate_source, block = self.candidate_block_size,
+                n_blocks = self.candidate_topk_blocks,
+            )
         if self.is_candidate_source:
             params.setdefault("dsv41_candidates", {})[b] = r.cand
         return r
 
     # ------------------------------------------------------------------------------------
     # Cached path (attn_mode flash_attn)
+
+    def row_plan(self, position: int) -> tuple[bool, int]:
+        """
+        What a one-row cached step at `position` decides from its position: (dense pool, softmax
+        splits). Dense is _select_cached's choice for its ec = (position + 1) // m, the split count
+        dsa_attn's automatic one (auto_splits) for the keys of that row: the window plus the
+        row's visible entries when dense, plus index_topk selected ones otherwise. A call of
+        several rows takes ONE such plan, from its last row, so only a call whose rows all have
+        the same plan gives each row its one-row attention (EXL3_EXACT_ROWS).
+        """
+        w = self.sliding_window
+        m = self.compress_ratio
+        if not m:
+            return True, auto_splits(w)
+        ec = (position + 1) // m
+        dense = ec <= self.index_topk or (not self.is_index_source and ablated("dense_consumers"))
+        return dense, auto_splits(w + (ec if dense else self.index_topk))
 
     def _forward_cached(self, x, params, out_dtype):
         """
@@ -1070,6 +1114,13 @@ class DSV41Attention(DSV4Attention):
         if shift is not None:
             rs.wshift = shift
 
+        if EXACT_ROWS and params.get("exact_rows") and seq > 1:
+            # EXL3_EXACT_ROWS: the output projection one row per call, the seq == 1 call of a
+            # decode step (the grouped GEMM's launch configuration follows the row count, and wo_b
+            # behind it is a Linear). A row of the group-major output is strided across the groups
+            return torch.cat([
+                self._project_o_grouped(out[:, j:j + 1].contiguous().unsqueeze(1), params, out_dtype)
+                for j in range(seq)], dim = 1)
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype)
 
     def _compress_store(self, x, params, rsl, slot, kl, bt_row, pos0):
@@ -1087,9 +1138,12 @@ class DSV41Attention(DSV4Attention):
         m = self.compress_ratio
         seq = x.shape[1]
         e0, e1 = emission_range(pos0, seq, m)
+        # EXL3_EXACT_ROWS: every closed entry pooled and normalized by a call of its own
+        per_row = EXACT_ROWS and bool(params.get("exact_rows"))
         if m == 1:
             kvr = comp.wkv.forward(x, params)[0].float()
-            latent, first = CompressCarry.step(None, kvr, None, pos0, 1, comp.norm.weight, comp.rms_norm_eps)
+            latent, first = CompressCarry.step(None, kvr, None, pos0, 1, comp.norm.weight, comp.rms_norm_eps,
+                                               per_row)
         elif rsl.comp_buf_kv is not None:
             kvr = comp.wkv.forward(x, params)[0].float()
             gr = comp.wgate.forward(x, params)[0].float()
@@ -1099,7 +1153,7 @@ class DSV41Attention(DSV4Attention):
             kvr = comp.wkv.forward(x, params)[0].float()
             gr = comp.wgate.forward(x, params)[0].float()
             latent, first = CompressCarry.step(
-                rsl.comp_carry[slot], kvr, gr, pos0, m, comp.norm.weight, comp.rms_norm_eps)
+                rsl.comp_carry[slot], kvr, gr, pos0, m, comp.norm.weight, comp.rms_norm_eps, per_row)
         assert first == e0 and latent.shape[0] == e1 - e0
         if e1 > e0:
             self._store_entries(latent, e0, kl, bt_row, pos0, seq, params)
