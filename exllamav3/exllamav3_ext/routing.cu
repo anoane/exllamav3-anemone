@@ -762,7 +762,8 @@ static void routing_ds3_nogroup_impl
         TORCH_CHECK_DTYPE(scores, kHalf);
         TORCH_CHECK_SHAPES(hidden, -1, gate, 0, 1);
         TORCH_CHECK_SHAPES(gate, 1, scores, -1, 1);
-        TORCH_CHECK(hidden.size(1) >= 1 && hidden.size(1) <= INT_MAX, "routing_ds3_nogroup_rows: the width of hidden is out of range");
+        TORCH_CHECK(hidden.size(1) >= 1 && hidden.size(1) <= INT_MAX,
+                    "routing_ds3_nogroup_rows: the width of hidden is out of range");
         TORCH_CHECK(scores.is_cuda() && hidden.device() == scores.device() && gate.device() == scores.device(),
                     "routing_ds3_nogroup_rows: hidden, gate and scores must be on one CUDA device");
         if (gate_t.has_value())
@@ -863,7 +864,8 @@ void routing_ds3_nogroup
 {
     routing_ds3_nogroup_impl
     (
-        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, false, false
+        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb,
+        false, false
     );
 }
 
@@ -885,7 +887,8 @@ void routing_ds3_nogroup_rows
 {
     routing_ds3_nogroup_impl
     (
-        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb, true, one_launch
+        hidden, gate, scores, bias, topk_indices, topk_weights, scaling_factor, gate_t, act_fn, gate_i8, gate_sb,
+        true, one_launch
     );
 }
 
