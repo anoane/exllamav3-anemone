@@ -113,9 +113,14 @@ uint64_t mgemm_autotune_hash
     return h;
 }
 
-bool exl3_gemm_asks_int8(bool mul1)
+bool exl3_gemm_one_row_route_ok(int device, int64_t size_k, int64_t size_n)
 {
-    return mul1 && exl3_gemv_int8_enabled();
+    if (exl3_gemv_int8_enabled()) return false;
+    if (size_k <= 0 || size_n <= 0 || size_k % 128 || size_n % 128) return false;
+    if (device < 0 || device >= MAX_DEVICES) return false;
+    const auto* props = at::cuda::getDeviceProperties(device);
+    const int sm = props->major * 10 + props->minor;
+    return sm == 80 || sm == 89 || sm == 120;
 }
 
 int exl3_gemm_gr
@@ -221,19 +226,20 @@ int exl3_gemm_gr
                     A.device() == B.device() && A.device() == suh.value().device() &&
                     A.device() == svh.value().device(),
                     "exl3_gemm: one_row_route: the operands must be on one CUDA device");
-        // The input transform works on 128-element blocks of the flattened rows, and the output
-        // transform on 128-column blocks: a block must not straddle two rows
-        if (size_k % 128 || size_n % 128) return EXACT_ROWS_NO_LAUNCH;
+        // The int8 path on, a width that is not a multiple of 128, or a device without a bitwise
+        // run of the rows (exl3_gemm.cuh): the caller launches per row
+        if (!exl3_gemm_one_row_route_ok(device, size_k, size_n)) return EXACT_ROWS_NO_LAUNCH;
     }
 
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
     // to the regular kernel.
-    if (exl3_gemm_asks_int8(mul1))
+    if (mul1 && exl3_gemv_int8_enabled())
     {
-        // one_row_route: the one-row call is offered to the int8 path, which decodes the weights per
-        // call and whose one-row launch is not the launch of several rows
+        // one_row_route: the variable is read on every call. Had it changed since
+        // exl3_gemm_one_row_route_ok, the one-row call is offered to the int8 path, whose one-row
+        // launch is not the launch of several rows
         if (one_row_route) return EXACT_ROWS_NO_LAUNCH;
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
@@ -608,9 +614,9 @@ int exl3_mgemm_gr
         TORCH_CHECK(!indices || (indices.value().is_contiguous() && indices.value().dtype() == at::kLong &&
                                  indices.value().device() == A.device()),
                     "exl3_mgemm: one_row_route: indices must be contiguous int64, on the device of A");
-        // The transforms work on 128-element blocks of each matrix's flattened rows: a block must
-        // not straddle two rows
-        if (size_k % 128 || size_n % 128) return EXACT_ROWS_NO_LAUNCH;
+        // As in exl3_gemm_gr: the int8 path on, a width that is not a multiple of 128, or a device
+        // without a bitwise run of the rows. The caller launches per row
+        if (!exl3_gemm_one_row_route_ok((int) A.get_device(), size_k, size_n)) return EXACT_ROWS_NO_LAUNCH;
     }
 
     // Device properties
@@ -846,14 +852,16 @@ int exl3_mgemm
 }
 
 // EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows, every row with
-// the bits of a one-row call. With the launch record of the one-row call in the process, the rows
-// are ONE launch under it (exl3_mgemm_gr, one_row_route), on matrix-major (G, rows, k) and (G, rows,
-// n) copies with a scratch of their own: the kernel addresses the rows of one matrix contiguously.
-// The grouped call is never offered to the int8 GEMV, so this does not depend on EXL3_INT8_GEMV.
-// Otherwise row r of the row-major A and C is the contiguous (G, 1, k) and (G, 1, n) block a one-row
-// call passes, and every row is exl3_mgemm_gr with that call's argument list: size_m 1, G inputs and
-// outputs, and with them the launch-autotune record of the one-row call, which the first row loads
-// or tunes. Those rows share A_had, in stream order, as successive one-row calls do
+// the bits of a one-row call. Row r of the row-major A and C is the contiguous (G, 1, k) and (G, 1,
+// n) block a one-row call passes, and every row is exl3_mgemm_gr with that call's argument list:
+// size_m 1, G inputs and outputs, and with them the launch-autotune record of the one-row call, which
+// the first row loads or tunes. The rows share A_had, in stream order, as successive one-row calls do.
+// With EXL3_INT8_GEMV=0 (exl3_gemm_one_row_route_ok) and the launch record of the one-row call in
+// the process, the rows are instead ONE launch under that record (exl3_mgemm_gr, one_row_route), on
+// matrix-major (G, rows, k) and (G, rows, n) copies with a scratch of their own: the kernel addresses
+// the rows of one matrix contiguously. The grouped call itself never takes the int8 GEMV; the
+// variable decides here so that the default setting launches exactly as it did before the single
+// launch existed
 int exl3_mgemm_rows
 (
     const at::Tensor& A,
@@ -898,7 +906,9 @@ int exl3_mgemm_rows
                 A.device() == B.device() && A.device() == suh.device() && A.device() == svh.device(),
                 "exl3_mgemm_rows: A, C, A_had, indices and the pointer tables must be on one CUDA device");
 
-    // One launch for the rows, where exl3_mgemm_gr makes it (one_row_route)
+    // One launch for the rows, where exl3_mgemm_gr makes it (one_row_route). Asked first: a call it
+    // would not launch makes no copy and no scratch
+    if (exl3_gemm_one_row_route_ok((int) A.get_device(), size_k, size_n))
     {
         at::Tensor a = A.transpose(0, 1).contiguous();
         at::Tensor a_had = at::empty_like(a);
