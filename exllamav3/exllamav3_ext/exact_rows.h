@@ -24,11 +24,12 @@
 // else, and for every call with the int8 path on
 #define EXACT_ROWS_CAP_ONE_LAUNCH 32
 #define EXACT_ROWS_CAP_HGEMM 64     // hgemm_rows
-// An argument of run_bszN_rows (grouped): on the GPU types of exact_rows_device_ok the rows are
-// launched as an unflagged call launches them (the rotation launch, the slots that picked one expert
-// as rows of one tile), with the tile and the split-k factor of a one-row call
-// (quant/exl3_moe_coop.cuh, exl3_moe_coop_rows_grouped). Without the argument, and on every other
-// device, a launch per slot, rotated in-block
+// An argument of run_bszN_rows (grouped): on the GPU types of exact_rows_device_ok, for a module
+// without a shared-expert gate (BC_BlockSparseMLP::rows_grouped), the rows are launched as an
+// unflagged call launches them (the rotation launch, the slots that picked one expert as rows of
+// one tile), with the tile and the split-k factor of a one-row call (quant/exl3_moe_coop.cuh,
+// exl3_moe_coop_launch). Without the argument, and everywhere else, a launch per slot, rotated
+// in-block
 #define EXACT_ROWS_CAP_MOE_GROUPED 128
 // An argument of routing_ds3_nogroup_rows (one_launch): the rows are projected with one launch of
 // the FMA GEMV where a one-row call is that GEMV (routing.cu, routing_gemv with one_row_route).
@@ -44,11 +45,25 @@ int exact_rows_caps();
 
 // The GPU types on which several rows share one tensor-core tile under EXL3_EXACT_ROWS: compute
 // capability 8.0, 8.9 and 12.0. The kernel sources show that the operations on a row and their
-// order do not depend on the other rows. That an output row of a tensor-core tile depends on its
-// own input row alone, whatever the other rows of the tile hold, is a property of the instruction:
-// those are the capabilities on which the rows of such launches are compared bit for bit with
-// one-row calls (tests/test_dsv41_exact_rows_gpu_.py). False for every other device and for an
-// index outside 0 .. MAX_DEVICES - 1
+// order do not depend on the other rows. What they cannot show is a property of the instruction:
+// that an element of a tensor-core product is computed from its own row of the first operand and
+// its own column of the second, whatever the other rows and columns of the fragments hold and
+// wherever the row sits in its m16 tile. It is assumed of three uses, each a separate assumption
+// with a test of its own, and those are the capabilities on which each is compared bit for bit
+// with one-row calls (tests/test_dsv41_exact_rows_gpu_.py):
+// - the cooperative EXL3 linears (EXACT_ROWS_CAP_ONE_LAUNCH): the FP32-accumulate instruction
+//   (ptx.cuh, f32.f16.f16.f32), a row among the other rows of its tile (test_one_launch_*)
+// - the grouped MoE tile (EXACT_ROWS_CAP_MOE_GROUPED): the FP16-accumulate instruction
+//   (quant/exl3_gemv_kernel.cuh, mma_ab_h, f16.f16.f16.f16, folded to FP32 every FOLD slices). A
+//   slot is fragment row 0 with rows 1 to 15 zero in a one-row call, and row r among up to 8
+//   non-zero rows when grouped: independence of the other rows and of the row's position
+//   (test_native_moe_selections, whose "every row the same experts" case fills rows 0 .. K - 1 of
+//   one tile, and test_moe_grouped_form, at every K on every GPU type)
+// - the index scorer of a shared selection pass (Python: modules/dsv41_select.py, ROWS_PASS_SM,
+//   the same list): the FP32-accumulate instruction as Triton emits it for tl.dot, a key column
+//   among the other key columns of its tile (test_select_rows_equal_one_row_calls)
+// A form is served on a GPU type only with its tests green there. False for every other device
+// and for an index outside 0 .. MAX_DEVICES - 1
 bool exact_rows_device_ok(int device);
 
 // Calls of run_alloc_rows and exl3_mgemm_rows served with one launch since the extension was

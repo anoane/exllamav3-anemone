@@ -188,8 +188,9 @@ struct BC_BlockSparseMLP
     // per row: the shared expert, if any, is a fused launch, and the rows fit the scratch
     bool rows_exact_ok(int topk);
 
-    // Whether run_bszN_rows with grouped groups the rows that picked one expert on this module's
-    // device (exl3_moe_coop_rows_grouped), or launches every slot on its own
+    // Whether run_bszN_rows with grouped groups the rows that picked one expert, or launches every
+    // slot on its own: on this module's device (exl3_moe_coop_rows_grouped), and only without a
+    // shared-expert gate
     bool rows_grouped();
 
     void run_single_expert_gr

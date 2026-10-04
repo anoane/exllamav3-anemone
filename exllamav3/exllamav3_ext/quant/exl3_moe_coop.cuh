@@ -86,20 +86,33 @@ struct MoeCoopParams
 // rows_grouped, where exl3_moe_coop_rows_grouped holds for the device, the slots are launched as an
 // unflagged call launches them: the rotation launch, and the slots that picked one expert as the
 // rows of one tile (a_global true).
-// With the tile fixed, a slot's result does not depend on that: the rotation launch and the
-// in-block rotation run the same rotate_chunk on the same row, a row of a run sits at a fragment
-// row of its own (rows past the run and rows 8 to 15 are zero), every accumulation, fold and
-// cross-warp sum is per (row, column), and the epilogues are per (slot, chunk) and per (token,
-// chunk). Without rows_grouped, and on every other device, the slots stay ungrouped and rotated
-// in-block (a_global false, no rot launch): a block then computes its slot exactly as the block of
-// that slot does in the row's own one-row launch. rows_grouped without exact_rows changes nothing
+// With the tile fixed, a slot's result does not depend on that:
+// - the GEMV tiles and both epilogues are the code of the one-row call's own kernel instances. A
+//   row of a run sits at a fragment row of its own (rows past the run and rows 8 to 15 are zero),
+//   every accumulation, fold and cross-warp sum is per (row, column), and the epilogues are per
+//   (slot, chunk) and per (token, chunk). That the FP16-accumulate tensor-core instruction gives a
+//   row the same bits at fragment row r among other rows as at row 0 alone is a property of the
+//   instruction, compared bit for bit on the GPU types of exact_rows_device_ok (exact_rows.h)
+// - the input rotation is computed by the rotation kernel, another compilation of rotate_chunk
+//   than the one inside kernel A. Its result does not depend on which products the build
+//   contracts into FMAs in either (rotate_chunk, exl3_moe_coop_kernel.cuh): the only products are
+//   of two FP16 values, exact in FP32, so a product contracted into the add or subtract that
+//   follows rounds the same exact sum as the separate multiply and add
+// - an empty token row (no active slot) is written by the rotation kernel instead of kernel A:
+//   zeros, or a copy of the shared expert's row. With a shared-expert gate the two would each
+//   compute the gate (write_empty_row_chunk: an FP32 dot product and an exponential, two
+//   compilations again, and not exact): a caller must not ask for rows_grouped then
+//   (BC_BlockSparseMLP::rows_grouped), and the launch below does not group
+// Without rows_grouped, and on every other device, the slots stay ungrouped and rotated in-block
+// (a_global false, no rot launch): a block then computes its slot exactly as the block of that slot
+// does in the row's own one-row launch. rows_grouped without exact_rows changes nothing
 void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
                           bool exact_rows = false, bool rows_grouped = false);
 
-// Whether an exact_rows launch with rows_grouped on CUDA device `device` groups the rows (above):
-// the GPU types on which rows sharing a tensor-core tile are compared bit for bit with one-row
-// calls (exact_rows.h, exact_rows_device_ok). Counted per launch in exact_rows_served
-// (EXACT_ROWS_CAP_MOE_GROUPED)
+// Whether an exact_rows launch with rows_grouped on CUDA device `device` groups the rows (above),
+// given parameters without a shared-expert gate: the GPU types on which rows sharing a tensor-core
+// tile are compared bit for bit with one-row calls (exact_rows.h, exact_rows_device_ok). Counted
+// per launch in exact_rows_served (EXACT_ROWS_CAP_MOE_GROUPED)
 bool exl3_moe_coop_rows_grouped(int device);
 
 // Whether an exact_rows launch of `rows` token rows of `topk` picks fits the scratch p was prepared

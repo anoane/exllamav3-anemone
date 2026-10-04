@@ -15,6 +15,7 @@ int exact_rows_caps()
            EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH;
 }
 
+// modules/dsv41_select.py holds the same list for the index scorer (ROWS_PASS_SM)
 bool exact_rows_device_ok(int device)
 {
     if (device < 0 || device >= MAX_DEVICES) return false;

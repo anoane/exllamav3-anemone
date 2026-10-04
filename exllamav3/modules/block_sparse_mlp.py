@@ -1399,9 +1399,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, BlockSparseMLP_Tier, Module):
                 # EXL3_EXACT_ROWS: the launch covers the rows with the kernel instances of a one-row
                 # call (the tile of one row's slots); with an extension that reports
                 # EXACT_ROWS_CAP_MOE_GROUPED the rows are grouped by expert, on the GPU types that
-                # was verified on (bc.rows_grouped). The caller sends a flagged call of several rows
-                # here only when that serves the layer (DSV41MoE.rows_native); the launch below
-                # sizes its tile from all slots and would not give one-row bits
+                # was verified on and without a shared-expert gate (bc.rows_grouped), else launched
+                # slot by slot. The caller sends a flagged call of several rows here only when that
+                # serves the layer (DSV41MoE.rows_native); the launch below sizes its tile from all
+                # slots and would not give one-row bits
                 if not (ROWS_NATIVE & EXACT_ROWS_CAP_MOE):
                     raise RuntimeError(
                         f"{self.key}: EXL3_EXACT_ROWS=1: a flagged call of {bsz} rows reached the fused "

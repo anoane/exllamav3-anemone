@@ -580,7 +580,11 @@ __device__ __forceinline__ int token_active_slots(const MoeCoopParams& p, int ro
 
 // A token with no active slot on this rank (expert-parallel sharding: every pick lives elsewhere)
 // gets no arrival in the down stage, so nobody would write its output row. Writes one 128-chunk of
-// that row: the shared-expert term when there is one, else zeros. Warp-level
+// that row: the shared-expert term when there is one, else zeros. Warp-level.
+// Compiled into kernel A and into the rotation kernel, like rotate_chunk. Without a shared gate
+// it rounds nothing (zeros, or 1.0f * the shared expert's value); with one it computes the gate,
+// and the two compilations are not shown to do so alike: the grouped launch of EXL3_EXACT_ROWS
+// is not taken then (exl3_moe_coop_launch)
 __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, int row, int chunk, int lane)
 {
     const int col = chunk * 128 + lane * 4;
@@ -620,7 +624,17 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
     }
 }
 
-// Input rotation of one 128-chunk of a slot's x row: zero-padded from H to Hi, * suh, Hadamard
+// Input rotation of one 128-chunk of a slot's x row: zero-padded from H to Hi, * suh, Hadamard.
+// Compiled into kernel A (bsz 1, and the slot-by-slot launch of EXL3_EXACT_ROWS) and into the
+// rotation kernel (bsz > 1, and the grouped launch of EXL3_EXACT_ROWS, which must give a slot the
+// bits of the former). The build contracts a product and the add or subtract that follows it into
+// an FMA where it sees fit (--use_fast_math), and need not do so alike in two kernels. Here that
+// cannot change a bit: x and suh are FP16 values, so each product (at most 22 significant bits,
+// magnitude 2^-48 to 2^32 or zero) is exact in FP32, and an FMA and a separate multiply and add
+// both round the same exact sum of two products. Every later operation is an add or subtract of
+// such sums in the order written, then one multiply by R_SCALE that feeds the FP16 store and no
+// add. Keep it so: with a product of anything but two FP16 values in front of an add, the two
+// compilations could differ
 __device__ __forceinline__ void rotate_chunk(const MoeCoopParams& p, int row, const half* suh, int c, half* dst, int lane)
 {
     const int col = c * 128 + lane * 4;

@@ -161,11 +161,13 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     // exact_rows: the values a one-row call computes from its topk slots and that select a kernel
     // instance or a reduction order are pinned to them (the tile, the split-k factor); the grids
     // below still cover every slot of the call. With rows_grouped the rows are grouped and rotated
-    // by the rotation launch, as in an unflagged call, where exl3_moe_coop_rows_grouped holds; else
+    // by the rotation launch, as in an unflagged call, where exl3_moe_coop_rows_grouped holds and
+    // no shared-expert gate would be computed by the rotation kernel (write_empty_row_chunk); else
     // every slot is a run of its own, rotated in-block as in a one-row call
     TORCH_CHECK(!exact_rows || (p.bsz >= 1 && p.topk >= 1), "exl3_moe_coop: a row-exact call without rows or picks");
     const int geo_slots = exact_rows ? p.topk : slots;
-    p.a_global = p.bsz > 1 && (!exact_rows || (rows_grouped && exl3_moe_coop_rows_grouped(device)));
+    const bool group_rows = rows_grouped && !p.sh_gate_w && exl3_moe_coop_rows_grouped(device);
+    p.a_global = p.bsz > 1 && (!exact_rows || group_rows);
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, geo_slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, geo_slots, device);
