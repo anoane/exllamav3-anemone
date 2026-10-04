@@ -1285,23 +1285,40 @@ shape), the differences are last-bit rounding, and a near-tie then resolves to a
 
 With `1`, a cached DeepSeek-V4.1 forward of one sequence with 2 to 8 rows:
 
-- gives every row the launch a decode step makes, in the operations that follow the row count:
-  every linear (attention, compressor, indexer, engram, output head), the grouped output
-  projection, the MoE layer (router, routed and shared experts), the index selection, the
-  compressor's pooling and norm, the engram gate, and the torch sums of the stream collapse and
-  of the hyper-connection pre-mix. With an extension that has the row-exact entry points
-  (`exllamav3_ext.exact_rows_caps()`), the rows of an EXL3 linear, of the grouped output
-  projection and of the router projection are launched from one native call each, the MoE
-  experts of all rows run in one launch pair with the launch geometry of one row (no grouping of
-  rows that picked the same expert), the router selects for all rows in one launch, and the two
-  torch sums run in the extension; the index selection, `idx.weights_proj`, the compressor's
-  pooling and norm and the engram gate are one Python call per row. With `EXL3_INT8_GEMV=0`,
-  where the one-row call of an EXL3 linear or of the grouped output projection is the
-  cooperative FP16 kernel, an extension that reports bit 32 of `exact_rows_caps()` makes ONE
-  launch for the rows instead of one per row, under the launch record of the one-row call
-  (kernel shape, block count, concurrency): with that record fixed the kernel computes a row
-  with the same operations in the same order whatever the row count, so the rows keep their
-  one-row bits (see "Cost");
+- gives every row the bits of a decode step in the operations that follow the row count: every
+  linear (attention, compressor, indexer, engram, output head), the grouped output projection,
+  the MoE layer (router, routed and shared experts), the index selection, the compressor's
+  pooling and norm, the engram gate, and the torch sums of the stream collapse and of the
+  hyper-connection pre-mix. An operation whose kernel provably computes a row the same way
+  whatever the other rows of the call, once its variant is pinned to the one of a one-row
+  call, runs once for the rows; every other one makes the one-row call per row:
+  - the index selection is one pass per index source: the scorer is pinned to the kernel of a
+    one-row call, a program of which reads and writes one row, and visibility, the candidate
+    mask, the top-k and the sorts are row-local integer work. Only the block maxima of the
+    candidate source are reduced row by row. The few forwards whose rows straddle a tile
+    width (a power of two of at least 65,536 pool entries) select one row per call;
+  - the two torch sums run over the rows: each of their outputs is added by one thread in an
+    order fixed by its term count (4 streams, 80 chunks of width 25), not by the row count.
+    torch has no argument to pin that, so the first flagged call per operand shape and GPU
+    computes both forms, compares them bit for bit and keeps one sum per row (one printed
+    line) if they differ;
+  - the compressor pools and normalizes all closed entries at once except for the mean of the
+    norm, and the engram gate is computed at once except for its three reductions over the
+    hidden width: those follow the shape of the call and stay one call per row;
+  - with an extension that has the row-exact entry points (`exllamav3_ext.exact_rows_caps()`),
+    the rows of an EXL3 linear, of the grouped output projection and of the router projection
+    are launched from one native call each, the router selects for all rows in one launch, and
+    the MoE experts of all rows run in one launch pair with the tile of one row. An extension
+    that reports bit 64 makes the cuBLAS GEMMs of an FP16 linear (`idx.weights_proj`: one per
+    row, since cuBLAS picks its kernel from the whole shape) in one native call; bit 128, the
+    MoE launch with the rows that picked one expert grouped, as in any call, so the shared
+    expert is read once; bit 256, the router's FP32 projection as one launch for the rows;
+  - with `EXL3_INT8_GEMV=0`, where the one-row call of an EXL3 linear or of the grouped output
+    projection is the cooperative FP16 kernel, an extension that reports bit 32 of
+    `exact_rows_caps()` makes ONE launch for the rows instead of one per row, under the launch
+    record of the one-row call (kernel shape, block count, concurrency): with that record
+    fixed the kernel computes a row with the same operations in the same order whatever the
+    row count, so the rows keep their one-row bits (see "Cost");
 - keeps batched what is computed per row whatever the row count: RMS norms, RoPE, the attention
   kernel, the residual update, pool and ring stores, and the hyper-connection mix kernel, which
   takes the column partition of a one-row call;
@@ -1352,6 +1369,11 @@ with DeepSeek-V4.1-Flash); with the Python row loops alone the mode costs 1.6 (K
   verify forward of a process for a linear shape whose one-row launch record the process does
   not hold yet (the one-row launches of that forward load or tune it).
 
+The figures above were measured with one selection, one stream collapse and one compressed
+entry per row and call, the MoE launched slot by slot and the router row by row; the one-pass
+selection, the sums over the rows, the grouped MoE launch and the router's single launch lower
+the cost under both settings, by an amount the probe has to measure on the host.
+
 Generation with a draft returns the tokens of generation without one under either setting; the
 setting changes which one-row arithmetic both have, and the cost. What a verify forward costs on
 a host is what the probe prints there. A verify forward that costs c decode steps is faster than
@@ -1365,10 +1387,16 @@ not reach c - 1, serve the mode without a draft or with a shorter one (`num_draf
 
 The entry points change where and how often the launches are made, not the results. The
 extension counts the calls it served with one launch for their rows
-(`exllamav3_ext.exact_rows_one_launches()`), which the tests and the probe read: both routes
-give the same bits, so nothing else tells them apart. With an extension built before the entry
-points the Python row loops run, and they also run for whatever an entry point does not
-cover: a linear with a LoRA, a scale or a softcap, or under calibration capture; an MoE layer
+(`exllamav3_ext.exact_rows_one_launches()`), the MoE launch pairs it made with the rows grouped
+and the router projections that were one launch (`exllamav3_ext.exact_rows_served(128)` and
+`(256)`), which the tests and the probe read: both routes give the same bits, so nothing else
+tells them apart. The grouped MoE launch rests on the same property of the tensor-core
+instruction as the single launch of a linear and is made on the same GPU types (compute
+capability 8.0, 8.9 and 12.0); elsewhere every slot is launched on its own. With an extension
+built before the entry points the Python row loops run (the one-pass selection, the sums over
+the rows, the compressor and the engram gate need no entry point and run with every extension),
+and they also run for whatever an entry point does not cover: an FP16 linear whose one-row call
+is `torch.matmul` or whose input is zero-padded; a linear with a LoRA, a scale or a softcap, or under calibration capture; an MoE layer
 whose shared expert is not a fused launch inside the decode kernels, or with
 `EXL3_MOE_COOP_KSPLIT` forced beyond what 8 rows fit, or whose expert cache would not look the
 rows up in decode mode (`EXL3_MOE_TIER_DECODE_ROWS` below the row count). An MoE layer that the
@@ -1380,9 +1408,10 @@ result.
 
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported.
 Read once, in Python (`exllamav3.model.math_policy`); the extension does not read it and there is
-no command-line flag. The extension only reports which row-exact entry points it was built with,
-and there is no setting to choose among them: whether the rows of a linear are one launch follows
-from `EXL3_INT8_GEMV` and the GPU type alone.
+no command-line flag. The extension only reports which row-exact entry points and batched forms
+it was built with, and there is no setting to choose among them: Python uses all it reports,
+and whether the rows of a linear are one launch follows from `EXL3_INT8_GEMV` and the GPU type
+alone.
 
 Refused: at import, together with `EXL3_STABLE_ARITHMETIC=1` (that profile replaces the one-row
 arithmetic this mode keeps) or with `EXL3_DSV41_FUSED_COMPRESS`; when the model is built, a
@@ -1400,16 +1429,19 @@ own positions, with or without a draft. A draft model whose verifier parameters 
 prefill a long prompt with other forwards; an n-gram draft does not.
 
 `tools/dsv41_rowprobe.py` measures the mode operation by operation in a real forward (every line
-of its tables reads `=`), and is the only check of the index selection and of the attention
-kernel. `tests/test_dsv41_exact_rows_gpu_.py` checks the other operations one by one on each GPU,
-against one-row calls and, for each row-exact entry point, against the Python row loop, and
-`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation. Both test
-files and the probe are meant to be run under both settings of `EXL3_INT8_GEMV`, on every GPU
-type that serves the model: the single launch rests on the tensor-core instruction computing an
-output row from that row's inputs alone, which the source cannot show and these runs do. The
-extension therefore makes the single launch only on the compute capabilities that have had such
-a run, 8.0, 8.9 and 12.0; every other GPU keeps one launch per row under either setting, sm_86
-among them, where the kernel accumulates in FP16 within a block.
+of its tables reads `=`), and is the only check of the attention kernel.
+`tests/test_dsv41_exact_rows_gpu_.py` checks the other operations one by one on each GPU,
+against one-row calls (the index selection on the pools of real forwards and on crafted ones,
+with its scores) and, for each row-exact entry point, against the Python row loop, and
+`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation and
+checks that the batched forms ran. Both test files and the probe are meant to be run under both
+settings of `EXL3_INT8_GEMV`, on every GPU type that serves the model: the single launch, the
+grouped MoE launch and the one-pass scorer rest on the tensor-core instruction computing an
+output row from that row's inputs alone, and the sums over the rows on the layout of torch's
+reduction, which the engine's source cannot show and these runs do. The extension therefore
+makes the single launch and the grouped MoE launch only on the compute capabilities that have
+had such a run, 8.0, 8.9 and 12.0; every other GPU keeps one launch per row or slot under
+either setting, sm_86 among them, where the kernel accumulates in FP16 within a block.
 
 ```sh
 EXL3_EXACT_ROWS=1 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3

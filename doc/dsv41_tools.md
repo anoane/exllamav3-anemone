@@ -733,11 +733,15 @@ Under `EXL3_EXACT_ROWS=1` (see `doc/env_vars.md`) the tool is that mode's accept
 K-row forward then gives every row of the operations that follow the row count the launch of a
 one-row call, from the extension's row-exact entry points or from Python, one call per row; the
 wrappers follow both, and every in-situ and replay line is expected to read `=`, with bit-equal
-logits; the index selection and the attention kernel have no other test. The tool prints the
-entry points in use and the MoE layers they serve. `--exact-rows-caps MASK` runs with a subset of
-them (a sum of 1 EXL3 linears, 2 grouped `wo_a`, 4 router, 8 MoE experts, 16 hyper-connection
-sums; the MoE needs 4 and 8 together; `0` is the Python row loops alone), which gives the same
-tables and the cost of each step. Bit 32 is not an entry point and cannot be masked: with
+logits; the attention kernel has no other test. The tool prints the entry points in use and the
+MoE layers they serve. `--exact-rows-caps MASK` runs with a subset of them (a sum of 1 EXL3
+linears, 2 grouped `wo_a`, 4 router, 8 MoE experts, 16 hyper-connection sums in the extension,
+64 FP16 linears through the native GEMM, 128 the MoE rows grouped by expert, 256 the router's
+projection as one launch; the MoE needs 4 and 8 together, and 128 and 256 need both; `0` is the
+Python row loops alone), which gives the same tables and the cost of each step. The one-pass
+index selection, the hyper-connection sums over the rows, the compressor and the engram gate are
+Python and have no bit; the timing table prints the grouped MoE launch pairs and the one-launch
+router projections of a K-row forward, and a line the sums that ran over the rows. Bit 32 is not an entry point and cannot be masked: with
 `EXL3_INT8_GEMV=0`, an extension that reports it makes one launch for the rows of an EXL3
 linear and of the grouped `wo_a` inside the entry points of bits 1 and 2, and the timing table
 prints, per K, how many calls of the K-row forward were served that way (`one-launch calls`; 0
