@@ -61,6 +61,8 @@ class DSV41MoE(BlockSparseMLP):
         # before anything of this module is loaded or handed to the CPU worker
         if self.load_guard is not None:
             self.load_guard.check(self.layer_idx, device)
+        if EXACT_ROWS:
+            self._rows_native_layer = None
         super().load(device, **kwargs)
 
     @override
@@ -87,9 +89,15 @@ class DSV41MoE(BlockSparseMLP):
                 return forward_rows(lambda row: one_row(row, params, out_dtype), x)
             return one_row(x, params, out_dtype)
 
-        # (the bound block the answer of rows_native_layer was computed for, the answer): a load
-        # builds a new block, an unload drops it
-        _rows_native_layer = (None, False)
+        # The answer of rows_native_layer for the block as loaded, None until a flagged call asks.
+        # Only the answer is kept, never the block: load and unload both reset it, and the bound
+        # block is built nowhere else
+        _rows_native_layer = None
+
+        @override
+        def unload(self):
+            self._rows_native_layer = None
+            super().unload()
 
         def rows_native_layer(self) -> bool:
             """
@@ -123,10 +131,9 @@ class DSV41MoE(BlockSparseMLP):
             """
             if ROWS_NATIVE & ROWS_NATIVE_MOE != ROWS_NATIVE_MOE:
                 return False
-            bc, layer = self._rows_native_layer
-            if bc is not self.bc:
-                layer = self.rows_native_layer()
-                self._rows_native_layer = (self.bc, layer)
+            layer = self._rows_native_layer
+            if layer is None:
+                layer = self._rows_native_layer = self.rows_native_layer()
             if not layer:
                 return False
             rows = x.numel() // x.shape[-1]
