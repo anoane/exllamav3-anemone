@@ -665,9 +665,12 @@ operation, in the arithmetic of the calling environment. It loads the full model
 run it alone on the host.
 
 After prefilling `--prefix` tokens (default 1200, past the 512-entry threshold of every pool, so
-the top-k selection is active; a short prefix such as 40 probes the dense regime), it runs, for
+the top-512 selection is active; a short prefix such as 40 probes the dense regime), it runs, for
 each row count K of `--rows` (default 2 to 8) and from the same job state, K one-row forwards
-with the generator's decode params and one K-row forward with its verify params. Wrappers around
+with the generator's decode params and one K-row forward with its verify params. The candidate
+stage of the index sources above the candidate source masks nothing until a row sees more than
+`candidate_topk_blocks * candidate_block_size` entries (16,384 on V4.1-Flash), so probing it
+needs a prefix past that and a token source that long. Wrappers around
 the Python methods and native calls of each block and of the head capture every row's inputs and
 outputs in both arms. The state is restored between the arms by the engine's own rewind, the one
 the generator uses to reject draft tokens.
@@ -677,7 +680,10 @@ and row that differ, the count of differing units and elements, the largest abso
 difference, and how many units are an origin: the output differs while every input of the
 operation, the state it reads included, is bit-equal. Then the first diverging operation of the
 forward, the call facts that differ between the arms (mHC chunk count, indexer kernel, attention
-split count), and per row the logits' bit equality, both argmaxes and the top-2 gap.
+split count), and per row the logits' bit equality, both argmaxes and the top-2 gap. A final
+table lists operation by K: `=`, or the first differing layer, as `L3*` when the operation is an
+origin at that layer and as `L3/o20` when it only propagates there and is first an origin at
+layer 20.
 
 The replay table isolates each operation: inside the K-row forward the operation is run again one
 row at a time on the inputs the K-row call had. `=` there means the operation gives a row the
@@ -685,22 +691,43 @@ same bits at 1 and at K rows, whatever differs upstream. For the EXL3 linears a 
 with the int8 GEMV off (`EXL3_INT8_GEMV=0`, set in-process for those calls only) separates the
 int8-versus-FP16 switch from the row buckets of the launch autotuner, and a table lists the
 kernel each linear launches at 1 to 8 rows with its autotune records. `--no-replay` and
-`--no-int8-split` turn these off.
+`--no-int8-split` turn these off. When `EXL3_INT8_GEMV` is not set the tool sets it to 2, the
+value the extension takes when it is unset, before anything is loaded, so that the in-process
+switch only ever replaces an existing variable while other threads run.
 
-Every run checks itself, bit for bit: two unhooked runs agree (determinism), hooked logits equal
-unhooked ones, the one-row arm repeated after the K-row arm equals its first run on every
-captured tensor (the rewind is exact), and the replay run equals the capture run on every
-captured tensor. Exit status 0 means the probe ran and these checks passed, whatever it found;
-1 a check failed; 2 refused.
+Every run checks itself, bit for bit:
 
-The launch autotuner keeps its choices in `coop_autotune_v1.bin` (see `EXLLAMAV3_TUNE_CACHE`).
-By default the tool works on a private copy next to its report (`--tune-cache copy`), so it
-reads the records serving uses and never writes that file; `live` uses the file itself.
+- the unhooked repetitions of each arm agree (`--timing-reps`, default 5), and hooked logits
+  equal unhooked ones;
+- every one-row run equals a reference taken on the state as prefilled, before the first K-row
+  forward of the process: the logits of each run, and every captured tensor of the one-row arm.
+  This is what shows that a K-row forward and its rewind leave nothing behind that a one-row
+  step reads;
+- a K-row forward that follows a K-row forward equals one that follows one-row steps;
+- the one-row arm repeated after the K-row arm equals its first run on every captured tensor,
+  and the replay run equals the capture run on every captured tensor;
+- coverage: every operation the layer facts call for was captured on every row or pool entry
+  of both arms. A gap is printed as `NOT CAPTURED: <operation> on layers ...`; the tables miss
+  that operation there.
+
+Exit status 0 means the probe ran, these checks passed and nothing was missed, whatever it
+found; 1 a check failed or an operation was not captured; 2 refused.
+
+The verify cost is printed per K as the median and the minimum of those repetitions: K one-row
+steps, one K-row forward, and that forward in one-row steps.
+
+The launch autotuner keeps its choices in `coop_autotune_v1.bin` (see `EXLLAMAV3_TUNE_CACHE`),
+and a row bucket with no record there is tuned by timing on its first use. By default the tool
+works on a private copy next to its report (`--tune-cache copy`), removed when the run ends, so
+it reads the records serving uses and never writes that file. Runs that are to be compared
+should share one file, `--tune-cache <path>`: it is created as a copy of the live file when it
+does not exist, and a bucket one run tuned is reused by the next. `live` uses the file itself.
+The records a run added are listed in its report.
 
 `--stable-check` only prints the switches of `exllamav3/model/math_policy.py` as the environment
-sets them, without importing torch. Under `EXL3_STABLE_ARITHMETIC=1` the tool refuses to run
-unless `--allow-stable` is given: every operation should then come out equal, which validates
-the probe.
+sets them, without importing torch, under the profile too. Under `EXL3_STABLE_ARITHMETIC=1` the
+tool refuses to run unless `--allow-stable` is given: every operation should then come out equal,
+which validates the probe.
 
 ```sh
 python tools/dsv41_rowprobe.py --stable-check

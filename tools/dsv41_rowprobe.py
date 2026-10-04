@@ -31,17 +31,26 @@ way: two prefills are separate GPU computations that nothing guarantees to be bi
 rewind keeps the very bytes. It is exact because all V4.1 job state is addressed by position (the
 window ring, the rate-2 carry ring, the engram id ring, the pool entries) and a forward writes
 every row at or above its start position before any row reads it. The tool does not rely on that
-argument: it repeats arm (a) after arm (b) and requires every captured tensor to equal the first
-run (the repeat control). Not restored: the expert cache's policy state and the n-gram row cache,
-which decide where bytes live, not their values.
+argument. Before the first K-row forward it runs the one-row arm on the state as prefilled, twice
+unhooked and once captured (the pristine reference), and it requires every later one-row run to
+equal that reference: the logits of each, and every captured tensor of arm (a). A K-row forward
+that left something behind for a later one-row step to read would fail that check. The K-row arm
+is checked from the other side: a K-row forward that follows a K-row forward must equal one that
+follows one-row steps. Not restored by a rewind: window_beg after a ring shift (the rows keep
+their bytes at another ring offset; reported when it happens), the expert cache's policy state
+and the n-gram row cache, which decide where bytes live, not their values.
 
 Self-checks, all bit-exact, each printed and stored: unhooked run against unhooked run
-(determinism), hooked against unhooked logits (the wrappers change nothing), the repeat control,
-and the replay run against the capture run on every captured tensor (the replays change nothing).
+(determinism), hooked against unhooked logits (the wrappers change nothing), the pristine
+reference against every later one-row run, the repeat control (arm (a) again after arm (b), every
+captured tensor), the replay run against the capture run on every captured tensor (the replays
+change nothing), and coverage: every operation the layer facts call for was captured on every row
+or pool entry, else it is listed as NOT CAPTURED.
 
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
-never written.
+never written. Runs that are to be compared should share one copy (--tune-cache PATH): a row
+bucket the file has no record for is tuned by timing, and two runs can tune it differently.
 
 The whole body runs under main(): exllamav3's CPU-MoE worker is started with multiprocessing
 spawn, which re-imports this file in the child. See doc/dsv41_tools.md.
@@ -55,6 +64,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -86,6 +96,15 @@ POLICY_ENV = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED
               "EXL3_NO_FUSED_RECONSTRUCT", "EXL3_INT8_GEMV", "EXL3_INT8_GEMV_MAX_K", "EXL3_GEMV",
               "EXL3_DSV41_FUSED_COMPRESS", "EXL3_DSV41_NUMERICS", "EXL3_DSV41_XDEV_BF16", "EXL3_MOE_COOP_WIDE",
               "EXL3_MOE_COOP_KSPLIT", "EXL3_MOE_SHARED_COOP", "EXL3_FP32_LOGITS", "EXLLAMAV3_TUNE_CACHE")
+
+# What the extension and Config take when EXL3_INT8_GEMV is not set (exl3_gemv_int8.cu,
+# exl3_gemv_int8_mode; model/config.py): setting it to this value changes nothing
+INT8_GEMV_DEFAULT = "2"
+# Captured on every row of every block, whatever the layer's role
+BLOCK_OPS = ("hc_attn.mix", "attn_norm", "attn.wq_a", "attn.q_norm", "attn.wq_b", "attn.wkv", "attn.kv_norm",
+             "attn.rope", "attn.dsa_attn", "attn.wo_a", "attn.wo_b", "hc_attn.apply",
+             "hc_ffn.mix", "ffn_norm", "moe.router", "moe.out", "hc_ffn.apply")
+HEAD_OPS = ("head.collapse", "norm", "head")
 
 TUNE_MAGIC = b"EX3ATUNE"
 TUNE_FILE = "coop_autotune_v1.bin"
@@ -128,11 +147,13 @@ output, per row count K:
   logits          per row: bit equality, argmax of both arms, the top-2 gap
   replay table    each operation run one row at a time on the K-row call's own inputs, against its
                   K-row result: '=' means the operation gives a row the same bits at 1 and at K rows
-then one table operation x K for the in-situ runs ('=', or the first differing layer, '*' = origin
-there) and one for the replays; the kernel each EXL3 linear takes at 1..8 rows (0 = int8 GEMV,
+then one table operation x K for the in-situ runs ('=', or the first differing layer; 'L3*' the
+operation is an origin at that layer, 'L3/o20' it only propagates there and is first an origin at
+layer 20) and one for the replays; the kernel each EXL3 linear takes at 1..8 rows (0 = int8 GEMV,
 90 = FP16 GEMV, 1..4 = cooperative kernel shape) with its autotune records; and the self-checks.
-exit status: 0 the probe ran and its self-checks passed (whatever it found), 1 a self-check failed
-or the run broke, 2 refused.
+exit status: 0 the probe ran, its self-checks passed and every expected operation was captured
+(whatever it found), 1 a self-check failed, an operation was not captured or the run broke,
+2 refused.
 
 examples:
   python3 tools/dsv41_rowprobe.py --stable-check
@@ -151,8 +172,11 @@ examples:
     ap.add_argument("--text-file", default = None, help = "token source instead of --ref: this file's text, with BOS")
     ap.add_argument("--prefix", type = int, default = 1200,
                     help = "tokens prefilled before the probed rows (default 1200: every compressed pool is past "
-                           "its 512-entry threshold, so the top-k selection is active; a short prefix such as 40 "
-                           "probes the dense regime)")
+                           "its 512-entry threshold, so the top-512 selection is active; a short prefix such as "
+                           "40 probes the dense regime). The candidate stage of the index sources above the "
+                           "candidate source masks nothing until a row sees more than candidate_topk_blocks * "
+                           "candidate_block_size entries (2048 * 8 = 16384 on V4.1-Flash): probing it needs a "
+                           "prefix past that, e.g. 19000")
     ap.add_argument("--rows", default = "2,3,4,5,6,7,8", help = f"row counts K to probe, each 2..{MAX_ROWS}")
     ap.add_argument("--visible", default = None, help = "CUDA_VISIBLE_DEVICES, with CUDA_DEVICE_ORDER=PCI_BUS_ID")
     ap.add_argument("--placement", default = None, help = "explicit placement (EXL3_PLACEMENT rules)")
@@ -171,10 +195,15 @@ examples:
                            "switch of the EXL3 linears from the row buckets of the launch autotuner) and the "
                            "kernel tags")
     ap.add_argument("--no-repeat", action = "store_true", help = "skip the repeat control (arm (a) run again)")
+    ap.add_argument("--timing-reps", type = int, default = 5,
+                    help = "unhooked repetitions of both arms per K (default 5, at least 2): all must agree bit "
+                           "for bit, and the verify cost is reported as their median and minimum")
     ap.add_argument("--tune-cache", default = "copy", metavar = "copy|live|PATH",
                     help = "launch-autotune cache the extension uses: 'copy' (default) a private copy of the live "
-                           "file, so the probe reads serving's records and never writes that file; 'live' the "
-                           "file itself; or a path")
+                           "file, removed when the run ends, so the probe reads serving's records and never "
+                           "writes that file; 'live' the file itself; or a path, created as a copy of the live "
+                           "file when it does not exist and kept, so that several runs share the records one of "
+                           "them tuned")
     ap.add_argument("--stable-check", action = "store_true",
                     help = "only print which switches of exllamav3/model/math_policy.py are on; no torch, no CUDA")
     ap.add_argument("--allow-stable", action = "store_true",
@@ -271,24 +300,31 @@ def _sha256(path) -> str | None:
         return None
 
 
-def prepare_tune_cache(mode: str, out: str) -> dict:
-    """Decide the autotune cache of this run; 'env' is the EXLLAMAV3_TUNE_CACHE value to set, or None."""
+def prepare_tune_cache(mode: str, out: str) -> tuple[dict, dict]:
+    """Decide the autotune cache of this run: (info, the records the file holds before the run).
+    info['env'] is the EXLLAMAV3_TUNE_CACHE value to set, or None."""
     live = tune_cache_live_path()
-    info = {"mode": mode, "live_path": live, "live_sha256": _sha256(live), "live_records": len(read_tune_cache(live)),
-            "used_path": live, "env": None}
-    if mode == "live":
-        return info
-    if mode == "copy":
-        used = os.path.join(os.path.dirname(os.path.abspath(out)), f"rowprobe-autotune-{os.getpid()}.bin")
-        os.makedirs(os.path.dirname(used), exist_ok = True)
-        if live and os.path.isfile(live):
+    live_records = read_tune_cache(live)
+    info = {"mode": mode, "live_path": live, "live_sha256": _sha256(live), "live_records": len(live_records),
+            "used_path": live, "env": None, "private": False, "seeded_from_live": False}
+    if mode != "live":
+        if mode == "copy":
+            used = os.path.join(os.path.dirname(os.path.abspath(out)), f"rowprobe-autotune-{os.getpid()}.bin")
+            os.makedirs(os.path.dirname(used), exist_ok = True)
+            if os.path.exists(used):
+                os.unlink(used)
+            info["private"] = True
+        else:
+            used = os.path.join(mode, TUNE_FILE) if os.path.isdir(mode) else mode
+        if not os.path.exists(used) and live and os.path.isfile(live):
             shutil.copyfile(live, used)
-        elif os.path.exists(used):
-            os.unlink(used)
-    else:
-        used = os.path.join(mode, TUNE_FILE) if os.path.isdir(mode) else mode
-    info["used_path"] = info["env"] = used
-    return info
+            info["seeded_from_live"] = True
+        info["used_path"] = info["env"] = used
+    # what the file holds before this run, and which of it the live file lacks (earlier probe runs tuned it)
+    before = read_tune_cache(info["used_path"])
+    info["records_before"] = len(before)
+    info["carried_over"] = {f"{k:016x}": list(v) for k, v in before.items() if k not in live_records}
+    return info, before
 
 
 def _autotune_version() -> int:
@@ -393,17 +429,19 @@ def _op_index(op: str) -> float:
 
 class _Int8Off:
     """EXL3_INT8_GEMV=0 for the launches inside: the extension reads the variable on every launch
-    (exl3_gemv_int8.cu, exl3_gemv_int8_mode), so the switch can be flipped in-process."""
+    (exl3_gemv_int8.cu, exl3_gemv_int8_mode), so the switch can be flipped in-process.
+
+    Other threads are alive by then (the RAM watchdog, the engram prefetch executor, the expert
+    tier's workers) and native code calls getenv at run time, so the variable is never added or
+    removed here, only replaced: run_gpu sets it to its default before any thread starts, and a
+    replaced value leaves the environment array as it is."""
 
     def __enter__(self):
-        self.old = os.environ.get("EXL3_INT8_GEMV")
+        self.old = os.environ.get("EXL3_INT8_GEMV", INT8_GEMV_DEFAULT)
         os.environ["EXL3_INT8_GEMV"] = "0"
 
     def __exit__(self, *exc):
-        if self.old is None:
-            os.environ.pop("EXL3_INT8_GEMV", None)
-        else:
-            os.environ["EXL3_INT8_GEMV"] = self.old
+        os.environ["EXL3_INT8_GEMV"] = self.old
         return False
 
 
@@ -461,6 +499,7 @@ class Probe:
         self.layers = {}
         self.linears = {}
         self.n_layers = 0
+        self.fused_compress = False
 
     # -- bookkeeping --
 
@@ -591,6 +630,8 @@ class Probe:
         from exllamav3.modules import dsv41 as m_dsv41, dsv41_cached as m_cached
         from exllamav3.modules.attention_fn import dsa_triton as m_triton
         from exllamav3.architecture.dsv41 import compressor as m_comp
+        from exllamav3.cache.dsv41 import FUSED_COMPRESS
+        self.fused_compress = bool(FUSED_COMPRESS)      # which carry rings the layer states were built with
         model = self.model
         self.n_layers = n = model.config.num_hidden_layers
         blocks = model.modules[model.first_block_idx: model.first_block_idx + n]
@@ -603,6 +644,9 @@ class Probe:
                 "device": str(b.device), "compress_ratio": at.compress_ratio, "kv_source": at.kv_source_layer,
                 "index_source": at.index_source_layer, "is_kv_source": bool(at.is_kv_source),
                 "is_index_source": bool(at.is_index_source), "engram": b.engram is not None,
+                "index_topk": getattr(at, "index_topk", None),
+                "comp_gate": at.compressor is not None and at.compressor.wgate is not None,
+                "owns_index_k": at.indexer is not None and at.indexer.wk is not None,
                 "moe_bc": getattr(b.mlp, "bc", None) is not None,
                 "sh_coop": getattr(getattr(b.mlp, "bc", None), "sh_coop", None),
                 "expert_cache": getattr(b.mlp, "tier", None) is not None,
@@ -1342,15 +1386,17 @@ def _run_keys(*runs):
     return sorted(keys, key = lambda k: (k[1] if k[1] is not None else -1, _op_index(k[0]), k[0]))
 
 
-def same_runs(torch, x: Run, y: Run) -> dict:
-    """Two runs of the SAME arm must agree on every captured tensor: {'equal', 'tensors', 'first'}."""
+def same_runs(torch, x: Run, y: Run, subset: bool = False) -> dict:
+    """Two runs of the SAME arm must agree on every captured tensor: {'equal', 'tensors', 'first'}.
+    With subset, y ran fewer steps than x: every tensor of y must be in x and equal."""
     first, total, bad = None, 0, 0
-    for key in _run_keys(x, y):
+    for key in _run_keys(y) if subset else _run_keys(x, y):
         ex, ey = x.rec.get(key), y.rec.get(key)
         ux, uy = (ex["units"] if ex else {}), (ey["units"] if ey else {})
-        for u in sorted(set(ux) | set(uy)):
+        for u in sorted(uy if subset else set(ux) | set(uy)):
             for side in ("in", "out"):
-                names = set(ux.get(u, {}).get(side, {})) | set(uy.get(u, {}).get(side, {}))
+                names = set(uy[u][side]) if subset else \
+                    set(ux.get(u, {}).get(side, {})) | set(uy.get(u, {}).get(side, {}))
                 for name in sorted(names):
                     total += 1
                     a, b = ux.get(u, {}).get(side, {}).get(name), uy.get(u, {}).get(side, {}).get(name)
@@ -1492,6 +1538,78 @@ def compare_arms(torch, a: Run, b: Run, probe: Probe) -> dict:
     return {"rows": ordered, "first": first, "origins": origins, "dispatch": dispatch}
 
 
+def expected_units(probe: Probe, forwards) -> dict:
+    """
+    {(op, layer): units} the wrappers should capture over the forwards [(pos0, rows), ...] of one
+    arm, from the layer facts, as the cached path runs them (modules/dsv41.py, _forward_cached_row
+    and _compress_store; modules/dsv41_block.py, DSV41Block.forward): the block operations on
+    every row, the engram's on its layers, a kv source's projections on every row and its pooling,
+    index keys and store on the entries [pos0 // m, (pos0 + rows) // m) the forward closes, and an
+    index source's selection on every row of a forward whose pool passes index_topk entries.
+    The ablations of EXL3_DSV41_ABLATE are not modelled.
+    """
+    exp = {}
+
+    def add(op, L, units):
+        if units:
+            exp.setdefault((op, L), set()).update(units)
+
+    for pos0, rows in forwards:
+        row_units = range(pos0, pos0 + rows)
+        for L, info in probe.layers.items():
+            for op in BLOCK_OPS:
+                add(op, L, row_units)
+            if info["engram"]:
+                for op in ("engram.wkv", "engram.gate", "engram.out"):
+                    add(op, L, row_units)
+            m = info["compress_ratio"] or 0
+            if m and info["is_kv_source"]:
+                add("comp.wkv", L, row_units)
+                if info["comp_gate"]:
+                    add("comp.wgate", L, row_units)
+                entries = range(pos0 // m, (pos0 + rows) // m)
+                if m > 1 and probe.fused_compress:
+                    add("comp.fused", L, entries)
+                else:
+                    if m > 1:
+                        add("comp.pool", L, entries)
+                    add("comp.norm", L, entries)
+                if info["owns_index_k"]:
+                    add("idx.wk", L, entries)
+                    add("idx.k_norm", L, entries)
+                add("pool.store", L, entries)
+            if m and info["is_index_source"] and info["index_topk"] is not None \
+                    and (pos0 + rows) // m > info["index_topk"]:
+                for op in ("idx.wq_b", "idx.weights_proj", "idx.scores", "idx.topk"):
+                    add(op, L, row_units)
+        for op in HEAD_OPS:
+            add(op, probe.n_layers, row_units)
+    return exp
+
+
+def coverage(probe: Probe, arms) -> dict:
+    """
+    arms: [(name, run, forwards)]. What expected_units calls for and the run did not capture, the
+    same gap on several layers folded: {'complete', 'missing': [{op, arm, layers, units}]}. The
+    grouped output projection counts as captured through ext.exl3_mgemm (attn.wo_a) or through
+    its per-group linears (attn.wo_a.g<n>), whichever the engine took.
+    """
+    folded = {}
+    for name, run, forwards in arms:
+        for (op, L), units in expected_units(probe, forwards).items():
+            got = set()
+            for (o, l), ent in run.rec.items():
+                if l == L and (o == op or (op == "attn.wo_a" and o.startswith("attn.wo_a."))):
+                    got |= set(ent["units"])
+            gap = len(units - got)
+            if gap:
+                ent = folded.setdefault((op, name), {"op": op, "arm": name, "layers": [], "units": 0})
+                ent["layers"].append(L)
+                ent["units"] += gap
+    missing = sorted(folded.values(), key = lambda e: (_op_index(e["op"]), e["op"], e["arm"]))
+    return {"complete": not missing, "missing": missing}
+
+
 def logits_rows(torch, la, lb, P: int) -> list:
     """Per row: bit equality of the logits, both argmaxes and the gap between the two best logits."""
     out = []
@@ -1603,9 +1721,24 @@ def print_replay(rep: dict, K: int, n_layers: int):
 def print_table(title: str, table: dict, ks: list):
     print(f"\n{title}")
     width = max([len(s) for s in table] + [16])
-    print(f"   {'operation:output':<{width}} " + " ".join(f"{'K=' + str(k):>6}" for k in ks))
+    col = max([6] + [len(cell) for row in table.values() for cell in row.values()])
+    print(f"   {'operation:output':<{width}} " + " ".join(f"{'K=' + str(k):>{col}}" for k in ks))
     for label in sorted(table, key = lambda s: (_op_index(s.split(":")[0]), s)):
-        print(f"   {label:<{width}} " + " ".join(f"{table[label].get(k, '.'):>6}" for k in ks))
+        print(f"   {label:<{width}} " + " ".join(f"{table[label].get(k, '.'):>{col}}" for k in ks))
+
+
+def insitu_cell(row: dict, n_layers: int) -> str:
+    """Cell of the in-situ operation x K table: '=', or the first differing layer; '*' when the
+    operation is an origin AT that layer, '/o<layer>' when its first origin is at another one."""
+    if row["equal"]:
+        return "="
+    cell = _layer_name(row["first_diff"]["layer"], n_layers)
+    origin = row["first_origin"]
+    if origin is None:
+        return cell
+    if origin["layer"] == row["first_diff"]["layer"]:
+        return cell + "*"
+    return f"{cell}/o{_layer_name(origin['layer'], n_layers).lstrip('L')}"
 
 
 def print_kernel_tags(tags: dict, records: dict, version: int) -> dict:
@@ -1757,9 +1890,27 @@ def run_gpu(val, args, policy: dict, ks: list, out: str) -> int:
         env["CUDA_VISIBLE_DEVICES"] = args.visible
     if args.placement is not None:
         env["EXL3_PLACEMENT"] = args.placement
-    tune = prepare_tune_cache(args.tune_cache, out)
+    tune, tune_before = prepare_tune_cache(args.tune_cache, out)
+    try:
+        return _run_gpu(val, args, ks, out, report, env, tune, tune_before)
+    finally:
+        if tune["private"]:
+            # the private copy: what this run added to it is in the report
+            try:
+                os.unlink(tune["used_path"])
+            except OSError:
+                pass
+
+
+def _run_gpu(val, args, ks: list, out: str, report: dict, env: dict, tune: dict, tune_before: dict) -> int:
     if tune["env"]:
         env["EXLLAMAV3_TUNE_CACHE"] = tune["env"]
+    int8_pinned = not args.no_int8_split and "EXL3_INT8_GEMV" not in os.environ
+    if int8_pinned:
+        # Before any thread exists: the int8 split flips this variable in-process later, and
+        # replacing a value leaves the environment array alone where adding or removing one
+        # would move it under a concurrent getenv (see _Int8Off)
+        env["EXL3_INT8_GEMV"] = INT8_GEMV_DEFAULT
     if "torch" in sys.modules and "CUDA_VISIBLE_DEVICES" in env:
         print("WARNING torch was imported before the device environment was applied")
     os.environ.update(env)
@@ -1770,8 +1921,20 @@ def run_gpu(val, args, policy: dict, ks: list, out: str) -> int:
 
     shown = {k: os.environ[k] for k in tuple(val.REPORT_ENV) + ("EXLLAMAV3_TUNE_CACHE",) if k in os.environ}
     print(f"environment: {shown}", flush = True)
-    print(f"autotune cache: {tune['mode']}: {tune['used_path']} (live file {tune['live_path']}, "
-          f"{tune['live_records']} records)", flush = True)
+    if int8_pinned:
+        print(f"  EXL3_INT8_GEMV was not set: set to {INT8_GEMV_DEFAULT}, the value the extension takes when it "
+              f"is unset, so that the int8 split only ever replaces it", flush = True)
+    print(f"autotune cache: {tune['mode']}: {tune['used_path']}"
+          f"{' (created as a copy of the live file)' if tune['seeded_from_live'] else ''}, "
+          f"{tune['records_before']} records; live file {tune['live_path']}, {tune['live_records']} records",
+          flush = True)
+    if tune["mode"] == "live":
+        print("  the live file is in use: a row bucket it has no record for is tuned by this run and WRITTEN to it",
+              flush = True)
+    if tune["carried_over"]:
+        print(f"  {len(tune['carried_over'])} record(s) of this cache are not in the live file (tuned by earlier "
+              f"probe runs on it): " + " ".join(sorted(tune["carried_over"])[:16])
+              + (" ..." if len(tune["carried_over"]) > 16 else ""), flush = True)
 
     P, kmax = args.prefix, max(ks)
     t0 = time.time()
@@ -1825,11 +1988,13 @@ def run_gpu(val, args, policy: dict, ks: list, out: str) -> int:
                                    for i in range(torch.cuda.device_count())]},
         "placement": {d: [keys[0], keys[-1], len(keys)] for d, keys in devs.items()},
         "tokens": {"source": source, "prefix": P, "probed_ids": ids[P:]},
-        "restore": "engine rewind (DSV41State.rewind) on one job state, verified by the repeat control",
+        "restore": "engine rewind (DSV41State.rewind) on one job state, verified against a reference taken before "
+                   "any K-row forward",
     })
 
     with torch.inference_mode():
-        ok = _probe(torch, ext, val, args, model, cache, ids, ks, min(args.prefill_chunk or 2048, chunk), report, tune)
+        ok = _probe(torch, ext, val, args, model, cache, ids, ks, min(args.prefill_chunk or 2048, chunk), report,
+                    tune, tune_before)
     report["ok"] = ok
     report["status"] = "completed"
     val._write(out, _jsonable(report))
@@ -1837,49 +2002,94 @@ def run_gpu(val, args, policy: dict, ks: list, out: str) -> int:
     return 0 if ok else 1
 
 
-def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, tune) -> bool:
-    P = args.prefix
+def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, tune, tune_before) -> bool:
+    P, kmax = args.prefix, max(ks)
     drv = Driver(torch, val, model, cache, ids, P)
     t0 = time.time()
     drv.prefill(prefill_chunk)
     st = drv.state
+    window_beg = st.window_beg
     print(f"prefilled {P} tokens in {time.time() - t0:.1f}s (chunks of {prefill_chunk}); window_beg "
-          f"{st.window_beg}, rollback capacity {st.rollback_capacity()}", flush = True)
-    report["state"] = {"position": P, "window_beg": st.window_beg, "rollback_capacity": st.rollback_capacity()}
+          f"{window_beg}, rollback capacity {st.rollback_capacity()}", flush = True)
+    report["state"] = {"position": P, "window_beg": window_beg, "rollback_capacity": st.rollback_capacity()}
     eq = lambda a, b: diff_stats(torch, a, b)["equal"]
+    stable = report["arithmetic"]["stable_arithmetic"]
 
-    # Unhooked runs first, on the engine as it is: a warm-up (the launch autotuner times a row
-    # bucket on its first use), then two runs of each arm for the determinism check and timing
-    plain, timing = {}, {}
+    # The pristine reference: the one-row arm on the state as prefilled, before this process has
+    # run any K-row verify forward. Twice unhooked (the first use of a launch bucket may be the
+    # autotuner's timing run, so the second is the reference), then once captured, through
+    # wrappers that are removed again. Every later one-row run must equal it
+    first = drv.one_row(kmax)
+    drv.rewind(kmax)
+    ref = drv.one_row(kmax)
+    drv.rewind(kmax)
+    probe0 = Probe(torch, ext, model, P, replay_int8 = False, stable = stable)
+    drv.probe = probe0
+    probe0.install()
+    try:
+        probe0.mode = "capture"
+        A0 = Run("one-row, before any K-row forward")
+        drv.one_row(kmax, A0)
+        drv.rewind(kmax)
+    finally:
+        probe0.uninstall()
+        drv.probe = None
+    pristine = {"first_use_equals_second": eq(first, ref), "captured_equals_unhooked": eq(A0.logits, ref)}
+    del first
+    report["pristine"] = pristine
+    print(f"pristine reference: {kmax} one-row steps before any K-row forward; captured run equals the unhooked "
+          f"one: {'yes' if pristine['captured_equals_unhooked'] else 'NO'}", flush = True)
+    if not pristine["first_use_equals_second"]:
+        print("   note: the FIRST one-row run of this process differs from the second, so a first use (the launch "
+              "autotuner timing a bucket, a kernel compile) changes one-row results; the second run is the reference",
+              flush = True)
+    ok = pristine["captured_equals_unhooked"]
+
+    # Unhooked K-row runs, on the engine as it is: a warm-up (the launch autotuner times a row
+    # bucket on its first use), then one that directly follows a K-row forward and its rewind,
+    # for the check that a K-row forward does not depend on which arm ran before it
+    after_k = {}
     for K in ks:
-        drv.one_row(K)
-        drv.rewind(K)
         drv.multi(K)
         drv.rewind(K)
+        after_k[K] = drv.multi(K)
+        drv.rewind(K)
+    # then both arms alternating, --timing-reps times: determinism and the verify cost
+    reps = max(2, args.timing_reps)
+    plain, det, timing = {}, {}, {}
     for K in ks:
-        runs = []
-        for _ in range(2):
+        ta, tb = [], []
+        det[K] = {"one_row": True, "k_row": True, "runs": reps}
+        for i in range(reps):
             t = time.perf_counter()
             la = drv.one_row(K)
-            ta = time.perf_counter() - t
+            ta.append(time.perf_counter() - t)
             drv.rewind(K)
             t = time.perf_counter()
             lb = drv.multi(K)
-            tb = time.perf_counter() - t
+            tb.append(time.perf_counter() - t)
             drv.rewind(K)
-            runs.append((la, lb, ta, tb))
-        plain[K] = runs
-        timing[K] = {"one_row_steps_ms": round(1e3 * runs[1][2], 2), "k_row_forward_ms": round(1e3 * runs[1][3], 2),
-                     "k_row_over_one_step": round(runs[1][3] / (runs[1][2] / K), 2)}
-    print("timing, unhooked (second run): K: K one-row steps / one K-row forward [ms], K-row forward in one-row steps")
+            if i == 0:
+                plain[K] = (la, lb)
+            else:
+                det[K]["one_row"] &= eq(la, plain[K][0])
+                det[K]["k_row"] &= eq(lb, plain[K][1])
+        ma, mb = statistics.median(ta), statistics.median(tb)
+        timing[K] = {"reps": reps,
+                     "one_row_steps_ms": {"median": round(1e3 * ma, 2), "min": round(1e3 * min(ta), 2)},
+                     "k_row_forward_ms": {"median": round(1e3 * mb, 2), "min": round(1e3 * min(tb), 2)},
+                     "k_row_over_one_step": {"median": round(mb / (ma / K), 2),
+                                             "min": round(min(tb) / (min(ta) / K), 2)}}
+    print(f"timing, unhooked, {reps} repetitions, median [minimum]: K one-row steps, one K-row forward, and that "
+          f"forward in one-row steps (wall clock around forward and logits copy; other load on the host shows)")
     for K in ks:
         t = timing[K]
-        print(f"   K={K}: {t['one_row_steps_ms']:.1f} / {t['k_row_forward_ms']:.1f}   {t['k_row_over_one_step']:.2f}x",
-              flush = True)
+        print(f"   K={K}: {t['one_row_steps_ms']['median']:.1f} [{t['one_row_steps_ms']['min']:.1f}] ms"
+              f" / {t['k_row_forward_ms']['median']:.1f} [{t['k_row_forward_ms']['min']:.1f}] ms"
+              f"   {t['k_row_over_one_step']['median']:.2f}x [{t['k_row_over_one_step']['min']:.2f}x]", flush = True)
     report["timing"] = timing
 
-    probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split,
-                  stable = report["arithmetic"]["stable_arithmetic"])
+    probe = Probe(torch, ext, model, P, replay_int8 = not args.no_int8_split, stable = stable)
     drv.probe = probe
     probe.install()
     print(f"wrapped {len(probe.patches)} methods and calls", flush = True)
@@ -1887,11 +2097,11 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     report["layers"] = probe.layers
     report["linears"] = probe.linears
     report["k"], report["table"] = {}, {"insitu": {}, "replay": {}}
-    ok = True
+    covered = True
     try:
         for K in ks:
-            la0, lb0 = plain[K][0][0], plain[K][0][1]
-            checks = {"deterministic_unhooked": {"one_row": eq(la0, plain[K][1][0]), "k_row": eq(lb0, plain[K][1][1])}}
+            la0, lb0 = plain[K]
+            checks = {"deterministic_unhooked": det[K]}
             probe.replays, probe.notes = {}, []
             probe.mode = "capture"
             A, B = Run("one-row"), Run(f"{K}-row")
@@ -1900,11 +2110,17 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
             drv.multi(K, B)
             drv.rewind(K)
             checks["hooks_change_nothing"] = {"one_row": eq(A.logits, la0), "k_row": eq(B.logits, lb0)}
+            # every one-row run so far followed K-row forwards; the reference followed none
+            pr = {"unhooked": eq(la0, ref[:K]), "captured": eq(A.logits, ref[:K]),
+                  "tensors": same_runs(torch, A0, A, subset = True)}
+            checks["pristine_equals_post_multi"] = pr
+            checks["k_row_after_k_row_equals_after_one_row"] = eq(after_k[K], lb0)
             if not args.no_repeat:
                 A2 = Run("one-row, repeated")
                 drv.one_row(K, A2)
                 drv.rewind(K)
                 checks["repeat_control"] = same_runs(torch, A, A2)
+                pr["repeat"] = eq(A2.logits, ref[:K])
                 del A2
             if not args.no_replay:
                 probe.mode = "replay"
@@ -1914,6 +2130,8 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
                 checks["replays_change_nothing"] = dict(same_runs(torch, B, B2), logits = eq(B2.logits, lb0))
                 del B2
             probe.mode = None
+            checks["coverage"] = coverage(probe, [("one-row", A, [(P + r, 1) for r in range(K)]),
+                                                  (f"{K}-row", B, [(P, K)])])
             cmp = compare_arms(torch, A, B, probe)
             lrows = logits_rows(torch, A.logits, B.logits, P)
             print_insitu(cmp, K, P, n_layers)
@@ -1924,9 +2142,9 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
                 print(f"   note: {n}")
             good = _print_checks(checks, K)
             ok &= good
+            covered &= checks["coverage"]["complete"]
             for row in cmp["rows"]:
-                cell = "=" if row["equal"] else _layer_name(row["first_diff"]["layer"], n_layers) + ("*" if row["origin"] else "")
-                report["table"]["insitu"].setdefault(row["label"], {})[K] = cell
+                report["table"]["insitu"].setdefault(row["label"], {})[K] = insitu_cell(row, n_layers)
             for label, d in probe.replays.items():
                 report["table"]["replay"].setdefault(label, {})[K] = \
                     "=" if not d["rows_diff"] else _layer_name(d["first"]["layer"], n_layers)
@@ -1938,16 +2156,21 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
             gc.collect()
     finally:
         probe.uninstall()
+        drv.probe = None
     # the engine as it was: one more unhooked run of the widest K must still give the first logits
+    # and the pristine ones
     K = ks[-1]
     la = drv.one_row(K)
     drv.rewind(K)
-    after = eq(la, plain[K][0][0])
-    ok &= after
+    after = {"equals_first_unhooked": eq(la, plain[K][0]), "equals_pristine": eq(la, ref[:K])}
+    ok &= all(after.values())
     report["unhooked_after"] = after
+    report["state"]["window_beg_after"] = st.window_beg
     cache.release_state(drv.state)
+    del A0
 
-    print_table("in-situ: operation x K -> '=' or the first differing layer ('*': an origin there, '.': not captured)",
+    print_table("in-situ: operation x K -> '=' or the first differing layer ('L3*': an origin at that layer, "
+                "'L3/o20': propagated there, first an origin at layer 20; '.': not captured)",
                 report["table"]["insitu"], ks)
     if report["table"]["replay"]:
         print_table("replay: operation x K -> '=' when one row at a time gives the K-row call's bits on the same inputs, "
@@ -1955,41 +2178,68 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     records = read_tune_cache(tune["used_path"])
     report["kernel_tags"] = print_kernel_tags(probe.tags, records, _autotune_version())
     tune["records_after"] = len(records)
-    if tune["mode"] == "copy":
-        before = read_tune_cache(tune["live_path"])
-        added = {f"{k:016x}": list(v) for k, v in records.items() if k not in before}
-        tune["added_by_this_run"] = added
-        if added:
-            print(f"   this run added {len(added)} autotune record(s) to its private cache: launches the live "
-                  f"cache holds no record for (the replays with the int8 GEMV off among them)")
-    report["errors"] = probe.errors
-    for e in probe.errors:
+    added = {f"{k:016x}": list(v) for k, v in records.items() if tune_before.get(k) != v}
+    tune["added_by_this_run"] = added
+    if added:
+        where = {"copy": "its private cache", "live": "the LIVE cache"}.get(tune["mode"], "the cache of --tune-cache")
+        print(f"   this run added {len(added)} autotune record(s) to {where}: launches it held no record for "
+              f"(the replays with the int8 GEMV off among them): " + " ".join(sorted(added)[:16])
+              + (" ..." if len(added) > 16 else ""))
+    report["errors"] = probe0.errors + [e for e in probe.errors if e not in probe0.errors]
+    for e in report["errors"]:
         print(f"ERROR in the probe's own code (the forward was not affected): {e}")
-    print(f"\nunhooked run after the probe equals the first unhooked run: {'yes' if after else 'NO'}")
+    if st.window_beg != window_beg:
+        print(f"\nnote: the window ring shifted during the probe (window_beg {window_beg} -> {st.window_beg}); a "
+              f"rewind keeps the shifted ring, so later runs read the same rows at another ring offset")
+    print(f"\nunhooked run after the probe equals the first unhooked run: "
+          f"{'yes' if after['equals_first_unhooked'] else 'NO'}, the pristine reference: "
+          f"{'yes' if after['equals_pristine'] else 'NO'}")
     print("self-checks: " + ("all passed" if ok else "FAILED (see the K sections): a difference reported above "
                                                      "may then not be due to the row count"))
-    return ok and not probe.errors
+    print("coverage: " + ("every expected operation was captured on every row and pool entry" if covered else
+                          "INCOMPLETE (see the NOT CAPTURED lines): the tables miss those operations there. The "
+                          "expected set follows the layer facts (expected_units); check it against the engine "
+                          "before trusting either"))
+    report["coverage_complete"] = covered
+    return ok and covered and not report["errors"]
 
 
 def _print_checks(checks: dict, K: int) -> bool:
+    """Print the self-checks of one K; True when the validity checks passed. Coverage is printed
+    here and counted by the caller: a gap makes the map incomplete, not a reported difference wrong."""
+    yn = lambda v: "yes" if v else "NO"
     det, hook = checks["deterministic_unhooked"], checks["hooks_change_nothing"]
-    good = all(det.values()) and all(hook.values())
-    line = [f"deterministic unhooked: one-row {'yes' if det['one_row'] else 'NO'}, K-row {'yes' if det['k_row'] else 'NO'}",
-            f"hooked logits equal unhooked: one-row {'yes' if hook['one_row'] else 'NO'}, "
-            f"K-row {'yes' if hook['k_row'] else 'NO'}"]
-    for name, text in (("repeat_control", "repeat of the one-row arm equal on every tensor"),
-                       ("replays_change_nothing", "replay run equal to the capture run on every tensor")):
-        c = checks.get(name)
-        if c is None:
-            continue
+    pr, pred = checks["pristine_equals_post_multi"], checks["k_row_after_k_row_equals_after_one_row"]
+    good = det["one_row"] and det["k_row"] and all(hook.values()) and pred
+    line = [f"deterministic unhooked ({det['runs']} runs): one-row {yn(det['one_row'])}, K-row {yn(det['k_row'])}",
+            f"hooked logits equal unhooked: one-row {yn(hook['one_row'])}, K-row {yn(hook['k_row'])}",
+            f"K-row forward after a K-row forward equals one after one-row steps: {yn(pred)}"]
+
+    def tensors(c) -> tuple[bool, str]:
         passed = c["equal"] and c.get("logits", True)
-        good &= passed
         where = ""
         if not passed and c["first"] is not None:
             f = c["first"]
             where = f" (first: {f['op']} L{f['layer']} unit {f['unit']} {f['side']} {f['name']}; {c['differing']} of {c['tensors']})"
-        line.append(f"{text}: {'yes' if passed else 'NO'}{where}")
+        return passed, f"{yn(passed)}{where}"
+
+    passed, text = tensors(pr["tensors"])
+    logits = [f"{name} {yn(pr[name])}" for name in ("unhooked", "captured", "repeat") if name in pr]
+    good &= passed and all(pr[name] for name in ("unhooked", "captured", "repeat") if name in pr)
+    line.append(f"one-row arm equals the pristine reference (taken before any K-row forward): logits "
+                f"{', '.join(logits)}; every captured tensor {text}")
+    for name, label in (("repeat_control", "repeat of the one-row arm equal on every tensor"),
+                        ("replays_change_nothing", "replay run equal to the capture run on every tensor")):
+        c = checks.get(name)
+        if c is None:
+            continue
+        passed, text = tensors(c)
+        good &= passed
+        line.append(f"{label}: {text}")
     print(f"   self-checks K = {K}: " + "; ".join(line))
+    for miss in checks["coverage"]["missing"]:
+        where = "the head" if miss["op"] in HEAD_OPS else f"layers {_ranges(miss['layers'])}"
+        print(f"   NOT CAPTURED: {miss['op']} on {where} in the {miss['arm']} arm ({miss['units']} units)")
     return good
 
 
@@ -2004,12 +2254,12 @@ def main(argv = None) -> int:
         print(f"math policy: {error}")
         return 2
     print_policy(policy)
+    if args.stable_check:
+        return 0                        # it only shows the switches, in whatever environment
     if policy["stable_arithmetic"] and not args.allow_stable:
         print("refused: EXL3_STABLE_ARITHMETIC=1 is set. This probe measures the default arithmetic; pass "
               "--allow-stable to probe the profile (every operation should then come out equal)")
         return 2
-    if args.stable_check:
-        return 0
     if not args.model:
         print("no model: pass --model or set DSV41_MODEL_DIR")
         return 2
@@ -2030,6 +2280,9 @@ def main(argv = None) -> int:
         if value is not None and value < (0 if name == "prefix" else 1):
             print(f"--{name.replace('_', '-')} must be {'nonnegative' if name == 'prefix' else 'positive'}")
             return 2
+    if args.timing_reps < 2:
+        print("--timing-reps must be at least 2: the determinism check compares the repetitions")
+        return 2
     if args.tune_cache not in ("copy", "live") and not os.path.isdir(os.path.dirname(os.path.abspath(args.tune_cache))):
         print(f"--tune-cache {args.tune_cache}: no such directory")
         return 2
