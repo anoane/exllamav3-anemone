@@ -753,11 +753,20 @@ int exl3_mgemm_rows
     bool mul1
 )
 {
+    // Everything a row's launch reads through a raw pointer is checked here, ahead of the first row;
+    // exl3_mgemm_gr checks the rest (the dtypes of A, C and the pointer tables) before it launches
     TORCH_CHECK_DIM(A, 3);
     TORCH_CHECK_DIM(C, 3);
     TORCH_CHECK_DIM(indices, 2);
+    TORCH_CHECK_DIM(B, 1);
+    TORCH_CHECK_DIM(suh, 1);
+    TORCH_CHECK_DIM(svh, 1);
+    TORCH_CHECK_DTYPE(A_had, kHalf);
+    TORCH_CHECK_DTYPE(indices, kLong);
     TORCH_CHECK(A.is_contiguous() && C.is_contiguous() && A_had.is_contiguous() && indices.is_contiguous(),
                 "exl3_mgemm_rows: A, C, A_had and indices must be contiguous");
+    TORCH_CHECK(B.is_contiguous() && suh.is_contiguous() && svh.is_contiguous(),
+                "exl3_mgemm_rows: the pointer tables must be contiguous");
     const int64_t rows = A.size(0);
     const int64_t groups = A.size(1);
     const int64_t size_k = A.size(2);
@@ -766,10 +775,13 @@ int exl3_mgemm_rows
                 "exl3_mgemm_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
     TORCH_CHECK(C.size(0) == rows && C.size(1) == groups, "exl3_mgemm_rows: A and C must have the same rows and groups");
     TORCH_CHECK(groups > 0 && size_k > 0 && size_n > 0, "exl3_mgemm_rows: A or C is empty");
-    TORCH_CHECK(indices.size(1) == groups, "exl3_mgemm_rows: indices must hold one entry per group");
+    TORCH_CHECK(indices.size(0) >= 1 && indices.size(1) == groups, "exl3_mgemm_rows: indices must hold one entry per group");
+    TORCH_CHECK(B.size(0) >= groups && suh.size(0) >= groups && svh.size(0) >= groups,
+                "exl3_mgemm_rows: the pointer tables must hold one entry per group");
     TORCH_CHECK(A_had.numel() >= groups * size_k, "exl3_mgemm_rows: A_had must hold G * k elements");
-    TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.device(),
-                "exl3_mgemm_rows: A, C and A_had must be on one CUDA device");
+    TORCH_CHECK(A.is_cuda() && A.device() == C.device() && A.device() == A_had.device() && A.device() == indices.device() &&
+                A.device() == B.device() && A.device() == suh.device() && A.device() == svh.device(),
+                "exl3_mgemm_rows: A, C, A_had, indices and the pointer tables must be on one CUDA device");
 
     int tag = 0;
     for (int64_t r = 0; r < rows; ++r)
