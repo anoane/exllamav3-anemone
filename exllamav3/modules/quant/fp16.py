@@ -119,7 +119,7 @@ class LinearFP16:
             and x.is_cuda and x.dtype == torch.half
             and weight.dtype == torch.half and weight.dim() == 2 and weight.is_contiguous()
             and weight.device == x.device
-            and x.shape[-1] == weight.shape[0]
+            and x.shape[-1] == weight.shape[0] and weight.shape[1] == self.out_features
             and dtype in (torch.half, torch.float)
             and (dtype != x.dtype or bool(HGEMM_FIXED_ROWS))
         )
