@@ -1295,12 +1295,13 @@ With `1`, a cached DeepSeek-V4.1 forward of one sequence with 2 to 8 rows:
   experts of all rows run in one launch pair with the launch geometry of one row (no grouping of
   rows that picked the same expert), the router selects for all rows in one launch, and the two
   torch sums run in the extension; the index selection, `idx.weights_proj`, the compressor's
-  pooling and norm and the engram gate are one Python call per row. Where the one-row call of
-  an EXL3 linear or of the grouped output projection is the cooperative FP16 kernel, an
-  extension that reports bit 32 of `exact_rows_caps()` makes ONE launch for the rows instead of
-  one per row, under the launch record of the one-row call (kernel shape, block count,
-  concurrency): with that record fixed the kernel computes a row with the same operations in the
-  same order whatever the row count, so the rows keep their one-row bits (see "Cost");
+  pooling and norm and the engram gate are one Python call per row. With `EXL3_INT8_GEMV=0`,
+  where the one-row call of an EXL3 linear or of the grouped output projection is the
+  cooperative FP16 kernel, an extension that reports bit 32 of `exact_rows_caps()` makes ONE
+  launch for the rows instead of one per row, under the launch record of the one-row call
+  (kernel shape, block count, concurrency): with that record fixed the kernel computes a row
+  with the same operations in the same order whatever the row count, so the rows keep their
+  one-row bits (see "Cost");
 - keeps batched what is computed per row whatever the row count: RMS norms, RoPE, the attention
   kernel, the residual update, pool and ring stores, and the hyper-connection mix kernel, which
   takes the column partition of a one-row call;
@@ -1335,19 +1336,21 @@ with DeepSeek-V4.1-Flash); with the Python row loops alone the mode costs 1.6 (K
   is not its launch for two rows. Every such linear is one launch per row, so a verify forward
   decodes the weights K times. The row-exact entry points remove the interpreter and the
   bindings between the rows, not the per-row decode: measured on a three-GPU host, 1.8 (K = 3)
-  to 4.0 (K = 8) decode steps, where a verify forward without the mode costs 1.3 to 1.7 (that
-  measurement predates the single launch of the grouped output projection, which never takes
-  the int8 path and is one launch for the rows under this setting too). One-token decode keeps
-  its full speed.
+  to 4.0 (K = 8) decode steps, where a verify forward without the mode costs 1.3 to 1.7. No
+  call is one launch for its rows under this setting, the grouped output projection included
+  (its own one-row call never takes the int8 path; it follows the variable so that this
+  setting launches exactly as before the single launch existed). One-token decode keeps its
+  full speed.
 - `EXL3_INT8_GEMV=0`: a one-row call is the cooperative FP16 kernel, which a call of several rows
   takes too. With an extension that reports bit 32 of `exact_rows_caps()`, every EXL3 linear and
   the grouped output projection of a verify forward is one launch for its rows, under the launch
   record of the one-row call, and decodes the weights once, as a verify forward without the mode
   does. One-token decode is slower without the int8 path (42.1 against 43.6 tokens per second
-  on the three-GPU host, 3.5%). The exceptions keep one launch per row: a linear whose one-row
-  call is the FP16 GEMV (`EXL3_GEMV`, bitrates 2 to 4), a width that is not a multiple of 128,
-  and the first verify forward of a process for a linear shape whose one-row launch record the
-  process does not hold yet (the one-row launches of that forward load or tune it).
+  on the three-GPU host, 3.5%). The exceptions keep one launch per row: a GPU whose compute
+  capability is not 8.0, 8.9 or 12.0 (see the tests below), a linear whose one-row call is the
+  FP16 GEMV (`EXL3_GEMV`, bitrates 2 to 4), a width that is not a multiple of 128, and the first
+  verify forward of a process for a linear shape whose one-row launch record the process does
+  not hold yet (the one-row launches of that forward load or tune it).
 
 Generation with a draft returns the tokens of generation without one under either setting; the
 setting changes which one-row arithmetic both have, and the cost. What a verify forward costs on
@@ -1379,7 +1382,7 @@ Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav
 Read once, in Python (`exllamav3.model.math_policy`); the extension does not read it and there is
 no command-line flag. The extension only reports which row-exact entry points it was built with,
 and there is no setting to choose among them: whether the rows of a linear are one launch follows
-from `EXL3_INT8_GEMV` alone.
+from `EXL3_INT8_GEMV` and the GPU type alone.
 
 Refused: at import, together with `EXL3_STABLE_ARITHMETIC=1` (that profile replaces the one-row
 arithmetic this mode keeps) or with `EXL3_DSV41_FUSED_COMPRESS`; when the model is built, a
@@ -1403,9 +1406,10 @@ against one-row calls and, for each row-exact entry point, against the Python ro
 `tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation. Both test
 files and the probe are meant to be run under both settings of `EXL3_INT8_GEMV`, on every GPU
 type that serves the model: the single launch rests on the tensor-core instruction computing an
-output row from that row's inputs alone, which the source cannot show and these runs do. On
-sm_86 the kernel accumulates in FP16 within a block; the same argument covers it, and it has had
-no such run.
+output row from that row's inputs alone, which the source cannot show and these runs do. The
+extension therefore makes the single launch only on the compute capabilities that have had such
+a run, 8.0, 8.9 and 12.0; every other GPU keeps one launch per row under either setting, sm_86
+among them, where the kernel accumulates in FP16 within a block.
 
 ```sh
 EXL3_EXACT_ROWS=1 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3

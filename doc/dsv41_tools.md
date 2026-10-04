@@ -737,11 +737,11 @@ logits; the index selection and the attention kernel have no other test. The too
 entry points in use and the MoE layers they serve. `--exact-rows-caps MASK` runs with a subset of
 them (a sum of 1 EXL3 linears, 2 grouped `wo_a`, 4 router, 8 MoE experts, 16 hyper-connection
 sums; the MoE needs 4 and 8 together; `0` is the Python row loops alone), which gives the same
-tables and the cost of each step. Bit 32 is not an entry point and cannot be masked: an
-extension that reports it makes one launch for the rows of an EXL3 linear (with
-`EXL3_INT8_GEMV=0`) and of the grouped `wo_a` inside the entry points of bits 1 and 2, and the
-timing table prints, per K, how many calls of the K-row forward were served that way
-(`one-launch calls`). The timing table then gives what a verify forward costs under
+tables and the cost of each step. Bit 32 is not an entry point and cannot be masked: with
+`EXL3_INT8_GEMV=0`, an extension that reports it makes one launch for the rows of an EXL3
+linear and of the grouped `wo_a` inside the entry points of bits 1 and 2, and the timing table
+prints, per K, how many calls of the K-row forward were served that way (`one-launch calls`; 0
+with the int8 path on). The timing table then gives what a verify forward costs under
 the mode, in one-row steps: the figure that decides whether a draft pays; its `host` column is
 the part of each arm until `model.forward` returned, before the logits copy waits for the GPU.
 Per K it says whether the forward is one the mode covers; a forward
