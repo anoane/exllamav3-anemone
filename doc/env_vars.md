@@ -1271,6 +1271,66 @@ from exllamav3.ext import exllamav3_ext as ext
 assert ext.stable_arithmetic() and ext.hgemm_fixed_rows() == 128
 ```
 
+### `EXL3_EXACT_ROWS` (default: `0`)
+
+Opt-in mode for speculative decoding with DeepSeek-V4.1: a verify forward computes every row with
+exactly the arithmetic of a one-token decode step, so generation with a draft (n-gram or a draft
+model) returns the tokens generation without one returns. By default a forward of 2 to 8 rows
+takes other kernels and reductions than a one-row step (the int8 activation kernels of EXL3
+linears serve one and two rows, launch configurations are tuned per row bucket, the MoE router
+projects one row in FP32 and more rows in int8, cuBLAS and torch reductions follow the call's
+shape), the differences are last-bit rounding, and a near-tie then resolves to another token.
+
+With `1`, a cached DeepSeek-V4.1 forward of one sequence with 2 to 8 rows:
+
+- runs one row at a time, through the call a decode step makes: every linear (attention,
+  compressor, indexer, engram, output head), the grouped output projection, the whole MoE layer
+  (router, expert cache lookup, routed and shared experts), the index selection, the compressor's
+  pooling and norm, the engram gate, and the torch sums of the stream collapse and of the
+  hyper-connection pre-mix;
+- keeps batched what is computed per row whatever the row count: RMS norms, RoPE, the attention
+  kernel, the residual update, pool and ring stores, and the hyper-connection mix kernel, which
+  takes the column partition of a one-row call;
+- is left as it is when its rows straddle a position where a one-row step changes its attention
+  plan (dense pool or top-512 selection, 8 or 16 softmax partitions: positions 128, 257, 512 and
+  1025 on DeepSeek-V4.1-Flash).
+
+The generator, for a model that supports the mode: proposes a draft only while one sequence is
+generating; shortens a draft so the verify forward has at most 8 rows, stays inside the job's
+pages and requeue budget and does not cross one of those positions (the rest of the draft is
+proposed again in the next round); requeues a job and sizes its default token budgets as without
+a draft; does not draft for a job with banned strings or multimodal embeddings.
+
+One-row calls are unchanged, bit for bit. So are calls of 9 rows or more, batches of several
+sequences, the stateless path, draft models and every other architecture. A prefill chunk of 2 to
+8 rows (a short prompt tail) is computed row by row as well, so its rows get decode arithmetic. A
+verify forward costs about as many decode steps as it has rows, less what stays batched; drafting
+pays only at high acceptance.
+
+Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported.
+Read once, in Python (`exllamav3.model.math_policy`); the extension does not read it and there is
+no command-line flag.
+
+Refused: at import, together with `EXL3_STABLE_ARITHMETIC=1` (that profile replaces the one-row
+arithmetic this mode keeps) or with `EXL3_DSV41_FUSED_COMPRESS`; when the model is built, a
+DeepSeek-V4.1 checkpoint with hash-routed layers; when a Cache is built, a quantized DeepSeek-V4.1
+Cache (`-cq`); during a verify forward, a hyper-connection site the fused mix kernel cannot take
+(streams off the GPU or not FP32).
+
+What it does not cover: results still depend on the launch-autotune file, as one-row results do
+(keep one `EXLLAMAV3_TUNE_CACHE` file across runs that must agree), and on the placement (a layer
+on another GPU type has other one-row bits). Two runs agree only if they also prefill the prompt
+with the same forwards: a prompt-cache hit or another chunk size changes the bits of the prompt's
+own positions, with or without a draft.
+
+`tools/dsv41_rowprobe.py` measures the mode operation by operation (every line of its tables
+reads `=`), `tests/test_dsv41_exact_rows_gpu_.py` checks each operation on each GPU, and
+`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation.
+
+```sh
+EXL3_EXACT_ROWS=1 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3
+```
+
 ## Model loading
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
