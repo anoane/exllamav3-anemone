@@ -72,8 +72,13 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float, per_row: 
 
     per_row (EXL3_EXACT_ROWS): every row of a (rows, d) input gets the bits of its one-row
     call. The mean is then one reduction per row, on the freshly allocated (1, d) square a
-    one-row call reduces. Everything else serves all rows at once: the maximum of absolute
-    values has one bit pattern under any reduction order, and the rest is elementwise.
+    one-row call reduces. Everything else serves all rows at once: the rest is elementwise,
+    and the maximum of absolute values has one bit pattern under any reduction order for a row
+    without NaN (no signed zero survives abs; an infinity is the maximum in any order). A row
+    with NaN is NaN throughout in both forms. With several NaNs of different payloads in one
+    row the payload the maximum hands on could follow the order, and the bits of that row are
+    then not shown to be those of the one-row call: finite projections are assumed here, as a
+    NaN row has no meaningful latent in either form.
     """
     if not math.isfinite(eps) or not _MIN_EPS <= eps <= _MAX_EPS:
         raise ValueError("compressor RMSNorm requires epsilon in the positive normal FP32 range")

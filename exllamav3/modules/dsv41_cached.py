@@ -90,10 +90,14 @@ class CompressCarry:
     than assuming bitwise equality for all schedules or input ranges, except under
     EXL3_STABLE_ARITHMETIC=1, where rms_norm reduces each row alone and chunked latents
     are bitwise equal (tests/test_dsv41_stable_norm_gpu_.py). With per_row (EXL3_EXACT_ROWS)
-    every closed entry gets the bits of the one-row step that closes it: the pooling is
-    elementwise but for reductions over the two rows of a group, which have one result in any
-    order, so it serves all entries at once; of the norm only the mean follows the row count,
-    and it is reduced one entry per call (rms_norm, per_row).
+    every closed entry gets the bits of the one-row step that closes it. At rate 2 the pooling
+    is elementwise but for reductions over the two rows of a group (a maximum that only feeds
+    exp of a difference, and sums of two terms), which have one result in any order for rows
+    without NaN (the assumption of rms_norm), so it serves all entries at once; of the norm
+    only the mean follows the row count, and it is reduced one entry per call (rms_norm,
+    per_row). At a rate above 2 the pooling sums more
+    than two terms, in an order torch chooses from the operand: every entry is then pooled and
+    normalized by a call of its own, the call a one-row step that closes it makes.
     """
 
     @staticmethod
@@ -103,8 +107,9 @@ class CompressCarry:
         carry   (R, 2 * hd) fp32 ring of this slot, or None at rate 1
         kv      (seq, hd) raw compressor kv rows of this chunk
         score   (seq, hd) raw gate rows (None at rate 1)
-        per_row every closed entry with the bits of a one-row step: the mean of the norm one
-                entry per call (the carry ring is read and written as without it)
+        per_row every closed entry with the bits of a one-row step: at rates 1 and 2 the mean
+                of the norm one entry per call and the rest at once, else one entry per call
+                (the carry ring is read and written as without it)
         returns (latents (n, hd) fp32 pre-RoPE, first_entry)
                 n = (pos0 + seq) // m - pos0 // m, first_entry = pos0 // m
         """
@@ -134,6 +139,11 @@ class CompressCarry:
             return kvf.new_zeros((0, hd)), first
         # per_row: a one-row step that closes a group pools its (1, m, hd) rows, the pending ones
         # from the carry ring: the same FP32 values as the rows of this call
+        if per_row and closed > m and m != 2:
+            # more than two rows per group: the pooling's sums have an order, one group per call
+            return torch.cat([
+                rms_norm(group_pool(kvf[g:g + m].view(1, m, hd), scf[g:g + m].view(1, m, hd)), norm_weight, eps)
+                for g in range(0, closed, m)], dim = 0), first
         lat = group_pool(kvf[:closed].view(-1, m, hd), scf[:closed].view(-1, m, hd))
         return rms_norm(lat, norm_weight, eps, per_row), first
 
