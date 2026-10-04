@@ -49,10 +49,12 @@ from .dsv4 import DSV4Attention, _ext_rope
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle
 from .attention_fn.dsa_triton import dsa_attn, auto_splits, SPLIT_MAX_ROWS
-from ..util.tensor import get_for_device
+from ..util.tensor import get_for_device, g_tensor_cache
 from ..util.device_copy import to_device
 from ..constants import PAGE_SIZE
-from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX
+from ..model.math_policy import (
+    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_MGEMM, exact_rows_native,
+)
 from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
 from ..cache.dsv41_replica import sync_pool_replica
 from .dsv41_select import select_topk, SelectResult, INT32_LIMIT
@@ -66,6 +68,10 @@ from .dsv41_cached import emission_range, entry_rows, rope_positions, CompressCa
 # take the split softmax of a one-row step, which dsa_attn gives calls of up to SPLIT_MAX_ROWS rows
 assert EXACT_ROWS_MAX <= SPLIT_MAX_ROWS, \
     f"EXACT_ROWS_MAX {EXACT_ROWS_MAX} exceeds dsa_attn's split-softmax row limit {SPLIT_MAX_ROWS}"
+
+# EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
+# extension built before them: the Python row loops)
+ROWS_NATIVE = exact_rows_native(ext)
 
 
 def check_row_limit(key: str, rows: int, num_heads: int, head_dim: int):
@@ -1143,7 +1149,32 @@ class DSV41Attention(DSV4Attention):
         GEMM's launch configuration follows the row count, and wo_b behind it is a Linear. A row
         of the group-major output is strided across the groups, hence the contiguous copy.
         Returns (1, seq, hidden), as _project_o_grouped on the whole output does.
+
+        Where the extension has the row-exact entry point and a one-row call takes the grouped
+        GEMM (use_mg in _project_o_grouped), one native call makes that call's launch for every
+        row: row j of the row-major copy is the (groups, 1, width) block the one-row call passes,
+        with that call's scratch, and row j of C the (1, groups * n) row its wo_b reads. wo_b then
+        gets the rows as one flagged call.
         """
+        G, rows, width = out.shape
+        if ROWS_NATIVE & EXACT_ROWS_CAP_MGEMM:
+            if not self.woa_multi_ready and self.device is not None:
+                self._build_woa_multi()
+            mu = self.wo_a_multi
+            if (
+                mu is not None and not STABLE_ARITHMETIC and 1 < rows <= EXACT_ROWS_MAX
+                and G == self.o_groups and width == mu.in_features
+                and not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
+            ):
+                A = out.transpose(0, 1).contiguous()
+                ah = g_tensor_cache.get(out.device, (G, 1, width), torch.half, "dsv4_woa_had")
+                C = torch.empty((rows, G, mu.out_features), dtype = torch.half, device = out.device)
+                ext.exl3_mgemm_rows(
+                    A, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh,
+                    self.woa_indices, mu.K, mu.mcg, mu.mul1
+                )
+                return self.wo_b.forward(
+                    C.view(1, rows, G * mu.out_features), params, out_dtype = out_dtype or self.out_dtype)
         return torch.cat([
             self._project_o_grouped(out[:, j:j + 1].contiguous().unsqueeze(1), params, out_dtype)
             for j in range(out.shape[1])], dim = 1)

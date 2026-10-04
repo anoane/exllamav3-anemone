@@ -7,6 +7,7 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
+#include "../exact_rows.h"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "bits_k.cuh"
@@ -731,4 +732,54 @@ int exl3_mgemm
         had_src_list,
         num_had_src
     );
+}
+
+// EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows. Row r of the
+// row-major A and C is the contiguous (G, 1, k) and (G, 1, n) block a one-row call passes, so every
+// row is exl3_mgemm_gr with that call's argument list: size_m 1, G inputs and outputs, and with them
+// the launch-autotune record of the one-row call. The rows share A_had, in stream order, as
+// successive one-row calls do
+int exl3_mgemm_rows
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    const at::Tensor& indices,
+    float K_,
+    bool mcg,
+    bool mul1
+)
+{
+    TORCH_CHECK_DIM(A, 3);
+    TORCH_CHECK_DIM(C, 3);
+    TORCH_CHECK_DIM(indices, 2);
+    TORCH_CHECK(A.is_contiguous() && C.is_contiguous() && A_had.is_contiguous() && indices.is_contiguous(),
+                "exl3_mgemm_rows: A, C, A_had and indices must be contiguous");
+    const int64_t rows = A.size(0);
+    const int64_t groups = A.size(1);
+    const int64_t size_k = A.size(2);
+    const int64_t size_n = C.size(2);
+    TORCH_CHECK(rows >= 2 && rows <= EXACT_ROWS_MAX,
+                "exl3_mgemm_rows: a row-exact call takes 2 to ", EXACT_ROWS_MAX, " rows, got ", rows);
+    TORCH_CHECK(C.size(0) == rows && C.size(1) == groups, "exl3_mgemm_rows: A and C must have the same rows and groups");
+    TORCH_CHECK(groups > 0 && size_k > 0 && size_n > 0, "exl3_mgemm_rows: A or C is empty");
+    TORCH_CHECK(indices.size(1) == groups, "exl3_mgemm_rows: indices must hold one entry per group");
+    TORCH_CHECK(A_had.numel() >= groups * size_k, "exl3_mgemm_rows: A_had must hold G * k elements");
+    TORCH_CHECK(A.device() == C.device() && A.device() == A_had.device(),
+                "exl3_mgemm_rows: A, C and A_had must be on one device");
+
+    int tag = 0;
+    for (int64_t r = 0; r < rows; ++r)
+    {
+        at::Tensor a = A.slice(0, r, r + 1).view({groups, 1, size_k});
+        at::Tensor c = C.slice(0, r, r + 1).view({groups, 1, size_n});
+        int row_tag = exl3_mgemm_gr(a, B, c, suh, A_had, svh, indices, c10::nullopt, K_, -1, mcg, mul1, -1, -1, 0, nullptr, 1);
+        TORCH_CHECK(r == 0 || row_tag == tag,
+                    "exl3_mgemm_rows: row ", r, " took kernel ", row_tag, ", the rows before it kernel ", tag);
+        tag = row_tag;
+    }
+    return tag;
 }

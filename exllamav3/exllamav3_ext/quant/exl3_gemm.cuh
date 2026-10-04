@@ -84,3 +84,20 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& had_src_list = {},
     int num_had_src = 0
 );
+
+// EXL3_EXACT_ROWS (exact_rows.h): the grouped projection of 2 to EXACT_ROWS_MAX rows, every row the
+// exl3_mgemm call of a one-row step. A (rows, G, k) and C (rows, G, n) are row-major, A_had is the
+// one-row call's (G, 1, k) scratch, indices (1, G). Returns the launch tag the rows share
+int exl3_mgemm_rows
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    const at::Tensor& indices,
+    float K,
+    bool mcg,
+    bool mul1
+);
