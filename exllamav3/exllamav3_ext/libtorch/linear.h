@@ -61,4 +61,6 @@ struct BC_LinearEXL3
     void run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph);
     void run(const at::Tensor& x, at::Tensor& y);
     at::Tensor run_alloc(const at::Tensor& x, int64_t out_features, bool output_fp32);
+    // EXL3_EXACT_ROWS: run_alloc for a call of 2 to EXACT_ROWS_MAX rows, every row the one-row call
+    at::Tensor run_alloc_rows(const at::Tensor& x, int64_t out_features, bool output_fp32);
 };

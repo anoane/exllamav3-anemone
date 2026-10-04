@@ -9,8 +9,12 @@ from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
-from ..model.math_policy import EXACT_ROWS
+from ..model.math_policy import EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_LINEAR, exact_rows_native
 from ..util.tensor import forward_rows
+
+# EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
+# extension built before them: the Python row loops)
+ROWS_NATIVE = exact_rows_native(ext)
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -630,10 +634,15 @@ class Linear(Module):
 
         # EXL3_EXACT_ROWS: a flagged forward (params["exact_rows"], set by the model per forward)
         # projects one row per call, each the complete one-row call below. The kernel, its
-        # activation format and its launch configuration follow the row count of a call. Every
-        # path below returns a tensor it allocated in the call (LinearEXL3.forward and
-        # BC_LinearEXL3::run_alloc, LinearFP16.forward), so the rows are concatenated, not copied
+        # activation format and its launch configuration follow the row count of a call. Where the
+        # extension has the row-exact entry point and a one-row call is nothing but the EXL3
+        # projection (rows_native), one native call makes the one-row launches of every row.
+        # Otherwise the rows are forwarded one by one from here: every path below returns a tensor
+        # it allocated in the call (LinearEXL3.forward and BC_LinearEXL3::run_alloc,
+        # LinearFP16.forward), so the rows are concatenated, not copied
         if EXACT_ROWS and params.get("exact_rows") and x.numel() > x.shape[-1]:
+            if self.rows_native(x, params):
+                return self.forward_rows_native(x, params, out_dtype)
             return forward_rows(lambda row: self.forward(row, params, out_dtype), x, copy = False)
 
         # When in_features is padded past the incoming activation width (dims not a multiple of
@@ -668,6 +677,46 @@ class Linear(Module):
             ext.softcap(x, x, self.softcap)
         if self.post_scale != 1.0:
             x *= self.post_scale
+        return x
+
+
+    def rows_native(self, x: torch.Tensor, params: dict) -> bool:
+        """
+        EXL3_EXACT_ROWS: whether the rows of a flagged call go to the extension in one call
+        (forward_rows_native). The extension must have the entry point, and a one-row forward must
+        be nothing but zero-padding, the EXL3 projection and the trim: no capture, LoRA, scale or
+        softcap, which forward applies around the projection per call
+        """
+        return (
+            bool(ROWS_NATIVE & EXACT_ROWS_CAP_LINEAR)
+            and isinstance(self.inner, LinearEXL3)
+            and x.is_contiguous()
+            and x.numel() // x.shape[-1] <= EXACT_ROWS_MAX
+            and "capture" not in params
+            and not self.lora_a_tensors
+            and self.pre_scale == 1.0
+            and self.softcap == 0.0
+            and self.post_scale == 1.0
+            and self.inner.rows_native(params)
+        )
+
+
+    def forward_rows_native(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """
+        EXL3_EXACT_ROWS: forward for a flagged call of several rows where rows_native holds. The
+        zero-padding and the trim are those of forward on all rows at once (copies of values), the
+        projection is one native call that launches the one-row call once per row
+        """
+        if x.shape[-1] < self.in_features:
+            x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
+        x = self.inner.forward_rows(x, params, out_dtype)
+        if self.trim_padded_out and self.out_features != self.out_features_unpadded:
+            x = x[..., :self.out_features_unpadded].contiguous()
         return x
 
 

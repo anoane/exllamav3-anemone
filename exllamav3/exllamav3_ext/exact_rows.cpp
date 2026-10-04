@@ -2,5 +2,5 @@
 
 int exact_rows_caps()
 {
-    return 0;
+    return EXACT_ROWS_CAP_LINEAR;
 }

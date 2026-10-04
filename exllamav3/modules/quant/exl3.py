@@ -155,6 +155,30 @@ class LinearEXL3:
         return self.reconstruct_hgemm(x, out_dtype)
 
 
+    def rows_native(self, params: dict) -> bool:
+        """
+        EXL3_EXACT_ROWS: whether a one-row forward with these params is nothing but run_alloc (no
+        override, no reconstruct path), so that forward_rows computes what one forward per row does
+        """
+        return not STABLE_ARITHMETIC and "ovr" not in params and not params.get("reconstruct")
+
+
+    def forward_rows(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """
+        EXL3_EXACT_ROWS: forward for a flagged call of 2 to EXACT_ROWS_MAX rows where
+        rows_native(params) holds. One native call (BC_LinearEXL3::run_alloc_rows) launches the
+        one-row call once per row, so every row has the bits forward gives it alone
+        """
+        assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
+        dtype = out_dtype or self.default_out_dtype
+        return self.bc.run_alloc_rows(x, self.out_features, dtype == torch.float)
+
+
     def unpack_bf(self, bitfield: torch.Tensor):
         # For some reason this operation causes a GPU assert on Transformers. Running on CPU seems to fix it
         device = bitfield.device
