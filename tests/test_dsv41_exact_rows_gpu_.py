@@ -501,17 +501,20 @@ class ExactRows(unittest.TestCase):
     def test_native_equals_python_loop_moe(self):
         self.need(CAP_ROUTER | CAP_MOE)
         m_moe = importlib.import_module("exllamav3.modules.dsv41_moe")
-        one_call = []
         for device in self.devices:
+            # every GPU must show the entry points on a layer of its own, at every K: a layer they
+            # do not serve compares the Python row loop with itself
+            one_call = []
             for b, experts in self.moe_layers(device):
                 mlp = b.mlp
-                served = False
+                served = []
                 for K in ROWS:
                     with self.subTest(layer = b.layer_idx, device = str(device), K = K, experts = experts):
                         x = self.randn((1, K, mlp.hidden_size), device)
                         with rows_native(self.caps):
-                            served = mlp.rows_native(x, FLAGGED)
-                            if served:
+                            one = bool(mlp.rows_native(x, FLAGGED))
+                            served.append(one)
+                            if one:
                                 with self.counted("routing_ds3_nogroup_rows") as calls, \
                                         mock.patch.object(m_moe, "forward_rows", _refuse):
                                     native = mlp.forward(x, dict(FLAGGED)).clone()
@@ -521,11 +524,14 @@ class ExactRows(unittest.TestCase):
                         with rows_native(0):
                             loop = mlp.forward(x, dict(FLAGGED)).clone()
                         self.same(f"moe L{b.layer_idx}", native, loop)
+                every_k = len(served) == len(ROWS) and all(served)
                 print(f" -- exact rows: MoE L{b.layer_idx} on {device} ({experts} experts): bc.sh_coop "
-                      f"{getattr(mlp.bc, 'sh_coop', None)}, one forward for the rows: {'yes' if served else 'NO'}",
-                      flush = True)
-                one_call.append(served)
-        self.assertTrue(any(one_call), "no tested MoE layer is served by the row-exact entry points")
+                      f"{getattr(mlp.bc, 'sh_coop', None)}, one forward for the rows at K = "
+                      f"{', '.join(str(K) for K, one in zip(ROWS, served) if one) or 'NO K'}", flush = True)
+                one_call.append(every_k)
+            with self.subTest(device = str(device)):
+                self.assertTrue(any(one_call), f"no tested MoE layer on {device} is served by the row-exact entry "
+                                               f"points at every K")
 
     def moe_launch(self, mlp, y, sel, w, rows_entry: bool):
         """The fused decode launch pair of an MoE layer on a given routing, as BlockSparseMLP.forward
@@ -547,11 +553,13 @@ class ExactRows(unittest.TestCase):
     def test_native_moe_selections(self):
         # The gate of the single launch pair: run_bszN_rows on K rows against K one-row run_bszN
         # calls on the same routing. From 6 rows on the stock launch of the sm_120 card switches
-        # the tile, and rows that picked one expert are grouped at every K: neither may show here
+        # the tile, and rows that picked one expert are grouped at every K: neither may show here.
+        # Every GPU must contribute a layer: a pass says nothing about a card that was skipped
         self.need(CAP_MOE)
         tested = []
         for device in self.devices:
             cc = self.ext.g_get_cc(device.index if device.index is not None else torch.cuda.current_device())
+            on_device = len(tested)
             for b, experts in self.moe_layers(device):
                 mlp = b.mlp
                 topk, cfg = mlp.num_experts_per_tok, mlp.routing_cfg
@@ -579,9 +587,10 @@ class ExactRows(unittest.TestCase):
                             ones = [self.moe_launch(mlp, y[j:j + 1].clone(), sel_c[j:j + 1].clone(),
                                                     w_c[j:j + 1].clone(), False) for j in range(K)]
                             self.same_rows(f"moe experts L{b.layer_idx}, {case}", many, ones)
+            with self.subTest(device = str(device)):
+                self.assertGreater(len(tested), on_device, f"run_bszN_rows serves no tested MoE layer on {device}")
         print(f" -- exact rows: run_bszN_rows against one-row run_bszN, K = 2..8, on {'; '.join(tested) or 'NOTHING'}",
               flush = True)
-        self.assertTrue(tested, "run_bszN_rows serves no tested MoE layer")
 
     @torch.inference_mode()
     def test_native_router(self):
