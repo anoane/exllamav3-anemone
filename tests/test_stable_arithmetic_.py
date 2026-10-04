@@ -198,14 +198,17 @@ class DeepseekV41AttentionTests(unittest.TestCase):
 
     def test_quantized_cache_is_refused(self):
         # A packed pool is read with row-count-dependent arithmetic (staged to FP16 from 64 rows)
+        # EXL3_EXACT_ROWS refuses it too: the packing kernel takes the rows of the call
         n = NS(compressed = False, contract = "deepseek")
-        for stable in (False, True):
+        for stable, exact, named in ((False, False, None), (True, False, "EXL3_STABLE_ARITHMETIC=1"),
+                                     (False, True, "EXL3_EXACT_ROWS=1")):
             register = method("exllamav3/architecture/deepseek_v41.py", "DeepseekV41Config",
-                              "register_packed_pool", dict(STABLE_ARITHMETIC = stable))
+                              "register_packed_pool", dict(STABLE_ARITHMETIC = stable, EXACT_ROWS = exact))
             config = NS(_dsv41_numerics = n, _dsv41_packed_pools = set())
-            if stable:
-                with self.assertRaisesRegex(ValueError, "quantized Cache"):
+            if named:
+                with self.assertRaisesRegex(ValueError, "quantized Cache") as cm:
                     register(config, "pool")
+                self.assertIn(named, str(cm.exception))
                 self.assertEqual(config._dsv41_packed_pools, set())
             else:
                 register(config, "pool")

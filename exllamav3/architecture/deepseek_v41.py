@@ -41,7 +41,7 @@ from ..util.file import no_default
 from ..model.config import Config
 from ..model.model import Model
 from ..model.placement import parse as parse_placement
-from ..model.math_policy import STABLE_ARITHMETIC
+from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS, exact_rows
 from .dsv41 import activation, numerics, pipeline, router_bias
 
 # V4.1: compress_ratios[i] is the compression rate, not a kind selector.
@@ -352,9 +352,9 @@ class DeepseekV41Config(Config):
     def register_packed_pool(self, layer):
         """
         Called by each V4.1 kv-source pool built in the packed (quantized) format, when the
-        Cache is constructed. Refuses the pool under EXL3_STABLE_ARITHMETIC or if the current
-        numerics round compressed entries, and keeps a weak reference so that the setting cannot
-        switch to them while it exists.
+        Cache is constructed. Refuses the pool under EXL3_STABLE_ARITHMETIC, under EXL3_EXACT_ROWS
+        or if the current numerics round compressed entries, and keeps a weak reference so that
+        the setting cannot switch to them while it exists.
         """
         if STABLE_ARITHMETIC:
             # dsa_attn stages a packed pool back to FP16 in the original domain for calls of 64 or
@@ -365,6 +365,13 @@ class DeepseekV41Config(Config):
                 "with arithmetic that depends on the number of query rows (from 64 rows the packed "
                 "pool is staged back to FP16, below that it is read packed), so decode would differ "
                 "from prefill; use an FP16 Cache")
+        if EXACT_ROWS:
+            # the entries a call closes are packed by one kernel over the call's rows
+            # (dsv4_pool_quant_scatter), which the mode does not run entry by entry
+            raise ValueError(
+                "EXL3_EXACT_ROWS=1: DeepSeek-V4.1 packs the compressed entries of a quantized Cache "
+                "(-cq) with one kernel over the rows of the call, so a draft verification is not "
+                "known to store what one-token steps store; use an FP16 Cache")
         n = self._dsv41_numerics
         if n.compressed:
             raise ValueError(
@@ -480,6 +487,14 @@ class DeepseekV41Model(Model):
         from ..modules.dsv41_moe import DSV41MoE
 
         c = config
+
+        if EXACT_ROWS and c.num_hash_layers > 0:
+            # a ValueError, not an assert: python -O must not strip a refusal
+            raise ValueError(
+                f"EXL3_EXACT_ROWS=1: this checkpoint routes its first {c.num_hash_layers} layers by a "
+                f"hash of the token ids (num_hash_layers), which that router indexes by the rows of the "
+                f"call; the mode runs the MoE one row per call and does not cover it. Unset "
+                f"EXL3_EXACT_ROWS")
 
         # The routed and shared experts' activation, the same for both (EXL3_DSV41_ACTIVATION,
         # architecture/dsv41/activation.py), fixed for the model's lifetime: the fused and graph
@@ -676,6 +691,10 @@ class DeepseekV41Model(Model):
             # convert.py stops before any work, with this reason
             "can_quantize": False,
             "quantize_refusal": QUANTIZE_REFUSAL,
+            # EXL3_EXACT_ROWS: the model gives the rows of a draft verification one-row
+            # arithmetic (prepare_inputs) and tells how many rows it can (exact_rows_span); the
+            # generator then keeps its draft windows inside that
+            "exact_rows": True,
         })
         # V4.1's own job-level state: V4's bookkeeping plus a rewind limit that keeps a
         # full sliding window below the rewound position, and checkpoints that include
@@ -687,6 +706,13 @@ class DeepseekV41Model(Model):
         # Cache() sizes its layers from the modules' caps at construction, and a
         # replica owner must already be one by then
         self._apply_pool_routes()
+
+        # exact_rows_span: one attention layer per distinct position rule (row_plan)
+        plans = {}
+        for b in self._blocks():
+            a = b.attn
+            plans.setdefault((a.compress_ratio, a.sliding_window, a.index_topk, a.is_index_source), a)
+        self._exact_plan_layers = tuple(plans.values())
 
     def module_plan(self) -> list[dict]:
         """
@@ -744,6 +770,7 @@ class DeepseekV41Model(Model):
     PER_FORWARD_KEYS = (
         "dsv41_pools", "dsv41_hc_pre", "dsv41_pool_mirrors", "dsv41_topk",
         "dsv41_candidates", "dsv41_dev_memo", "dsv41_rope", "dsv41_engram_lookback_fwd",
+        "exact_rows",
     )
 
     @override
@@ -781,7 +808,49 @@ class DeepseekV41Model(Model):
         # per-forward slot, so a dict reused for the next sequence cannot hash that
         # sequence's first positions with this chunk's ids
         params["dsv41_engram_lookback_fwd"] = params.pop("dsv41_engram_lookback", None)
+        # EXL3_EXACT_ROWS: whether this forward gives every row the arithmetic of a one-row step.
+        # Decided here, once, for every module of the forward
+        params["exact_rows"] = EXACT_ROWS and self.exact_rows_regime(input_ids, params)
         return prepare_for_attn(input_ids, params)
+
+    # -- EXL3_EXACT_ROWS --
+
+    def exact_rows_regime(self, input_ids: torch.Tensor, params: dict) -> bool:
+        """
+        Whether a forward is one EXL3_EXACT_ROWS covers (the switch itself is not read here): the
+        cached path, ONE sequence, 2 to EXACT_ROWS_MAX rows, no indexed embeddings (the router's
+        vision mask indexes the token ids by the rows of a call), and no row that changes the
+        attention plan (exact_rows_span). Every other forward keeps its arithmetic: one-row calls,
+        longer chunks, batches of several sequences, the stateless path, a call across a plan
+        change.
+        """
+        if input_ids.dim() != 2 or input_ids.shape[0] != 1 or not exact_rows(input_ids.shape[1], True):
+            return False
+        rs = params.get("recurrent_states")
+        if params.get("attn_mode") != "flash_attn" or not isinstance(rs, (list, tuple)) or len(rs) != 1:
+            return False
+        if params.get("indexed_embeddings"):
+            return False
+        rows = input_ids.shape[1]
+        return self.exact_rows_span(rs[0].position, rows) == rows
+
+    def exact_rows_span(self, position: int, rows: int) -> int:
+        """
+        How many leading rows of a cached call of `rows` rows starting at `position` take, on
+        every layer, the attention plan of its first row (DSV41Attention.row_plan: dense pool or
+        top-k selection, softmax split count); `rows` when no row changes it.
+
+        A call takes one plan, from its last row, while one-row steps take each their own, so only
+        the rows up to the first change can be given one-row arithmetic in one call. On
+        DeepSeek-V4.1-Flash the plan changes at positions 128 and 512 (rate-1 layers), 257 and
+        1025 (rate-2 layers). The generator shortens a draft window to this span.
+        """
+        layers = self._exact_plan_layers
+        first = [a.row_plan(position) for a in layers]
+        for n in range(1, rows):
+            if [a.row_plan(position + n) for a in layers] != first:
+                return n
+        return rows
 
     # -- layer split --
 

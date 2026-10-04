@@ -94,6 +94,7 @@ def main(path):
     check_conversion_refused(path)
     check_keymap(model, path)
     check_per_forward(model)
+    check_exact_rows(model)
     check_chat_prompt(model, path)
 
 
@@ -180,7 +181,7 @@ def check_forward_rows():
 
 # per-forward keys prepare_inputs must set fresh on every call
 PER_FORWARD = ("dsv41_pools", "dsv41_hc_pre", "dsv41_pool_mirrors", "dsv41_topk", "dsv41_candidates",
-               "dsv41_dev_memo", "dsv41_rope", "dsv41_engram_lookback_fwd")
+               "dsv41_dev_memo", "dsv41_rope", "dsv41_engram_lookback_fwd", "exact_rows")
 
 
 def check_per_forward(model):
@@ -201,8 +202,10 @@ def check_per_forward(model):
     left = [k for k in model.PER_FORWARD_KEYS if params.get(k, stale) is stale]
     assert not left, f"stale per-forward keys after prepare_inputs: {left}"
     assert all(params[k] == {} for k in model.PER_FORWARD_KEYS
-               if k not in ("dsv41_hc_pre", "dsv41_engram_lookback_fwd")), "a per-forward dict is not empty"
+               if k not in ("dsv41_hc_pre", "dsv41_engram_lookback_fwd", "exact_rows")), "a per-forward dict is not empty"
     assert params["dsv41_hc_pre"] is None and params["input_ids"] is ids
+    # the stateless path is never a forward of EXL3_EXACT_ROWS
+    assert params["exact_rows"] is False
     assert params["dsv41_engram_lookback_fwd"] is lb and "dsv41_engram_lookback" not in params
 
     # the engram reads the lookback in its forward, and not in the next one
@@ -219,6 +222,70 @@ def check_per_forward(model):
         eg.engram_ctx = None
     print(f"  OK  per-forward state: {len(model.PER_FORWARD_KEYS)} keys fresh after prepare_inputs on a "
           f"reused dict; an explicit engram lookback reaches only its own forward")
+
+
+def check_exact_rows(model):
+    """EXL3_EXACT_ROWS: which forwards the mode covers, and how far a call runs before one of its
+    rows changes the attention plan of a one-row step."""
+    import torch
+    from types import SimpleNamespace
+    from exllamav3.model.math_policy import EXACT_ROWS, EXACT_ROWS_MAX
+    from exllamav3.modules.attention_fn.dsa_triton import SPLIT_MAX_ROWS
+    c = model.config
+    assert model.caps.get("exact_rows") is True and EXACT_ROWS_MAX <= SPLIT_MAX_ROWS
+
+    states = lambda position, n = 1: [SimpleNamespace(position = position) for _ in range(n)]
+    cached = lambda position, **kw: dict({"attn_mode": "flash_attn", "recurrent_states": states(position)}, **kw)
+    ids = lambda rows, bsz = 1: torch.zeros((bsz, rows), dtype = torch.long)
+    regime = model.exact_rows_regime
+    far = 4 * c.index_topk          # every pool selects, on every layer
+    assert all(regime(ids(k), cached(far)) for k in range(2, EXACT_ROWS_MAX + 1))
+    assert not regime(ids(1), cached(far)), "a one-row call is the reference, never the mode"
+    assert not regime(ids(EXACT_ROWS_MAX + 1), cached(far))
+    assert not regime(ids(4, 2), cached(far)), "two sequences"
+    assert not regime(ids(4), {"attn_mode": "flash_attn", "recurrent_states": states(far, 2)})
+    assert not regime(ids(4), {"attn_mode": "flash_attn"}), "no job state"
+    assert not regime(ids(4), {"attn_mode": "flash_attn_nc"}) and not regime(ids(4), {})
+    assert not regime(ids(4), cached(far, indexed_embeddings = [object()]))
+    assert regime(ids(4), cached(far, indexed_embeddings = []))
+    # prepare_inputs sets the flag from the switch and the regime
+    params = cached(far)
+    model.prepare_inputs(ids(4), params)
+    assert params["exact_rows"] is EXACT_ROWS, params["exact_rows"]
+
+    # the plan of a one-row step, layer by layer, against the rule it mirrors: dense while
+    # (p + 1) // m <= index_topk (_select_cached), 16 splits past 256 keys (dsa_attn)
+    n = c.num_hidden_layers
+    blocks = model.modules[model.first_block_idx : model.first_block_idx + n]
+    w, topk = c.sliding_window, c.index_topk
+    for b in blocks:
+        m = b.attn.compress_ratio
+        for p in (0, 1, w - 1, w, 2 * w, 2 * w + 1, topk - 1, topk, 2 * topk, 2 * topk + 1, far):
+            ec = (p + 1) // m if m else 0
+            dense = ec <= topk
+            keys = w + (ec if dense else topk) if m else w
+            assert b.attn.row_plan(p) == (dense, 16 if keys > 256 else 8), (b.attn.layer_idx, p)
+
+    # brute force over every layer: the span is the run of rows that share the first row's plans
+    def brute(position, rows):
+        first = [b.attn.row_plan(position) for b in blocks]
+        k = 1
+        while k < rows and [b.attn.row_plan(position + k) for b in blocks] == first:
+            k += 1
+        return k
+    span = model.exact_rows_span
+    for p in list(range(0, 2 * w + 16)) + list(range(topk - 16, topk + 16)) + \
+            list(range(2 * topk - 16, 2 * topk + 16)) + [far]:
+        for rows in (1, 2, 5, EXACT_ROWS_MAX):
+            assert span(p, rows) == brute(p, rows), (p, rows, span(p, rows), brute(p, rows))
+    if (c.sliding_window, c.index_topk, sorted(set(c.compress_ratios))) == (128, 512, [0, 1, 2]):
+        # DeepSeek-V4.1-Flash: the plan changes at 128 and 512 (rate 1), 257 and 1025 (rate 2)
+        got = {p: span(p, 8) for p in (120, 124, 128, 252, 508, 1020, 1200)}
+        assert got == {120: 8, 124: 4, 128: 8, 252: 5, 508: 4, 1020: 5, 1200: 8}, got
+        assert not regime(ids(8), cached(1020)) and regime(ids(5), cached(1020))
+    print(f"  OK  EXL3_EXACT_ROWS: the regime (one cached sequence, 2..{EXACT_ROWS_MAX} rows, one attention plan), "
+          f"row_plan and exact_rows_span against brute force over {n} layers; switch "
+          f"{'ON' if EXACT_ROWS else 'off'} in this run")
 
 
 def check_chat_prompt(model, path):
