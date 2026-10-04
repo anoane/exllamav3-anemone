@@ -27,7 +27,13 @@ from __future__ import annotations
 import torch
 
 from ..constants import PAGE_SIZE
+from ..model.math_policy import EXACT_ROWS_FORM_COMPRESS, exact_rows_forms
 from ..util.device_copy import to_device
+
+# EXL3_EXACT_ROWS: the batched forms that are Python alone (math_policy.exact_rows_forms): here
+# EXACT_ROWS_FORM_COMPRESS, the closed entries of a flagged call pooled and normalized at once
+# (CompressCarry.step, per_row)
+ROWS_FORMS = exact_rows_forms()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -97,7 +103,8 @@ class CompressCarry:
     only the mean follows the row count, and it is reduced one entry per call (rms_norm,
     per_row). At a rate above 2 the pooling sums more
     than two terms, in an order torch chooses from the operand: every entry is then pooled and
-    normalized by a call of its own, the call a one-row step that closes it makes.
+    normalized by a call of its own, the call a one-row step that closes it makes. So is every
+    entry without EXACT_ROWS_FORM_COMPRESS (ROWS_FORMS).
     """
 
     @staticmethod
@@ -116,8 +123,11 @@ class CompressCarry:
         from ..architecture.dsv41.compressor import group_pool, rms_norm
         seq, hd = kv.shape
         first = pos0 // m
+        at_once = bool(ROWS_FORMS & EXACT_ROWS_FORM_COMPRESS)
         if m == 1:
             # a softmax over one row is 1: every token closes its own group, no state
+            if per_row and seq > 1 and not at_once:
+                return torch.cat([rms_norm(kv[i:i + 1], norm_weight, eps) for i in range(seq)], dim = 0), first
             return rms_norm(kv, norm_weight, eps, per_row), first
         assert carry is not None and score is not None and score.shape == kv.shape
         R = carry.shape[0]
@@ -139,7 +149,7 @@ class CompressCarry:
             return kvf.new_zeros((0, hd)), first
         # per_row: a one-row step that closes a group pools its (1, m, hd) rows, the pending ones
         # from the carry ring: the same FP32 values as the rows of this call
-        if per_row and closed > m and m != 2:
+        if per_row and closed > m and (m != 2 or not at_once):
             # more than two rows per group: the pooling's sums have an order, one group per call
             return torch.cat([
                 rms_norm(group_pool(kvf[g:g + m].view(1, m, hd), scf[g:g + m].view(1, m, hd)), norm_weight, eps)

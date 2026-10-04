@@ -53,7 +53,8 @@ from ..util.tensor import get_for_device, g_tensor_cache
 from ..util.device_copy import to_device
 from ..constants import PAGE_SIZE
 from ..model.math_policy import (
-    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_MGEMM, exact_rows_native,
+    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_MGEMM, EXACT_ROWS_FORM_SELECT,
+    exact_rows_native, exact_rows_forms,
 )
 from ..cache.dsv41 import CacheLayer_dsv41, DSV41LayerState, DeviceMemo
 from ..cache.dsv41_replica import sync_pool_replica
@@ -72,6 +73,9 @@ assert EXACT_ROWS_MAX <= SPLIT_MAX_ROWS, \
 # EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
 # extension built before them: the Python row loops)
 ROWS_NATIVE = exact_rows_native(ext)
+# EXL3_EXACT_ROWS: the batched forms that are Python alone (math_policy.exact_rows_forms): here
+# EXACT_ROWS_FORM_SELECT, one selection pass for the rows of a flagged call (_index_select)
+ROWS_FORMS = exact_rows_forms()
 
 
 def check_row_limit(key: str, rows: int, num_heads: int, head_dim: int):
@@ -951,9 +955,10 @@ class DSV41Attention(DSV4Attention):
             # scorer takes another kernel from 5 rows on). A flagged call never mixes dense and
             # selecting rows (DeepseekV41Model.exact_rows_span), and a dense row selects nothing.
             # The rows share one pass where their one-row calls share the tile width and need one
-            # tile, with the scorer pinned to the kernel of a one-row call (select_topk, one_row).
-            # Otherwise (the rows straddle a tile width, more than one tile) select_topk returns
-            # None before it launches anything and each row is the one-row call itself
+            # tile, on the GPU types that pass is verified on, with the scorer pinned to the kernel
+            # of a one-row call (select_topk, one_row). Otherwise (the rows straddle a tile width,
+            # more than one tile, another GPU type) select_topk returns None before it launches
+            # anything and each row is the one-row call itself, as without EXACT_ROWS_FORM_SELECT
             m = self.compress_ratio
             if (pos0 + 1) // m <= self.index_topk:
                 raise RuntimeError(
@@ -965,7 +970,7 @@ class DSV41Attention(DSV4Attention):
                 ec = (pos0 + seq) // m, topk = self.index_topk, cand_in = cand_in,
                 want_cand = self.is_candidate_source, block = self.candidate_block_size,
                 n_blocks = self.candidate_topk_blocks, one_row = True,
-            )
+            ) if ROWS_FORMS & EXACT_ROWS_FORM_SELECT else None
             if r is None:
                 rows = [select_topk(
                     q_idx[0][j:j + 1], wts[j:j + 1], idx_pool, bt_row = bt_row, epp = epp, pos0 = pos0 + j,

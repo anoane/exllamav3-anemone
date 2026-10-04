@@ -46,7 +46,8 @@ from typing_extensions import override
 from ..architecture.dsv41 import placement as dsv41_placement
 from ..ext import exllamav3_ext as ext
 from ..model.math_policy import (
-    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_HC, exact_rows_native, exact_rows_sum,
+    STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_HC, EXACT_ROWS_FORM_SUMS,
+    exact_rows_native, exact_rows_forms, exact_rows_sum,
 )
 from ..util.device_copy import to_device
 from ..util.tensor import g_tensor_cache, to2
@@ -59,6 +60,9 @@ from .transformer import TransformerBlock
 # EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
 # extension built before them: the Python row loops)
 ROWS_NATIVE = exact_rows_native(ext)
+# EXL3_EXACT_ROWS: the batched forms that are Python alone (math_policy.exact_rows_forms): here
+# EXACT_ROWS_FORM_SUMS, torch's sums over the rows of a flagged call (_sum_rows)
+ROWS_FORMS = exact_rows_forms()
 
 
 # EXL3_EXACT_ROWS: {(device, operand shape): whether the torch sum over that operand gave every row
@@ -132,11 +136,12 @@ def _collapse_rows(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
     The product is pointwise. Its sum has H terms per output: with contiguous FP32 CUDA operands
     and H inside exact_rows_sum, one thread adds an output's terms in the order a one-token call
     adds them, whatever the token count, so the expression of an unflagged call serves all tokens
-    (checked against the per-token form on first use, _sum_rows). Any other operand keeps one
-    token per call (_rows_collapse).
+    (checked against the per-token form on first use, _sum_rows). Any other operand, and every
+    operand without EXACT_ROWS_FORM_SUMS, keeps one token per call (_rows_collapse).
     """
     if (
-        streams.dim() == 4 and streams.is_cuda and pre.device == streams.device
+        ROWS_FORMS & EXACT_ROWS_FORM_SUMS
+        and streams.dim() == 4 and streams.is_cuda and pre.device == streams.device
         and pre.dtype == torch.float and streams.dtype == torch.float
         and pre.shape == streams.shape[:-1]
         and pre.is_contiguous() and streams.is_contiguous()
@@ -264,7 +269,7 @@ class DSV41HyperConnection(HyperConnection):
             p = partials[:, 0]
         elif not exact:
             p = partials.sum(dim = 1)
-        elif exact_rows_sum(chunks, M1):
+        elif ROWS_FORMS & EXACT_ROWS_FORM_SUMS and exact_rows_sum(chunks, M1):
             p = _sum_rows((dev, (R, chunks, M1)), lambda: partials.sum(dim = 1), lambda: _rows_partials(partials))
         else:
             p = _rows_partials(partials)

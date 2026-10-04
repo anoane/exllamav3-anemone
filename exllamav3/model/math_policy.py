@@ -12,6 +12,8 @@ entry points it has (exact_rows_caps, exact_rows.h), and Python passes a flagged
 runs its own row loops (exact_rows_native). How an entry point gives the rows their one-row bits
 (a launch per row, or one launch under the launch record of a one-row call,
 EXACT_ROWS_CAP_ONE_LAUNCH) is the extension's choice per call; Python passes the same call either way.
+Four operations of a flagged call have a batched form that is Python alone and runs with every
+extension (exact_rows_forms, EXACT_ROWS_FORM_*).
 
 Torch-free, so tests can load this file by path.
 """
@@ -127,6 +129,21 @@ def exact_rows_native(ext_module, enabled: bool = None) -> int:
     return 0 if caps is None else int(caps())
 
 
+def exact_rows_forms(enabled: bool = None) -> int:
+    """
+    EXL3_EXACT_ROWS: the batched forms of a flagged call that are Python alone, as the OR of their
+    EXACT_ROWS_FORM_* bits: all of them with the switch, 0 without. They need no entry point of the
+    extension, so they run with every extension, the ones built before the row-exact entry points
+    included. With a bit clear the operation keeps the form that makes one call per row, entry or
+    token (the extension's per-row entry points where it has them), which gives the same results.
+    Not a setting: each consumer holds the value as ROWS_FORMS, and the tests and
+    tools/dsv41_rowprobe.py (--exact-rows-forms) clear bits there to compare and to time the two
+    forms of one operation
+    """
+    enabled = EXACT_ROWS if enabled is None else enabled
+    return EXACT_ROWS_FORMS_ALL if enabled else 0
+
+
 def exact_rows_sum(terms: int, width: int) -> bool:
     """
     EXL3_EXACT_ROWS: whether torch's sum over the middle dimension of a contiguous FP32 CUDA operand
@@ -208,6 +225,13 @@ EXACT_ROWS_CAP_ROUTER_ONE_LAUNCH = 256
 # row-exact (exact_rows_sum): any width, and an odd width
 EXACT_ROWS_SUM_TERMS = 16
 EXACT_ROWS_SUM_TERMS_WIDE = 256
+
+# EXL3_EXACT_ROWS: one bit per batched form that is Python alone (exact_rows_forms)
+EXACT_ROWS_FORM_SELECT = 1      # DSV41Attention._index_select: one select_topk pass for the rows
+EXACT_ROWS_FORM_SUMS = 2        # dsv41_block: the hyper-connection sums over the rows (_sum_rows)
+EXACT_ROWS_FORM_COMPRESS = 4    # CompressCarry.step: the closed entries pooled and normalized at once
+EXACT_ROWS_FORM_GATE = 8        # DSV41Engram._gate_rows: the reductions per token, the rest at once
+EXACT_ROWS_FORMS_ALL = EXACT_ROWS_FORM_SELECT | EXACT_ROWS_FORM_SUMS | EXACT_ROWS_FORM_COMPRESS | EXACT_ROWS_FORM_GATE
 
 STABLE_ARITHMETIC = stable_arithmetic_enabled()
 HGEMM_FIXED_ROWS = hgemm_fixed_rows()

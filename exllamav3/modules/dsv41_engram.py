@@ -95,10 +95,14 @@ from .dsv41_engram_math import stable_engram_gate
 from .linear import Linear
 from ..ext import exllamav3_ext as ext
 from ..loader.safetensors import DiskTensorHandle, convert_dtype
-from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS
+from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS, EXACT_ROWS_FORM_GATE, exact_rows_forms
 from ..architecture.dsv41.engram_state import DSV41EngramState, state_lookback
 from ..architecture.dsv41.engram_torch import DEAD, UNK, dequant_rows, engram_hash_chunk
 from .ngram_row_cache import Landing, CachedTicket
+
+# EXL3_EXACT_ROWS: the batched forms that are Python alone (math_policy.exact_rows_forms): here
+# EXACT_ROWS_FORM_GATE, one gate call for the tokens of a flagged call (DSV41Engram._gate_rows)
+ROWS_FORMS = exact_rows_forms()
 
 PREFETCH_ENABLED = os.environ.get("EXL3_DSV41_ENGRAM_PREFETCH", "1") != "0"   # A/B switch
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines: decode
@@ -744,9 +748,13 @@ class DSV41Engram(Module):
     def _gate_rows(self, h, key, eps):
         """
         EXL3_EXACT_ROWS: the gate of a flagged call of several tokens, every token with the bits
-        of the one-token call on its (B, 1, H, D) slices of h and key (_gate, per_token).
+        of the one-token call on its (B, 1, H, D) slices of h and key: one _gate call that
+        reduces per token (per_token), or without EXACT_ROWS_FORM_GATE (ROWS_FORMS) that call
+        itself, once per token.
         """
-        return self._gate(h, key, eps, True)
+        if ROWS_FORMS & EXACT_ROWS_FORM_GATE:
+            return self._gate(h, key, eps, True)
+        return torch.cat([self._gate(h[:, l:l + 1], key[:, l:l + 1], eps) for l in range(h.shape[1])], dim = 1)
 
     def forward(self, x, params, out_dtype = None):
         """
