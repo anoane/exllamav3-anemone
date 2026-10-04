@@ -47,6 +47,13 @@ captured tensor), the replay run against the capture run on every captured tenso
 change nothing), and coverage: every operation the layer facts call for was captured on every row
 or pool entry, else it is listed as NOT CAPTURED.
 
+Under EXL3_EXACT_ROWS=1 (doc/env_vars.md) the K-row forward runs the operations that follow the
+row count one row per call, and every table is expected to read '=': the tool is that mode's
+acceptance test. It reports per K whether the forward is one the mode covers (a call whose rows
+cross a change of the attention plan is not), and it stores SHA-256 digests of the pristine
+one-row reference, so that --same-pristine A.json B.json can show that one-row steps have the same
+bits with the mode on and off (two runs on one --tune-cache file).
+
 The launch autotuner of the EXL3 kernels keeps its choices in a file (coop_autotune_v1.bin); by
 default the tool runs on a private copy of it (--tune-cache), so that serving's file is read but
 never written. Runs that are to be compared should share one copy (--tune-cache PATH): a row
@@ -92,7 +99,7 @@ ENTRY_OPS = frozenset(("comp.pool", "comp.norm", "comp.fused", "idx.wk", "idx.k_
 # Call facts that differ between the arms by construction
 META_SKIP = frozenset(("rows", "ec", "pos0", "bound", "est"))
 # Environment switches that select arithmetic on this path (doc/env_vars.md), printed with the policy
-POLICY_ENV = ("EXL3_STABLE_ARITHMETIC", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL", "EXL3_MOE_FUSED_DET",
+POLICY_ENV = ("EXL3_STABLE_ARITHMETIC", "EXL3_EXACT_ROWS", "EXL3_HGEMM_FIXED_ROWS", "EXL3_MOE_FUSED_PREFILL", "EXL3_MOE_FUSED_DET",
               "EXL3_NO_FUSED_RECONSTRUCT", "EXL3_INT8_GEMV", "EXL3_INT8_GEMV_MAX_K", "EXL3_GEMV",
               "EXL3_DSV41_FUSED_COMPRESS", "EXL3_DSV41_NUMERICS", "EXL3_DSV41_XDEV_BF16", "EXL3_MOE_COOP_WIDE",
               "EXL3_MOE_COOP_KSPLIT", "EXL3_MOE_SHARED_COOP", "EXL3_FP32_LOGITS", "EXLLAMAV3_TUNE_CACHE")
@@ -161,6 +168,8 @@ examples:
       --placement '0-10=cuda:0; 11-13=cuda:2; 14-39=cuda:1 experts=cache; ram experts=all; disk experts=off'
   python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --prefix 40 --rows 2,8 --no-replay
   EXL3_STABLE_ARITHMETIC=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --allow-stable
+  EXL3_EXACT_ROWS=1 python3 tools/dsv41_rowprobe.py --model DIR --ref capture.json --tune-cache tune.bin --out on.json
+  python3 tools/dsv41_rowprobe.py --same-pristine off.json on.json
   (--model defaults to DSV41_MODEL_DIR, --ref to DSV41_VLLM_REF)
 """, formatter_class = argparse.RawDescriptionHelpFormatter, allow_abbrev = False)
     ap.add_argument("--model", default = os.environ.get("DSV41_MODEL_DIR"),
@@ -204,6 +213,11 @@ examples:
                            "writes that file; 'live' the file itself; or a path, created as a copy of the live "
                            "file when it does not exist and kept, so that several runs share the records one of "
                            "them tuned")
+    ap.add_argument("--same-pristine", nargs = 2, metavar = ("A.json", "B.json"), default = None,
+                    help = "only compare the pristine one-row reference of two reports of this tool (its logits and "
+                           "every captured tensor, by their SHA-256), e.g. a run with EXL3_EXACT_ROWS=1 against one "
+                           "without, both on one --tune-cache file; no torch, no CUDA. Exit status 0 equal, "
+                           "1 different, 2 not comparable")
     ap.add_argument("--stable-check", action = "store_true",
                     help = "only print which switches of exllamav3/model/math_policy.py are on; no torch, no CUDA")
     ap.add_argument("--allow-stable", action = "store_true",
@@ -228,7 +242,7 @@ def math_policy(val) -> dict:
     if mp is None:
         raise ValueError("this tree has no exllamav3/model/math_policy.py")
     return {"stable_arithmetic": bool(mp.STABLE_ARITHMETIC), "hgemm_fixed_rows": int(mp.HGEMM_FIXED_ROWS),
-            "fused_prefill": bool(mp.FUSED_PREFILL)}
+            "fused_prefill": bool(mp.FUSED_PREFILL), "exact_rows": bool(getattr(mp, "EXACT_ROWS", False))}
 
 
 def print_policy(policy: dict):
@@ -237,6 +251,7 @@ def print_policy(policy: dict):
     print(f"  STABLE_ARITHMETIC  {on(policy['stable_arithmetic'])}")
     print(f"  HGEMM_FIXED_ROWS   {policy['hgemm_fixed_rows'] or 'off'}")
     print(f"  FUSED_PREFILL      {on(policy['fused_prefill'])}")
+    print(f"  EXACT_ROWS         {on(policy['exact_rows'])}")
     env = [f"{k}={os.environ[k]}" for k in POLICY_ENV if k in os.environ]
     print(f"  arithmetic switches set in the environment: {' '.join(env) if env else 'none'}", flush = True)
 
@@ -486,9 +501,13 @@ class Probe:
         self.last = {}              # (layer, op) -> outputs this forward captured, for derived inputs
         self.gpu = {}               # (layer, "engram.wkv") -> that projection's device output, this forward
         self.in_woa = False
-        self.moe_stage = None       # "real": capture the next routing call; "forced": overwrite its result
-        self.route = None
-        self.force = None
+        self.cursor = {}            # (op, layer) -> units its earlier calls of this forward covered
+        self.sel_pos0 = None        # position of row 0 of the select_topk call in progress
+        self.moe_stage = None       # "real": capture the layer's routing calls; "forced": overwrite their results
+        self.moe_gate = None        # the gate of the MoE layer in progress: its own routing calls pass it
+        self.routes = []            # the routing calls captured in this MoE forward, in row order
+        self.force = None           # (sel, w) the forced stage writes, row by row from force_row
+        self.force_row = 0
         self.replays = {}
         self.disabled = set()
         self.notes = []
@@ -509,8 +528,9 @@ class Probe:
     def begin(self, run: Run, pos0: int, rows: int):
         """Before each forward of a hooked run."""
         self.run, self.pos0, self.rows = run, pos0, rows
-        self.layer = self.entry = self.route = self.force = self.moe_stage = None
+        self.layer = self.entry = self.force = self.moe_stage = self.moe_gate = self.sel_pos0 = None
         self.last, self.gpu, self.in_woa = {}, {}, False
+        self.cursor, self.routes, self.force_row = {}, [], 0
 
     def note(self, text: str):
         if text not in self.notes and len(self.notes) < 200:
@@ -543,16 +563,30 @@ class Probe:
             if restore is not None:
                 restore()
 
-    def units(self, kind: str, n: int, op: str):
+    def units(self, kind: str, n: int, op: str, base: int | None = None):
+        """
+        The units one call of n rows (or pool entries) covers. An operation the engine runs in
+        several calls per forward (one row or one entry per call under EXL3_EXACT_ROWS) continues
+        where its previous call of this forward ended; a caller that knows the position of the
+        call's first row passes it (base). None, with a note, when the rows are not rows of the
+        forward.
+        """
         if kind == "entry":
             if self.entry is None:
                 self.note(f"{op} L{self.layer}: called outside a pool store; not captured")
                 return None
-            return [self.entry[0] + i for i in range(n)]
-        if n != self.rows:
-            self.note(f"{op} L{self.layer}: {n} rows in a {self.rows}-row forward; not captured")
+            first, limit = self.entry[0], None
+        else:
+            first, limit = self.pos0, self.rows
+        if base is None:
+            done = self.cursor.get((op, self.layer), 0)
+            self.cursor[(op, self.layer)] = done + n
+            base = first + done
+        if limit is not None and not first <= base <= base + n <= first + limit:
+            self.note(f"{op} L{self.layer}: {n} rows at position {base} in a {self.rows}-row forward at "
+                      f"{self.pos0}; not captured")
             return None
-        return [self.pos0 + r for r in range(n)]
+        return [base + i for i in range(n)]
 
     def record(self, op: str, units, ins: dict, outs: dict, ids = (), meta = None, append: bool = False):
         """Store CPU copies, unit by unit. Values are unit-major tensors or lists of per-unit tensors."""
@@ -747,12 +781,19 @@ class Probe:
         ent["K"].add(getattr(inner, "K", None))
         ent["mul1"].add(bool(getattr(inner, "mul1", False)))
         eligible = type(inner).__name__ == "LinearEXL3" and bool(getattr(inner, "mul1", False))
+        depth = [0]
 
         def make(orig):
             def forward(x, params, out_dtype = None):
-                if not self.on():
+                # Under EXL3_EXACT_ROWS a call of several rows calls this module again once per row
+                # (Linear.forward): the outer call is the operation, the nested ones pass through
+                if not self.on() or depth[0]:
                     return orig(x, params, out_dtype)
-                y = orig(x, params, out_dtype)
+                depth[0] += 1
+                try:
+                    y = orig(x, params, out_dtype)
+                finally:
+                    depth[0] -= 1
                 self.guard(op, after, orig, x, params, out_dtype, y)
                 return y
             return forward
@@ -863,10 +904,14 @@ class Probe:
             units = self.units("row", s, f"{tag}.mix")
             if units is None or b != 1:
                 return
+            # the column partition: that of the call's rows, of one row in a flagged forward of
+            # EXL3_EXACT_ROWS (DSV41HyperConnection.mix_fused)
+            chunk_rows = 1 if params.get("exact_rows") and s > 1 else s
             self.record(f"{tag}.mix", units,
                         {"streams": streams[0], "carried_pre": None if carried_pre is None else carried_pre[0]},
                         {"post": post[0], "comb": comb[0], "collapsed": coll[0], "pre": pre[0]},
-                        meta = {"rows": s, "chunks": 1 if self.stable else int(self.ext.hc_mix_num_chunks(s, H * D))})
+                        meta = {"rows": s, "chunks": 1 if self.stable else
+                                int(self.ext.hc_mix_num_chunks(chunk_rows, H * D))})
             # post and comb are views of static workspaces that a one-row call may share
             saved_post, saved_comb = post.clone(), comb.clone()
 
@@ -913,14 +958,18 @@ class Probe:
 
     # -- engram --
 
-    def _engram_gate(self, eng, h, key):
+    def _engram_gate(self, eng, h, key, per_row: bool = False):
         """The gate of DSV41Engram.forward (modules/dsv41_engram.py), the same expressions on the same
-        shapes: (rstd, dot, gate), rstd and dot None under the row-local kernel of the stable profile."""
+        shapes: (rstd, dot, gate), rstd and dot None under the row-local kernel of the stable profile.
+        per_row: one token per call, as the engine computes it in a flagged forward of EXL3_EXACT_ROWS."""
         from exllamav3.modules import dsv41_engram as m_engram
         torch = self.torch
         eps = eng.config.rms_norm_eps
         if m_engram.STABLE_ARITHMETIC and h.is_cuda:
             return None, None, m_engram.stable_engram_gate(h, key, eng.qk, eps)
+        if per_row and h.shape[1] > 1:
+            parts = [self._engram_gate(eng, h[:, l:l + 1], key[:, l:l + 1]) for l in range(h.shape[1])]
+            return tuple(torch.cat([p[i] for p in parts], dim = 1) for i in range(3))
         rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
         dot = (h * eng.qk * key).sum(-1) * rstd * h.shape[-1] ** -0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
@@ -933,11 +982,11 @@ class Probe:
                     return orig(x, params, out_dtype)
                 self.gpu.pop((self.layer, "engram.wkv"), None)
                 out = orig(x, params, out_dtype)
-                self.guard("engram", after, x, out)
+                self.guard("engram", after, x, out, bool(params.get("exact_rows")))
                 return out
             return forward
 
-        def after(x, out):
+        def after(x, out, per_row):
             torch = self.torch
             B, n, H, D = x.shape
             units = self.units("row", n, "engram.out")
@@ -951,7 +1000,7 @@ class Probe:
                 key = kv[..., :H * D].view(B, n, H, D)
                 value = kv[..., H * D:].view(B, n, 1, D)
                 h = x.float()
-                rstd, dot, gate = self._engram_gate(eng, h, key)
+                rstd, dot, gate = self._engram_gate(eng, h, key, per_row)
                 same = diff_stats(torch, h + gate.unsqueeze(-1) * value, out)["equal"]
                 self.record("engram.gate", units, {"streams": h[0], "key": key[0]},
                             {"rstd": None if rstd is None else rstd[0], "dot": None if dot is None else dot[0],
@@ -1105,7 +1154,9 @@ class Probe:
 
         def after(q_idx, weights, k_idx, q_pos0, m, bound_max, kwargs, out):
             R = q_idx.shape[0]
-            units = self.units("row", R, "idx.scores")
+            # the rows of the select_topk call in progress (q_pos0 is shifted by the tile): one call
+            # per tile, and under EXL3_EXACT_ROWS one select_topk per row
+            units = self.units("row", R, "idx.scores", base = self.sel_pos0)
             if units is None:
                 return
             vis = [max(0, min((q_pos0 + r + 1) // max(m, 1), bound_max)) for r in range(R)]
@@ -1131,14 +1182,20 @@ class Probe:
         torch = self.torch
 
         def select_topk(q_idx, wts, idx_pool, **kwargs):
-            res = orig(q_idx, wts, idx_pool, **kwargs)
-            if self.on() and self.layer is not None:
-                self.guard("idx.topk", after, q_idx, wts, idx_pool, kwargs, res)
+            if not (self.on() and self.layer is not None):
+                return orig(q_idx, wts, idx_pool, **kwargs)
+            prev, self.sel_pos0 = self.sel_pos0, kwargs.get("pos0")
+            try:
+                res = orig(q_idx, wts, idx_pool, **kwargs)
+            finally:
+                self.sel_pos0 = prev
+            self.guard("idx.topk", after, q_idx, wts, idx_pool, kwargs, res)
             return res
 
         def after(q_idx, wts, idx_pool, kwargs, res):
             seq = q_idx.shape[0]
-            units = self.units("row", seq, "idx.topk")
+            # the call's own rows: all of the forward's, or one of them under EXL3_EXACT_ROWS
+            units = self.units("row", seq, "idx.topk", base = kwargs.get("pos0"))
             if units is None:
                 return
             cand_in = kwargs.get("cand_in")
@@ -1174,6 +1231,7 @@ class Probe:
     # -- attention core, output projection --
 
     def _make_attn(self, orig):
+        from exllamav3.modules.attention_fn.dsa_triton import auto_splits, SPLIT_MAX_ROWS
         torch = self.torch
 
         def dsa_attn(q, pool_c, pool_r, block_table, **kwargs):
@@ -1190,10 +1248,10 @@ class Probe:
             indices, kvc = kwargs.get("indices"), kwargs.get("kv_chunk")
             win, rate = kwargs.get("win_len", 0), max(kwargs.get("compress_rate", 1), 1)
             pool_len, p0 = kwargs.get("pool_len", 0), kwargs.get("q_pos0", 0)
-            # the split count dsa_attn resolves for a call of up to 8 rows (dsa_triton.py, n_splits == 0)
+            # the split count dsa_attn resolves for the call (dsa_triton.py, n_splits == 0)
             est = (win if kvc is not None and win > 0 else 0) + \
                   (kwargs.get("k_len", 0) if indices is not None else min(pool_len, (p0 + R) // rate))
-            n_splits = kwargs.get("n_splits", 0) or ((16 if est > 256 else 8) if R <= 8 else 1)
+            n_splits = kwargs.get("n_splits", 0) or (auto_splits(est) if R <= SPLIT_MAX_ROWS else 1)
             self.record("attn.dsa_attn", units, {"q": q, "kv_chunk": kvc, "indices": indices},
                         {"out": out.permute(1, 0, 2)},
                         meta = {"rows": R, "est": est, "n_splits": n_splits, "pool": "gathered" if indices is not None
@@ -1283,20 +1341,28 @@ class Probe:
         def routing_ds3_nogroup(*args, **kwargs):
             res = orig(*args, **kwargs)
             stage = self.moe_stage
-            if stage == "real" and len(args) >= 6:
-                # the layer's own routing call (a prefetch prediction of the expert cache may follow)
-                self.moe_stage = "done"
+            # The layer's own routing calls are those on its own gate: one for the call, or one per
+            # row under EXL3_EXACT_ROWS. A prefetch prediction of the expert cache routes the same
+            # input through a later layer's gate
+            if stage is None or len(args) < 6 or args[1] is not self.moe_gate:
+                return res
+            n = args[0].shape[0]
+            if stage == "real":
                 try:
-                    n = args[0].shape[0]
-                    self.route = {"z": args[0].clone(), "logits": args[2].reshape(n, -1).clone(),
-                                  "sel": args[4].reshape(n, -1).clone(), "w": args[5].reshape(n, -1).clone()}
+                    self.routes.append({"z": args[0].clone(), "logits": args[2].reshape(n, -1).clone(),
+                                        "sel": args[4].reshape(n, -1).clone(), "w": args[5].reshape(n, -1).clone()})
                 except Exception as e:
                     self._error(f"capture moe.router L{self.layer}: {type(e).__name__}: {e}")
-            elif stage == "forced" and len(args) >= 6:
-                self.moe_stage = "done"
+            elif stage == "forced":
                 sel, w = self.force
-                args[4].copy_(sel.reshape(args[4].shape))
-                args[5].copy_(w.reshape(args[5].shape))
+                r0 = self.force_row
+                if r0 + n <= sel.shape[0]:
+                    args[4].copy_(sel[r0:r0 + n].reshape(args[4].shape))
+                    args[5].copy_(w[r0:r0 + n].reshape(args[5].shape))
+                    self.force_row = r0 + n
+                else:
+                    self._error(f"replay moe L{self.layer}: a routing call of {n} rows after {r0} of "
+                                f"{sel.shape[0]} forced rows")
             return res
         return routing_ds3_nogroup
 
@@ -1307,7 +1373,8 @@ class Probe:
             def forward(x, params, out_dtype = None):
                 if not self.on():
                     return orig(x, params, out_dtype)
-                self.route, self.moe_stage = None, "real"
+                self.routes, self.moe_stage = [], "real"
+                self.moe_gate = getattr(getattr(mlp, "routing_cfg", None), "gate_tensor", None)
                 try:
                     out = orig(x, params, out_dtype)
                 finally:
@@ -1316,13 +1383,20 @@ class Probe:
                 return out
             return forward
 
+        def set_forced(sel, w):
+            # the layer's routing calls that follow get these rows, in order
+            self.force, self.force_row, self.moe_stage = (sel, w), 0, "forced"
+
         def after(orig, x, params, out_dtype, out):
             y = x.reshape(-1, x.shape[-1])
             n = y.shape[0]
             units = self.units("row", n, "moe.out")
             if units is None:
                 return
-            route = self.route
+            # the routing calls of this forward, in row order: one of n rows, or n of one row
+            route = {k: torch.cat([r[k] for r in self.routes], dim = 0) for k in ("z", "logits", "sel", "w")} \
+                if self.routes else None
+            self.routes = []
             ins = {"y": y}
             if route is not None and route["z"].shape[0] == n:
                 self.record("moe.router", units, {"z": route["z"]},
@@ -1357,7 +1431,7 @@ class Probe:
             def forced():
                 # the experts with the K-row call's own selection and weights, one row at a time
                 for r in range(n):
-                    self.force, self.moe_stage = (route["sel"][r:r + 1], route["w"][r:r + 1]), "forced"
+                    set_forced(route["sel"][r:r + 1], route["w"][r:r + 1])
                     o1 = orig(_one_row(x, r), params, out_dtype)
                     self.rep("moe.out:y [routing forced to the K-row call's]", r, o1.reshape(-1), rows_out[r])
             self.replay("moe.forced", forced, restore)
@@ -1365,10 +1439,10 @@ class Probe:
             def shared():
                 # every routing weight 0: what remains is the shared expert's term
                 zero = torch.zeros_like(route["w"])
-                self.force, self.moe_stage = (route["sel"], zero), "forced"
+                set_forced(route["sel"], zero)
                 many = orig(x.clone(), params, out_dtype).reshape(n, -1).clone()
                 for r in range(n):
-                    self.force, self.moe_stage = (route["sel"][r:r + 1], zero[r:r + 1]), "forced"
+                    set_forced(route["sel"][r:r + 1], zero[r:r + 1])
                     o1 = orig(_one_row(x, r), params, out_dtype)
                     self.rep("moe.out:y [routing weights 0: the shared expert]", r, o1.reshape(-1), many[r])
             self.replay("moe.shared", shared, restore)
@@ -1407,6 +1481,82 @@ def same_runs(torch, x: Run, y: Run, subset: bool = False) -> dict:
                         first = {"op": key[0], "layer": key[1], "unit": u, "side": side, "name": name,
                                  "missing": a is None or b is None}
     return {"equal": bad == 0, "tensors": total, "differing": bad, "first": first}
+
+
+def _hash_tensor(torch, h, t):
+    """dtype, shape and bytes of a CPU tensor into h (floats as their bit patterns)."""
+    t = t.detach().contiguous().reshape(-1)
+    h.update(f"{t.dtype}{t.numel()}|".encode())
+    if t.numel():
+        if t.is_floating_point():
+            t = t.view({2: torch.int16, 4: torch.int32, 8: torch.int64}[t.element_size()])
+        h.update(t.numpy().tobytes())
+
+
+def run_digest(torch, run: Run) -> dict:
+    """SHA-256 of what a run captured, for comparing two reports (--same-pristine): 'logits',
+    'tensors' (every captured input and output, in execution order) and the same per operation."""
+    total, by_op = hashlib.sha256(), {}
+    for op, layer in _run_keys(run):
+        units = run.rec[(op, layer)]["units"]
+        mine = by_op.setdefault(op, hashlib.sha256())
+        for u in sorted(units):
+            for side in ("in", "out"):
+                for name in sorted(units[u][side]):
+                    for h in (total, mine):
+                        h.update(f"{op}|{layer}|{u}|{side}|{name}|{tuple(units[u][side][name].shape)}|".encode())
+                        _hash_tensor(torch, h, units[u][side][name])
+    logits = hashlib.sha256()
+    _hash_tensor(torch, logits, run.logits)
+    return {"logits": logits.hexdigest(), "tensors": total.hexdigest(),
+            "by_op": {op: h.hexdigest() for op, h in by_op.items()}}
+
+
+def same_pristine(path_a: str, path_b: str) -> int:
+    """--same-pristine: the pristine one-row reference of two reports, by its digests. 0 equal,
+    1 different, 2 not comparable. Torch-free."""
+    import json
+    reports = []
+    for path in (path_a, path_b):
+        try:
+            with open(path, encoding = "utf-8") as f:
+                reports.append(json.load(f))
+        except (OSError, ValueError) as e:
+            print(f"--same-pristine: {path}: {type(e).__name__}: {e}")
+            return 2
+    for path, r in zip((path_a, path_b), reports):
+        digest = (r.get("pristine") or {}).get("sha256") if isinstance(r, dict) else None
+        if not isinstance(digest, dict) or not all(isinstance(digest.get(k), str) for k in ("logits", "tensors")) \
+                or not isinstance(digest.get("by_op"), dict):
+            print(f"--same-pristine: {path} holds no digests of a pristine reference (a completed report of this "
+                  f"tool has pristine.sha256)")
+            return 2
+    a, b = reports
+    for what in ("tokens", "placement", "numerics"):
+        if a.get(what) != b.get(what):
+            print(f"--same-pristine: not comparable, the reports differ in '{what}': {a.get(what)!r} against "
+                  f"{b.get(what)!r}")
+            return 2
+    for path, r in zip((path_a, path_b), reports):
+        arith = r.get("arithmetic") or {}
+        tune = r.get("tune_cache") or {}
+        print(f"  {path}: EXACT_ROWS {'ON' if arith.get('exact_rows') else 'off'}, STABLE_ARITHMETIC "
+              f"{'ON' if arith.get('stable_arithmetic') else 'off'}, autotune cache {tune.get('used_path')}, "
+              f"{len(tune.get('added_by_this_run') or {})} record(s) added by the run")
+    da, db = a["pristine"]["sha256"], b["pristine"]["sha256"]
+    ops = sorted(set(da["by_op"]) | set(db["by_op"]), key = lambda op: (_op_index(op), op))
+    differing = [op for op in ops if da["by_op"].get(op) != db["by_op"].get(op)]
+    same = da["logits"] == db["logits"] and da["tensors"] == db["tensors"] and not differing
+    rows = len((a.get("tokens") or {}).get("probed_ids") or ())
+    print(f"pristine one-row reference ({rows} one-row steps before any K-row forward): logits "
+          f"{'equal' if da['logits'] == db['logits'] else 'DIFFERENT'}, captured tensors of {len(ops)} operations "
+          f"{'equal' if da['tensors'] == db['tensors'] and not differing else 'DIFFERENT'}")
+    if differing:
+        print("   operations whose captured tensors differ, in execution order: " + " ".join(differing))
+    if a.get("tune_cache", {}).get("used_path") != b.get("tune_cache", {}).get("used_path"):
+        print("   note: the runs used different autotune cache files; one-row results follow the records of that "
+              "file, so compare runs that share one (--tune-cache PATH)")
+    return 0 if same else 1
 
 
 def compare_arms(torch, a: Run, b: Run, probe: Probe) -> dict:
@@ -2014,6 +2164,7 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     report["state"] = {"position": P, "window_beg": window_beg, "rollback_capacity": st.rollback_capacity()}
     eq = lambda a, b: diff_stats(torch, a, b)["equal"]
     stable = report["arithmetic"]["stable_arithmetic"]
+    exact = report["arithmetic"]["exact_rows"]
 
     # The pristine reference: the one-row arm on the state as prefilled, before this process has
     # run any K-row verify forward. Twice unhooked (the first use of a launch bucket may be the
@@ -2034,7 +2185,8 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
     finally:
         probe0.uninstall()
         drv.probe = None
-    pristine = {"first_use_equals_second": eq(first, ref), "captured_equals_unhooked": eq(A0.logits, ref)}
+    pristine = {"first_use_equals_second": eq(first, ref), "captured_equals_unhooked": eq(A0.logits, ref),
+                "sha256": run_digest(torch, A0)}
     del first
     report["pristine"] = pristine
     print(f"pristine reference: {kmax} one-row steps before any K-row forward; captured run equals the unhooked "
@@ -2102,6 +2254,11 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
         for K in ks:
             la0, lb0 = plain[K]
             checks = {"deterministic_unhooked": det[K]}
+            # EXL3_EXACT_ROWS: whether the K-row forward is one the mode computes row by row
+            mode = None
+            if exact:
+                span = model.exact_rows_span(P, K)
+                mode = {"covered": span == K, "span": span}
             probe.replays, probe.notes = {}, []
             probe.mode = "capture"
             A, B = Run("one-row"), Run(f"{K}-row")
@@ -2135,6 +2292,11 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
             cmp = compare_arms(torch, A, B, probe)
             lrows = logits_rows(torch, A.logits, B.logits, P)
             print_insitu(cmp, K, P, n_layers)
+            if mode is not None:
+                print("   EXL3_EXACT_ROWS: " + (
+                    f"the {K}-row forward is computed with one-row arithmetic" if mode["covered"] else
+                    f"the {K}-row forward is OUTSIDE the mode: a one-row step changes its attention plan at row "
+                    f"{mode['span']} (position {P + mode['span']}), so the call keeps the default arithmetic"))
             print_logits(lrows)
             if probe.replays:
                 print_replay(probe.replays, K, n_layers)
@@ -2150,7 +2312,7 @@ def _probe(torch, ext, val, args, model, cache, ids, ks, prefill_chunk, report, 
                     "=" if not d["rows_diff"] else _layer_name(d["first"]["layer"], n_layers)
             report["k"][K] = {"insitu": cmp["rows"], "first_divergence": cmp["first"], "origins": cmp["origins"][:200],
                               "dispatch": cmp["dispatch"], "logits": lrows, "replay": probe.replays,
-                              "checks": checks, "notes": probe.notes, "checks_ok": good}
+                              "checks": checks, "notes": probe.notes, "checks_ok": good, "exact_rows": mode}
             sys.stdout.flush()
             del A, B, cmp
             gc.collect()
@@ -2248,6 +2410,8 @@ def _print_checks(checks: dict, K: int) -> bool:
 def main(argv = None) -> int:
     val = _load_validate()
     args = build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
+    if args.same_pristine:
+        return same_pristine(*args.same_pristine)
     try:
         policy = math_policy(val)
     except ValueError as error:
