@@ -1283,11 +1283,17 @@ shape), the differences are last-bit rounding, and a near-tie then resolves to a
 
 With `1`, a cached DeepSeek-V4.1 forward of one sequence with 2 to 8 rows:
 
-- runs one row at a time, through the call a decode step makes: every linear (attention,
-  compressor, indexer, engram, output head), the grouped output projection, the whole MoE layer
-  (router, expert cache lookup, routed and shared experts), the index selection, the compressor's
-  pooling and norm, the engram gate, and the torch sums of the stream collapse and of the
-  hyper-connection pre-mix;
+- gives every row the launch a decode step makes, in the operations that follow the row count:
+  every linear (attention, compressor, indexer, engram, output head), the grouped output
+  projection, the MoE layer (router, routed and shared experts), the index selection, the
+  compressor's pooling and norm, the engram gate, and the torch sums of the stream collapse and
+  of the hyper-connection pre-mix. With an extension that has the row-exact entry points
+  (`exllamav3_ext.exact_rows_caps()`), the rows of an EXL3 linear, of the grouped output
+  projection and of the router projection are launched from one native call each, the MoE
+  experts of all rows run in one launch pair with the launch geometry of one row (no grouping of
+  rows that picked the same expert), the router selects for all rows in one launch, and the two
+  torch sums run in the extension; the index selection, `idx.weights_proj`, the compressor's
+  pooling and norm and the engram gate are one Python call per row;
 - keeps batched what is computed per row whatever the row count: RMS norms, RoPE, the attention
   kernel, the residual update, pool and ring stores, and the hyper-connection mix kernel, which
   takes the column partition of a one-row call;
@@ -1311,19 +1317,36 @@ prints a warning when a draft is configured: the mode does nothing there). A pre
 to 8 rows (a short prompt tail) is computed row by row as well, so its rows get decode
 arithmetic.
 
-Cost: every operation that decodes weights runs once per row, so a verify forward of K rows
-costs up to K decode steps, less what stays batched. Without the mode it costs 1.1 (K = 2) to 1.7
-(K = 8) decode steps (measured on one host with DeepSeek-V4.1-Flash). A verify forward that costs
-c decode steps is faster than one-token steps only if more than c - 1 of its draft tokens are
+Cost: every linear decodes its weights once per row, so a verify forward of K rows costs more
+than without the mode, where it costs 1.1 (K = 2) to 1.7 (K = 8) decode steps (measured on one
+host with DeepSeek-V4.1-Flash). With the Python row loops alone it costs 1.6 (K = 2) to 5.1
+(K = 8) decode steps on that host. The row-exact entry points remove the interpreter and the
+bindings between the rows of the operations they cover, not the per-row decode; what a verify
+forward costs with them is what the probe prints on the host. A verify forward that costs c
+decode steps is faster than one-token steps only if more than c - 1 of its draft tokens are
 accepted, so drafting can be slower than not drafting under the mode. Measure both before
-serving with a draft: `tools/dsv41_rowprobe.py` prints c per K (its timing table, "that forward
-in one-row steps"), `tests/test_dsv41_exact_rows_gen_gpu_.py` the tokens per second of drafted
+serving with a draft: `tools/dsv41_rowprobe.py` prints c per K (its
+timing table, "that forward in one-row steps", and with `--exact-rows-caps` the same for a subset
+of the entry points), `tests/test_dsv41_exact_rows_gen_gpu_.py` the tokens per second of drafted
 and undrafted generation with the accepted and rejected draft tokens. Where the acceptance does
 not reach c - 1, serve the mode without a draft or with a shorter one (`num_draft_tokens`).
 
+The entry points change where the launches are made, not the results. With an extension built
+before them the Python row loops run, and they also run for whatever an entry point does not
+cover: a linear with a LoRA, a scale or a softcap, or under calibration capture; an MoE layer
+whose shared expert is not a fused launch inside the decode kernels, or with
+`EXL3_MOE_COOP_KSPLIT` forced beyond what 8 rows fit, or whose expert cache would not look the
+rows up in decode mode (`EXL3_MOE_TIER_DECODE_ROWS` below the row count). An MoE layer that the
+entry points serve looks its expert cache up once per verify forward, for up to 8 x top-k experts
+in one decode lookup and one token tick, as a verify forward does without the mode (row by row,
+it is one lookup per row); with `prefetch=router` the prediction for a later cache layer then
+comes from the multi-row projection. Both only decide where an expert's bytes are, not the
+result.
+
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported.
 Read once, in Python (`exllamav3.model.math_policy`); the extension does not read it and there is
-no command-line flag.
+no command-line flag. The extension only reports which row-exact entry points it was built with,
+and there is no setting to choose among them.
 
 Refused: at import, together with `EXL3_STABLE_ARITHMETIC=1` (that profile replaces the one-row
 arithmetic this mode keeps) or with `EXL3_DSV41_FUSED_COMPRESS`; when the model is built, a
@@ -1343,7 +1366,8 @@ prefill a long prompt with other forwards; an n-gram draft does not.
 `tools/dsv41_rowprobe.py` measures the mode operation by operation in a real forward (every line
 of its tables reads `=`), and is the only check of the index selection and of the attention
 kernel. `tests/test_dsv41_exact_rows_gpu_.py` checks the other operations one by one on each GPU,
-and `tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation.
+against one-row calls and, for each row-exact entry point, against the Python row loop, and
+`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation.
 
 ```sh
 EXL3_EXACT_ROWS=1 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3

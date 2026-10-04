@@ -730,11 +730,17 @@ tool refuses to run unless `--allow-stable` is given: every operation should the
 which validates the probe.
 
 Under `EXL3_EXACT_ROWS=1` (see `doc/env_vars.md`) the tool is that mode's acceptance test: the
-K-row forward then runs the operations that follow the row count one row per call, the wrappers
-follow those calls row by row, and every in-situ and replay line is expected to read `=`, with
-bit-equal logits; the index selection and the attention kernel have no other test. The timing
-table then gives what a verify forward costs under the mode, in one-row steps: the figure that
-decides whether a draft pays. Per K it says whether the forward is one the mode covers; a forward
+K-row forward then gives every row of the operations that follow the row count the launch of a
+one-row call, from the extension's row-exact entry points or from Python, one call per row; the
+wrappers follow both, and every in-situ and replay line is expected to read `=`, with bit-equal
+logits; the index selection and the attention kernel have no other test. The tool prints the
+entry points in use and the MoE layers they serve. `--exact-rows-caps MASK` runs with a subset of
+them (a sum of 1 EXL3 linears, 2 grouped `wo_a`, 4 router, 8 MoE experts, 16 hyper-connection
+sums; the MoE needs 4 and 8 together; `0` is the Python row loops alone), which gives the same
+tables and the cost of each step. The timing table then gives what a verify forward costs under
+the mode, in one-row steps: the figure that decides whether a draft pays; its `host` column is
+the part of each arm until `model.forward` returned, before the logits copy waits for the GPU.
+Per K it says whether the forward is one the mode covers; a forward
 whose rows cross a change of the attention plan (`--prefix 124`, `252`, `508` or `1020` with
 enough rows on DeepSeek-V4.1-Flash) is not, and keeps the default arithmetic. The report holds
 SHA-256 digests of the pristine one-row reference (its logits and every captured tensor), and
