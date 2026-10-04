@@ -214,6 +214,8 @@ covering the input Hadamard, activation quantization, dp4a GEMV and output Hadam
 (default) is the plain int8 mode, `1` the error-feedback residual mode (~15–16 bit effective
 activation precision, slightly slower), `0` disables the path.
 
+Under `EXL3_EXACT_ROWS=1` the value also decides what a draft verification costs: see "Cost" there.
+
 Tensors quantized with other codebooks are unaffected and keep their regular kernels. When the
 mode is enabled, gate/up (and other same-input) tensor pairs that the int8 path can take are
 also *unfused* from the batched MGEMM when each matrix is wide enough to fill the GPU on its
@@ -1293,7 +1295,12 @@ With `1`, a cached DeepSeek-V4.1 forward of one sequence with 2 to 8 rows:
   experts of all rows run in one launch pair with the launch geometry of one row (no grouping of
   rows that picked the same expert), the router selects for all rows in one launch, and the two
   torch sums run in the extension; the index selection, `idx.weights_proj`, the compressor's
-  pooling and norm and the engram gate are one Python call per row;
+  pooling and norm and the engram gate are one Python call per row. Where the one-row call of
+  an EXL3 linear or of the grouped output projection is the cooperative FP16 kernel, an
+  extension that reports bit 32 of `exact_rows_caps()` makes ONE launch for the rows instead of
+  one per row, under the launch record of the one-row call (kernel shape, block count,
+  concurrency): with that record fixed the kernel computes a row with the same operations in the
+  same order whatever the row count, so the rows keep their one-row bits (see "Cost");
 - keeps batched what is computed per row whatever the row count: RMS norms, RoPE, the attention
   kernel, the residual update, pool and ring stores, and the hyper-connection mix kernel, which
   takes the column partition of a one-row call;
@@ -1317,13 +1324,35 @@ prints a warning when a draft is configured: the mode does nothing there). A pre
 to 8 rows (a short prompt tail) is computed row by row as well, so its rows get decode
 arithmetic.
 
-Cost: every linear decodes its weights once per row, so a verify forward of K rows costs more
-than without the mode, where it costs 1.1 (K = 2) to 1.7 (K = 8) decode steps (measured on one
-host with DeepSeek-V4.1-Flash). With the Python row loops alone it costs 1.6 (K = 2) to 5.1
-(K = 8) decode steps on that host. The row-exact entry points remove the interpreter and the
-bindings between the rows of the operations they cover, not the per-row decode; what a verify
-forward costs with them is what the probe prints on the host. A verify forward that costs c
-decode steps is faster than one-token steps only if more than c - 1 of its draft tokens are
+Cost: it depends on `EXL3_INT8_GEMV`, because that variable decides which kernel a one-row call
+of a mul1 EXL3 linear takes, and the mode gives every row that kernel's bits. Without the mode a
+verify forward of K rows costs 1.1 (K = 2) to 1.7 (K = 8) decode steps (measured on one host
+with DeepSeek-V4.1-Flash); with the Python row loops alone the mode costs 1.6 (K = 2) to 5.1
+(K = 8) decode steps on that host.
+
+- Default `EXL3_INT8_GEMV` (the int8 path on): a one-row call of a mul1 linear is the
+  int8-activation GEMV, which decodes the whole weight for its one row, and its one-row launch
+  is not its launch for two rows. Every such linear is one launch per row, so a verify forward
+  decodes the weights K times. The row-exact entry points remove the interpreter and the
+  bindings between the rows, not the per-row decode: measured on a three-GPU host, 1.8 (K = 3)
+  to 4.0 (K = 8) decode steps, where a verify forward without the mode costs 1.3 to 1.7 (that
+  measurement predates the single launch of the grouped output projection, which never takes
+  the int8 path and is one launch for the rows under this setting too). One-token decode keeps
+  its full speed.
+- `EXL3_INT8_GEMV=0`: a one-row call is the cooperative FP16 kernel, which a call of several rows
+  takes too. With an extension that reports bit 32 of `exact_rows_caps()`, every EXL3 linear and
+  the grouped output projection of a verify forward is one launch for its rows, under the launch
+  record of the one-row call, and decodes the weights once, as a verify forward without the mode
+  does. One-token decode is slower without the int8 path (42.1 against 43.6 tokens per second
+  on the three-GPU host, 3.5%). The exceptions keep one launch per row: a linear whose one-row
+  call is the FP16 GEMV (`EXL3_GEMV`, bitrates 2 to 4), a width that is not a multiple of 128,
+  and the first verify forward of a process for a linear shape whose one-row launch record the
+  process does not hold yet (the one-row launches of that forward load or tune it).
+
+Generation with a draft returns the tokens of generation without one under either setting; the
+setting changes which one-row arithmetic both have, and the cost. What a verify forward costs on
+a host is what the probe prints there. A verify forward that costs c decode steps is faster than
+one-token steps only if more than c - 1 of its draft tokens are
 accepted, so drafting can be slower than not drafting under the mode. Measure both before
 serving with a draft: `tools/dsv41_rowprobe.py` prints c per K (its
 timing table, "that forward in one-row steps", and with `--exact-rows-caps` the same for a subset
@@ -1331,8 +1360,11 @@ of the entry points), `tests/test_dsv41_exact_rows_gen_gpu_.py` the tokens per s
 and undrafted generation with the accepted and rejected draft tokens. Where the acceptance does
 not reach c - 1, serve the mode without a draft or with a shorter one (`num_draft_tokens`).
 
-The entry points change where the launches are made, not the results. With an extension built
-before them the Python row loops run, and they also run for whatever an entry point does not
+The entry points change where and how often the launches are made, not the results. The
+extension counts the calls it served with one launch for their rows
+(`exllamav3_ext.exact_rows_one_launches()`), which the tests and the probe read: both routes
+give the same bits, so nothing else tells them apart. With an extension built before the entry
+points the Python row loops run, and they also run for whatever an entry point does not
 cover: a linear with a LoRA, a scale or a softcap, or under calibration capture; an MoE layer
 whose shared expert is not a fused launch inside the decode kernels, or with
 `EXL3_MOE_COOP_KSPLIT` forced beyond what 8 rows fit, or whose expert cache would not look the
@@ -1346,7 +1378,8 @@ result.
 Values: `0` (default) or `1`; anything else raises a `ValueError` when `exllamav3` is imported.
 Read once, in Python (`exllamav3.model.math_policy`); the extension does not read it and there is
 no command-line flag. The extension only reports which row-exact entry points it was built with,
-and there is no setting to choose among them.
+and there is no setting to choose among them: whether the rows of a linear are one launch follows
+from `EXL3_INT8_GEMV` alone.
 
 Refused: at import, together with `EXL3_STABLE_ARITHMETIC=1` (that profile replaces the one-row
 arithmetic this mode keeps) or with `EXL3_DSV41_FUSED_COMPRESS`; when the model is built, a
@@ -1367,10 +1400,17 @@ prefill a long prompt with other forwards; an n-gram draft does not.
 of its tables reads `=`), and is the only check of the index selection and of the attention
 kernel. `tests/test_dsv41_exact_rows_gpu_.py` checks the other operations one by one on each GPU,
 against one-row calls and, for each row-exact entry point, against the Python row loop, and
-`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation.
+`tests/test_dsv41_exact_rows_gen_gpu_.py` compares drafted with undrafted generation. Both test
+files and the probe are meant to be run under both settings of `EXL3_INT8_GEMV`, on every GPU
+type that serves the model: the single launch rests on the tensor-core instruction computing an
+output row from that row's inputs alone, which the source cannot show and these runs do. On
+sm_86 the kernel accumulates in FP16 within a block; the same argument covers it, and it has had
+no such run.
 
 ```sh
 EXL3_EXACT_ROWS=1 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3
+# the rows of every EXL3 linear in one launch; one-token steps without the int8 path
+EXL3_EXACT_ROWS=1 EXL3_INT8_GEMV=0 python examples/chat.py -m /path/to/DeepSeek-V4.1-Flash-exl3 -ngram 3
 ```
 
 ## Model loading
