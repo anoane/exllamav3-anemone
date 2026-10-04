@@ -176,6 +176,16 @@ class ExactRowsTests(unittest.TestCase):
                 self.assertIs(policy.exact_rows(rows), False)
                 self.assertIs(load({"EXL3_EXACT_ROWS": "1"}).exact_rows(rows), inside)
 
+    def test_row_sum_gate(self):
+        # exact_rows_sum: fewer than 16 terms at any width of 2 or more, fewer than 256 at an odd width
+        policy = load({})
+        self.assertEqual((policy.EXACT_ROWS_SUM_TERMS, policy.EXACT_ROWS_SUM_TERMS_WIDE), (16, 256))
+        for terms, width, expected in ((4, 5120, True), (80, 25, True), (15, 4, True), (255, 25, True), (2, 2, True),
+                                       (16, 4, False), (80, 24, False), (256, 25, False), (1, 5120, False),
+                                       (4, 1, False), (0, 25, False), (16, 25, True), (15, 1, False)):
+            with self.subTest(terms = terms, width = width):
+                self.assertIs(policy.exact_rows_sum(terms, width), expected)
+
     def test_native_entry_points(self):
         # exact_rows_native: what the extension reports, behind the switch; an extension built before
         # the row-exact entry points has no exact_rows_caps

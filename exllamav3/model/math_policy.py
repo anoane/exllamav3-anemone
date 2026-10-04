@@ -127,6 +127,34 @@ def exact_rows_native(ext_module, enabled: bool = None) -> int:
     return 0 if caps is None else int(caps())
 
 
+def exact_rows_sum(terms: int, width: int) -> bool:
+    """
+    EXL3_EXACT_ROWS: whether torch's sum over the middle dimension of a contiguous FP32 CUDA operand
+    (rows, terms, width) may run over all rows of a flagged call at once and still give every row
+    the bits of the sum over its own (1, terms, width) operand. torch has no argument that pins the
+    layout of a reduction, so this is the bound inside which its layout (ATen/native/cuda/
+    Reduce.cuh, setReduceConfig) lets ONE thread add all terms of an output, in an order fixed by
+    the term count alone, whatever the number of outputs:
+
+      * the reduced dimension is not the fastest-striding one (width >= 2), so outputs, not
+        terms, are split across the lanes of a warp;
+      * terms are split across warps only from min(16 * block height, 256) terms per thread on.
+        Fewer than EXACT_ROWS_SUM_TERMS terms never reach that at any block height. Up to
+        EXACT_ROWS_SUM_TERMS_WIDE the block is at least 16 threads high only when the outputs are
+        not loaded as vectors, which an odd width guarantees (an even width may give a block 4 or
+        8 threads high for some output counts and not others: a real row-count dependence).
+
+    Everything else keeps the per-row form (terms: size of the reduced dimension, width: size of
+    the operand's last dimension). Callers also compare the two forms bitwise on first use
+    (modules/dsv41_block.py, _sum_rows)
+    """
+    if terms < 2 or width < 2:
+        return False
+    if terms < EXACT_ROWS_SUM_TERMS:
+        return True
+    return terms < EXACT_ROWS_SUM_TERMS_WIDE and width % 2 == 1
+
+
 def require_whole_k_moe(key: str, built: bool, stable: bool = None):
     """
     EXL3_STABLE_ARITHMETIC runs every fused MoE launch through the kernel's whole-K instances, which
@@ -161,6 +189,11 @@ EXACT_ROWS_CAP_HC = 16          # hc_collapse_rows, hc_partials_rows
 # With the int8 path on they launch per row. Tests and tools/dsv41_rowprobe.py read both
 EXACT_ROWS_CAP_ONE_LAUNCH = 32
 EXACT_ROWS_CAP_HGEMM = 64       # hgemm_rows
+
+# EXL3_EXACT_ROWS: the term counts below which a torch sum over the rows of a flagged call is
+# row-exact (exact_rows_sum): any width, and an odd width
+EXACT_ROWS_SUM_TERMS = 16
+EXACT_ROWS_SUM_TERMS_WIDE = 256
 
 STABLE_ARITHMETIC = stable_arithmetic_enabled()
 HGEMM_FIXED_ROWS = hgemm_fixed_rows()
