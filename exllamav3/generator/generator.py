@@ -182,6 +182,9 @@ class Generator:
         # no headroom of num_draft_tokens below its requeue point or in its default token budgets (draft_headroom)
         self.exact_rows = EXACT_ROWS and bool(model.caps.get("exact_rows"))
         self.draft_headroom = 0 if self.exact_rows else self.num_draft_tokens
+        if EXACT_ROWS and not self.exact_rows and self.num_draft_tokens:
+            print(" !! Warning: EXL3_EXACT_ROWS=1 does not cover this model architecture; generation with a draft "
+                  "may return other tokens than generation without one")
 
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
