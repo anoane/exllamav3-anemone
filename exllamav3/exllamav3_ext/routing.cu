@@ -681,8 +681,8 @@ static void routing_ds3_nogroup_impl
 
     if (exact_rows)
     {
-        // Everything the per-row launches read or write is checked before the first one; the checks
-        // below, ahead of the top-k launch, cover the rest
+        // Everything the call reads or writes, the top-k launch included, is checked before the first
+        // per-row launch; the checks below are those of the plain call, repeated
         TORCH_CHECK(!stable_arithmetic(), "routing_ds3_nogroup_rows: EXL3_STABLE_ARITHMETIC replaces the one-row projection");
         TORCH_CHECK_DIM(hidden, 2);
         TORCH_CHECK_DIM(gate, 2);
@@ -708,6 +708,22 @@ static void routing_ds3_nogroup_impl
             TORCH_CHECK(gt.dtype() == at::kHalf && gt.dim() == 2 && gt.is_contiguous() &&
                         gt.size(0) == gate.size(1) && gt.size(1) == gate.size(0) && gt.device() == scores.device(),
                         "routing_ds3_nogroup_rows: gate_t must be the contiguous transposed gate");
+        }
+        TORCH_CHECK_DTYPE(topk_indices, kLong);
+        TORCH_CHECK_DTYPE(topk_weights, kHalf);
+        TORCH_CHECK(topk_indices.size(0) == rows && topk_weights.size(0) == rows && topk_indices.size(1) == topk_weights.size(1),
+                    "routing_ds3_nogroup_rows: topk_indices and topk_weights must be (rows, k)");
+        TORCH_CHECK(scores.size(1) >= 1 && scores.size(1) <= MAX_NUM_EXPERTS &&
+                    topk_indices.size(1) <= MAX_K && topk_indices.size(1) <= scores.size(1),
+                    "routing_ds3_nogroup_rows: the expert count or the experts per token are out of range");
+        TORCH_CHECK(topk_indices.device() == scores.device() && topk_weights.device() == scores.device(),
+                    "routing_ds3_nogroup_rows: topk_indices and topk_weights must be on the device of scores");
+        if (bias.has_value())
+        {
+            const at::Tensor& b = bias.value();
+            TORCH_CHECK(b.dtype() == at::kHalf && b.dim() >= 1 && b.is_contiguous() &&
+                        b.size(0) == scores.size(1) && b.device() == scores.device(),
+                        "routing_ds3_nogroup_rows: bias must be contiguous FP16, one entry per expert, on the device of scores");
         }
 
         for (int64_t r = 0; r < rows; ++r)
