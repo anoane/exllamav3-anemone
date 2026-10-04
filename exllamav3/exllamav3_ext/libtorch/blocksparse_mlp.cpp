@@ -140,6 +140,24 @@ void BC_BlockSparseMLP::run_bszN_rows
     TORCH_CHECK(sh_coop || !shared_experts, "run_bszN_rows: the shared expert is not a fused launch (rows_exact_ok)");
     const int num_tokens = (int) rows;
 
+    // The parameter blocks hold raw pointers of the module's device
+    TORCH_CHECK(y.device() == out_bszn.device(), "run_bszN_rows: y must be on the module's device");
+
+    // What exl3_moe_coop_run and exl3_moe_coop_launch check per launch pair, for both pairs and ahead
+    // of the first: the routed pair must not be refused once the shared expert's is on the stream
+    const int64_t H = y.size(1);
+    const int64_t topk = selected_experts.size(1);
+    TORCH_CHECK(H % 4 == 0 && H <= coop_p.Hi && (!sh_coop || H <= sh_coop_p.Hi), "run_bszN_rows: y width");
+    // The routed pair reads the shared expert's rows at the width of y
+    TORCH_CHECK(!sh_coop || (coop_p.H_out == H && sh_coop_p.H_out == H && sh_coop_p.out_stride == H &&
+                             (!coop_p.sh_gate_w || (coop_p.sh_gate_n == H && H % 2 == 0))),
+                "run_bszN_rows: the shared expert's output or gate does not have the width of y");
+    TORCH_CHECK(coop_p.min_expert < 0 || coop_p.max_expert - coop_p.min_expert <= coop_p.n_local,
+                "run_bszN_rows: expert range exceeds tables");
+    TORCH_CHECK(topk <= coop_p.slots_max && exl3_moe_coop_rows_ok(coop_p, (int) topk, num_tokens) &&
+                (!sh_coop || exl3_moe_coop_rows_ok(sh_coop_p, 1, num_tokens)),
+                "run_bszN_rows: the rows do not fit the scratch at the split-k factor of a one-row call (rows_exact_ok)");
+
     c10::cuda::CUDAGuard device_guard(y.device());
 
     c10::optional<at::Tensor> sh_o;
