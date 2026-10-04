@@ -9,7 +9,9 @@ from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
-from ..model.math_policy import EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_LINEAR, exact_rows_native
+from ..model.math_policy import (
+    EXACT_ROWS, EXACT_ROWS_MAX, EXACT_ROWS_CAP_LINEAR, EXACT_ROWS_CAP_HGEMM, exact_rows_native,
+)
 from ..util.tensor import forward_rows
 
 # EXL3_EXACT_ROWS: the row-exact entry points of the extension (0 without the switch, and with an
@@ -635,15 +637,16 @@ class Linear(Module):
         # EXL3_EXACT_ROWS: a flagged forward (params["exact_rows"], set by the model per forward)
         # projects one row per call, each the complete one-row call below. The kernel, its
         # activation format and its launch configuration follow the row count of a call. Where the
-        # extension has the row-exact entry point and a one-row call is nothing but the EXL3
-        # projection (rows_native), one native call gives every row its one-row bits: the one-row
-        # launch per row, or one launch for the rows under the launch record of a one-row call
-        # (BC_LinearEXL3::run_alloc_rows decides).
+        # extension has the row-exact entry point and a one-row call is nothing but the projection
+        # (rows_native), one native call gives every row its one-row bits. An EXL3 weight: the
+        # one-row launch per row, or one launch for the rows under the launch record of a one-row
+        # call (BC_LinearEXL3::run_alloc_rows decides). An FP16 weight through the native GEMM:
+        # the one-row GEMM per row (hgemm_rows).
         # Otherwise the rows are forwarded one by one from here: every path below returns a tensor
         # it allocated in the call (LinearEXL3.forward and BC_LinearEXL3::run_alloc,
         # LinearFP16.forward), so the rows are concatenated, not copied
         if EXACT_ROWS and params.get("exact_rows") and x.numel() > x.shape[-1]:
-            if self.rows_native(x, params):
+            if self.rows_native(x, params, out_dtype):
                 return self.forward_rows_native(x, params, out_dtype)
             return forward_rows(lambda row: self.forward(row, params, out_dtype), x, copy = False)
 
@@ -682,24 +685,33 @@ class Linear(Module):
         return x
 
 
-    def rows_native(self, x: torch.Tensor, params: dict) -> bool:
+    def rows_native(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> bool:
         """
         EXL3_EXACT_ROWS: whether the rows of a flagged call go to the extension in one call
-        (forward_rows_native). The extension must have the entry point, and a one-row forward must
-        be nothing but zero-padding, the EXL3 projection and the trim: no capture, LoRA, scale or
-        softcap, which forward applies around the projection per call
+        (forward_rows_native). The extension must have the entry point of the weight's format, and
+        a one-row forward must be nothing but zero-padding, the projection and the trim: no
+        capture, LoRA, scale or softcap, which forward applies around the projection per call.
+        An EXL3 weight takes BC_LinearEXL3::run_alloc_rows; an FP16 weight takes hgemm_rows where
+        a one-row forward with this out_dtype is the native GEMM, on an input of the weight's own
+        width (no zero-padding: each row is then the storage the row loop passes)
         """
+        inner = self.inner
+        if isinstance(inner, LinearEXL3):
+            served = bool(ROWS_NATIVE & EXACT_ROWS_CAP_LINEAR) and inner.rows_native(params)
+        elif isinstance(inner, LinearFP16):
+            served = bool(ROWS_NATIVE & EXACT_ROWS_CAP_HGEMM) and x.shape[-1] == self.in_features \
+                and inner.rows_native(x, out_dtype)
+        else:
+            served = False
         return (
-            bool(ROWS_NATIVE & EXACT_ROWS_CAP_LINEAR)
-            and isinstance(self.inner, LinearEXL3)
+            served
             and x.is_contiguous()
-            and x.numel() // x.shape[-1] <= EXACT_ROWS_MAX
+            and 1 < x.numel() // x.shape[-1] <= EXACT_ROWS_MAX
             and "capture" not in params
             and not self.lora_a_tensors
             and self.pre_scale == 1.0
             and self.softcap == 0.0
             and self.post_scale == 1.0
-            and self.inner.rows_native(params)
         )
 
 
@@ -713,7 +725,7 @@ class Linear(Module):
         EXL3_EXACT_ROWS: forward for a flagged call of several rows where rows_native holds. The
         zero-padding and the trim are those of forward on all rows at once (copies of values), the
         projection is one native call that gives every row the bits of its one-row call
-        (LinearEXL3.forward_rows)
+        (LinearEXL3.forward_rows, LinearFP16.forward_rows)
         """
         if x.shape[-1] < self.in_features:
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))

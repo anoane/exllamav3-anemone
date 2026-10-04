@@ -104,6 +104,44 @@ class LinearFP16:
         y = y.view(out_shape)
         return y
 
+    def rows_native(self, x: torch.Tensor, out_dtype: torch.dtype | None = None) -> bool:
+        """
+        EXL3_EXACT_ROWS: whether a one-row forward of x's rows is nothing but ext.hgemm on the
+        weight as loaded (FP16 rows on the weight's CUDA device, no pinned-host staging, and the
+        branch of forward that takes the native GEMM: another output dtype than x's, or
+        EXL3_HGEMM_FIXED_ROWS), so that forward_rows computes what one forward per row does. The
+        torch.matmul branch keeps the row loop
+        """
+        dtype = out_dtype or self.out_dtype or torch.half
+        weight = self.weight
+        return (
+            self._pinned_store is None
+            and x.is_cuda and x.dtype == torch.half
+            and weight.dtype == torch.half and weight.dim() == 2 and weight.is_contiguous()
+            and weight.device == x.device
+            and x.shape[-1] == weight.shape[0]
+            and dtype in (torch.half, torch.float)
+            and (dtype != x.dtype or bool(HGEMM_FIXED_ROWS))
+        )
+
+    def forward_rows(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """
+        EXL3_EXACT_ROWS: forward for a flagged call of 2 to EXACT_ROWS_MAX contiguous rows where
+        rows_native(x, out_dtype) holds. One native call (ext.hgemm_rows) makes the GEMM of a
+        one-row forward once per row, each on the row's own storage with an output of its own;
+        the bias add is elementwise on all rows
+        """
+        dtype = out_dtype or self.out_dtype or torch.half
+        y = ext.hgemm_rows(x.view(-1, x.shape[-1]), self.weight, dtype == torch.float)
+        if self.bias is not None:
+            y += self.bias
+        return y.view(x.shape[:-1] + (self.out_features,))
+
     def get_weight_tensor(self) -> torch.Tensor:
         return self.weight
 
