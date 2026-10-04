@@ -177,13 +177,30 @@ class PipelineTests(unittest.TestCase):
         m = model()
         m.fwd_modules.append(m.fwd_modules[1])
         self.assertFalse(P.eligible(m, ids, p))
-        # One device, three devices, a module of the second half back on the first device
-        for devices in (("cuda:0", "cuda:0"), ("cuda:0", "cuda:1", "cuda:2"), ("cuda:0", "cuda:1", "cuda:0")):
+        # One device, a module of the second half back on the first device
+        for devices in (("cuda:0", "cuda:0"), ("cuda:0", "cuda:1", "cuda:0")):
             m = model()
             m.fwd_modules = [(types.SimpleNamespace(device = d, modules = []), 0, i)
                              for i, d in enumerate(devices)]
             m.last_kv_module_idx_instance = (len(devices) - 1, 0)
             self.assertFalse(P.eligible(m, ids, p), devices)
+        # Three devices: stage 1 spans the first two, stage 2 is the last one, with a side stream per
+        # stage-1 device
+        m = model()
+        mods = [types.SimpleNamespace(device = d, modules = []) for d in ("cuda:0", "cuda:1", "cuda:2")]
+        m.modules, m.fwd_modules = mods, [(mod, 0, i) for i, mod in enumerate(mods)]
+        m.last_kv_module_idx_instance = (2, 0)
+        self.assertTrue(P.eligible(m, ids, p))
+        plan = P._plan(m)
+        self.assertEqual(plan.devs1, (torch.device("cuda:0"), torch.device("cuda:1")))
+        self.assertEqual(plan.dev2, torch.device("cuda:2"))
+        self.assertEqual([len(plan.st1), len(plan.st2), len(plan.sides)], [2, 1, 2])
+        # ... and every module past the hand-off must be on that last GPU
+        mods.append(types.SimpleNamespace(device = "cuda:1", modules = []))
+        m.fwd_modules = [(mod, 0, i) for i, mod in enumerate(mods)]
+        m.last_kv_module_idx_instance = (3, 0)
+        self.assertFalse(P.eligible(m, ids, p))
+        self.assertEqual(P._plan(m).reason, "a module past the hand-off is not on the last GPU")
         # The split must come before the last cache-writing module: with the split after it,
         # the prefill never reaches the second device
         m = model()

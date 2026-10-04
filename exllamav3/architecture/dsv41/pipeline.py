@@ -355,7 +355,7 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
             timing, t0 = ({}, time.perf_counter()) if TIMING else (None, 0.0)
             for m in plan.pf1:
                 m.prefetch(x, p)
-            x = _run(model, plan.st1, x, p, timing)
+            x = _run(model, plan.st1, x, p) if timing is None else _run(model, plan.st1, x, p, timing)
             if timing is not None:
                 _timing_line("S1", base + a, base + b, t0, timing)
             if placement.XDEV_BF16 and x.dtype == torch.float:
@@ -388,7 +388,10 @@ def prefill_pipelined(model, input_ids: torch.Tensor, params: dict) -> None:
             for h in plan.hosts:
                 h.begin_pass()
             timing, t0 = ({}, time.perf_counter()) if TIMING else (None, 0.0)
-            _run(model, plan.st2, x, p, timing)
+            if timing is None:
+                _run(model, plan.st2, x, p)
+            else:
+                _run(model, plan.st2, x, p, timing)
             if timing is not None:
                 _timing_line("S2", view.position, view.position + ids.shape[1], t0, timing)
             if view.wshift != shift1:
