@@ -57,7 +57,7 @@ from typing import NamedTuple
 
 import torch
 
-from ..model.math_policy import STABLE_ARITHMETIC
+from ..model.math_policy import STABLE_ARITHMETIC, EXACT_ROWS_MAX
 from ..architecture.dsv41.candidates import (
     visible_counts,
     topk_total_order,
@@ -111,6 +111,39 @@ def _effective_tile(rows_max: int, ec: int, slab_rows: int, tile_entries: int, q
         if wide > tile:
             tile = _ceil(wide, quantum)
     return tile
+
+
+def _rows_share_pass(backend: str, seq: int, pos0: int, m: int, ec: int, topk: int, slab: int,
+                     tile: int, tile_entries: int, quantum: int) -> bool:
+    """
+    EXL3_EXACT_ROWS: whether the rows of a call can take ONE selection pass in which every row
+    gets what its own one-row call computes (row r: seq 1, pos0 + r, ec (pos0 + r + 1) // m).
+    `tile` is the tile width the call computed for its `seq` rows. All of these must hold:
+
+      * the ext backend, without EXL3_STABLE_ARITHMETIC: the scorer can be pinned to the kernel
+        of a one-row call (dsa_indexer_scores, one_row). The torch backend scores with
+        torch.matmul, which picks its algorithm by row count;
+      * 2 to EXACT_ROWS_MAX rows, inside one slab;
+      * ec is the last row's own entry count, so every row's visible count is its one-row ec;
+      * no dense row: the first row already selects (the entry count only grows with the row);
+      * the first and the last row's one-row calls take this call's tile width, so every row
+        between does (the width does not decrease with the entry count): one score stride, a
+        constexpr of the scoring kernel and part of the key of its key tile;
+      * one tile, as every one-row call is (ec <= tile): no tiled merge, whose slots follow the
+        tile count of the call.
+
+    Integer arithmetic on the arguments only; nothing here reads device data.
+    """
+    if backend != "ext" or STABLE_ARITHMETIC:
+        return False
+    if m < 1 or pos0 < 0 or not 1 < seq <= min(slab, EXACT_ROWS_MAX):
+        return False
+    ec_first = (pos0 + 1) // m
+    if ec != (pos0 + seq) // m or ec_first <= topk:
+        return False
+    return tile == _effective_tile(1, ec_first, slab, tile_entries, quantum) \
+        and tile == _effective_tile(1, ec, slab, tile_entries, quantum) \
+        and ec <= tile
 
 
 def _keys_for(idx_pool: torch.Tensor, bt_flat: torch.Tensor | None, epp: int,
@@ -249,7 +282,8 @@ def select_topk(
     backend: str = "auto",
     scale: float = 1.0,
     score_dtype: torch.dtype = torch.float16,
-) -> SelectResult:
+    one_row: bool = False,
+) -> SelectResult | None:
     """
     Top-k index selection for one sequence, tiled, with the V4.1 candidate stage.
 
@@ -279,6 +313,14 @@ def select_topk(
                       within the same slab_rows * tile_entries budget, so decode is one pass.
     :param backend:   'auto' | 'ext' | 'torch'
     :param score_dtype: torch backend only: precision scores are rounded to before selection
+    :param one_row:   EXL3_EXACT_ROWS: give every row of a call of several rows the selection of
+                      its own one-row call (seq 1 at pos0 + r, ec (pos0 + r + 1) // m), in one
+                      pass: the scorer pinned to the kernel of a one-row call, the block maxima
+                      of the candidate source reduced row by row, everything else the row-local
+                      integer and selection work of any call. Returns None, before anything is
+                      allocated or launched, when the rows cannot share a pass
+                      (_rows_share_pass); the caller then makes the one-row calls. Without
+                      effect on a one-row call.
     :return: SelectResult(indices (seq, ceil32(topk)) int32 | None, k_len, cand | None).
              indices is None (dense: every entry selected) when ec <= topk; so is cand,
              since nothing is selected and the mask would be a no-op.
@@ -307,6 +349,9 @@ def select_topk(
     kp = _ceil(topk, 32)
     rows_max = min(slab, seq)
     tile = _effective_tile(rows_max, ec, slab, tile_entries, quantum)
+    one_row = one_row and seq > 1
+    if one_row and not _rows_share_pass(backend, seq, pos0, m, ec, topk, slab, tile, tile_entries, quantum):
+        return None
     # Refused before any backend runs: the defaults stay at 2^24 elements (256 x 65,536, or
     # a widened decode tile within the same budget), but a larger slab x tile budget would
     # wrap the kernels' int32 row offsets and score into another allocation
@@ -323,7 +368,8 @@ def select_topk(
 
     run = _ExtSlabs if backend == "ext" else _TorchSlabs
     runner = run(q_idx, wts, idx_pool, bt_flat, epp if paged else 0, pos0, m, ec, topk, kp,
-                 block, n_blocks, tile, rows_max, want_cand, cand_in is not None, scale, score_dtype)
+                 block, n_blocks, tile, rows_max, want_cand, cand_in is not None, scale, score_dtype,
+                 one_row)
     for r0 in range(0, seq, slab):
         r1 = min(r0 + slab, seq)
         runner.slab(r0, r1, indices[r0 : r1], None if cand is None else cand[r0 : r1],
@@ -335,12 +381,14 @@ class _Slabs:
     """Shared slab/tile walk; subclasses supply scoring and top-k primitives."""
 
     def __init__(self, q, w, pool, bt_flat, epp, pos0, m, ec, topk, kp, block, n_blocks,
-                 tile, rows_max, want_cand, has_cand_in, scale, score_dtype):
+                 tile, rows_max, want_cand, has_cand_in, scale, score_dtype, one_row = False):
         self.q, self.w, self.pool, self.bt, self.epp = q, w, pool, bt_flat, epp
         self.pos0, self.m, self.ec, self.topk, self.kp = pos0, m, ec, topk, kp
         self.block, self.n_blocks, self.tile, self.rows_max = block, n_blocks, tile, rows_max
         self.want_cand, self.has_cand_in = want_cand, has_cand_in
         self.scale, self.score_dtype = scale, score_dtype
+        # EXL3_EXACT_ROWS (select_topk, one_row): one slab, one tile, the rows of one pass
+        self.one_row = one_row
         self.device = q.device
 
     def slab(self, r0, r1, out, cand_out, cand_rows):
@@ -364,7 +412,10 @@ class _Slabs:
             sv = sc.view(rows, nbt, self.block)
             if blk is not None:
                 # Candidate blocks from the UNMASKED scores (the source's own top-k is unmasked)
-                blk[:, b0 : b0 + nbt] = sv.amax(dim = -1).to(blk.dtype)
+                if self.one_row:
+                    self._block_max_rows(blk, sv, r0)
+                else:
+                    blk[:, b0 : b0 + nbt] = sv.amax(dim = -1).to(blk.dtype)
             if flags is not None:
                 sv.masked_fill_(~flags[:, b0 : b0 + nbt, None], _NEG_INF)
             self.select_tile(sc, t0, n, len(tiles), out)
@@ -372,6 +423,24 @@ class _Slabs:
         if blk is not None:
             _pin_newest(blk, vis, self.block)
             self.select_blocks(blk, cand_out)
+
+    def _block_max_rows(self, blk, sv, r0):
+        """
+        EXL3_EXACT_ROWS (one_row): the block maxima one row at a time, each the reduction its
+        one-row call makes: the (1, blocks of the row, block) view of the row's scores, same
+        shape, strides and values. A maximum has one value under any reduction order but not
+        always one bit pattern (a block whose maximum is a zero present with both signs, or one
+        of several NaNs), the top-k ranks by the bit pattern, and the order torch reduces in may
+        follow the shape of the operand. Blocks past the row's own count hold only entries
+        beyond its causal bound: -inf, as their maximum would be. The row's block count is
+        Python integers, no device read. One tile (select_topk), so sv holds every block.
+        """
+        blk.fill_(_NEG_INF)
+        for r in range(blk.shape[0]):
+            vis = min(max(0, (self.pos0 + r0 + r + 1) // self.m), self.ec)
+            n = min(-(-vis // self.block), sv.shape[1], blk.shape[1])
+            if n > 0:
+                blk[r : r + 1, :n] = sv[r : r + 1, :n].amax(dim = -1).to(blk.dtype)
 
 
 class _TorchSlabs(_Slabs):
@@ -470,15 +539,18 @@ class _ExtSlabs(_Slabs):
         # decoded row selects exactly what the same row selects inside a prefill chunk (the
         # few-query kernel that decode would take reduces over the heads in another order)
         few_query = not STABLE_ARITHMETIC
+        # EXL3_EXACT_ROWS (one_row): the few-query kernel, the one of a one-row call, at every
+        # row count; a row's scores below its own causal bound are then those of its one-row call
+        one_row = self.one_row
         if self.bt is None:
             self.scores_fn(q, w, self.pool_flat[t0 : t1], qp, self.m, t1 - t0,
-                           scores = sc, scale = self.scale, few_query = few_query)
+                           scores = sc, scale = self.scale, few_query = few_query, one_row = one_row)
         else:
             e = self.epp
             bt = self.bt[t0 // e : -(-t1 // e)]
             self.scores_fn(q, w, self.pool_flat, qp, self.m, t1 - t0,
                            scores = sc, block_table = bt, epp = e, scale = self.scale,
-                           few_query = few_query)
+                           few_query = few_query, one_row = one_row)
         W = t1 - t0
         if W8 > W:
             sc[:, W : W8].fill_(_NEG_INF)

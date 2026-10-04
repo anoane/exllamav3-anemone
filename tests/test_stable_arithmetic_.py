@@ -220,7 +220,7 @@ class DeepseekV41AttentionTests(unittest.TestCase):
             score = method("exllamav3/modules/dsv41_select.py", "_ExtSlabs", "score", ns)
             slabs = NS(backing = torch.zeros(4 * 256), s_stride = 256, q = torch.zeros(4, 2, 8),
                        w = torch.zeros(4, 2), pos0 = 300, m = 1, pool_flat = torch.zeros(320, 8),
-                       scale = 1.0, scores_fn = Mock())
+                       scale = 1.0, scores_fn = Mock(), one_row = False)
             for bt, epp in ((None, 0), (torch.arange(5, dtype = torch.int32), 64)):
                 slabs.bt, slabs.epp = bt, epp
                 for rows in (1, 4):
@@ -228,6 +228,7 @@ class DeepseekV41AttentionTests(unittest.TestCase):
             self.assertEqual(slabs.scores_fn.call_count, 4)
             for call in slabs.scores_fn.call_args_list:
                 self.assertIs(call.kwargs["few_query"], not stable)
+                self.assertIs(call.kwargs["one_row"], False)
         # one_row (EXL3_EXACT_ROWS) pins the few-query kernel instead, at every row count
         code = condition("exllamav3/modules/attention_fn/dsa_triton.py", None, "dsa_indexer_scores",
                          "R <= 4")
