@@ -176,6 +176,24 @@ class ExactRowsTests(unittest.TestCase):
                 self.assertIs(policy.exact_rows(rows), False)
                 self.assertIs(load({"EXL3_EXACT_ROWS": "1"}).exact_rows(rows), inside)
 
+    def test_native_entry_points(self):
+        # exact_rows_native: what the extension reports, behind the switch; an extension built before
+        # the row-exact entry points has no exact_rows_caps
+        class Ext:
+            def __init__(self, caps = None):
+                if caps is not None:
+                    self.exact_rows_caps = lambda: caps
+        policy = load({})
+        self.assertEqual((policy.EXACT_ROWS_CAP_LINEAR, policy.EXACT_ROWS_CAP_MGEMM, policy.EXACT_ROWS_CAP_ROUTER,
+                          policy.EXACT_ROWS_CAP_MOE, policy.EXACT_ROWS_CAP_HC), (1, 2, 4, 8, 16))
+        for caps, enabled, expected in ((None, True, 0), (31, False, 0), (31, True, 31), (0, True, 0), (5, True, 5)):
+            with self.subTest(caps = caps, enabled = enabled):
+                self.assertEqual(policy.exact_rows_native(Ext(caps), enabled), expected)
+        # the import-time constant is the default
+        self.assertEqual(policy.exact_rows_native(Ext(31)), 0)
+        self.assertEqual(load({"EXL3_EXACT_ROWS": "1"}).exact_rows_native(Ext(31)), 31)
+        self.assertEqual(load({"EXL3_EXACT_ROWS": "1"}).exact_rows_native(Ext()), 0)
+
     def test_invalid_value_fails_the_import(self):
         code = f"import importlib.util as u; s = u.spec_from_file_location('p', {str(PATH)!r}); s.loader.exec_module(u.module_from_spec(s))"
         for extra, message in (({"EXL3_EXACT_ROWS": "2"}, "ValueError: EXL3_EXACT_ROWS must be 0 or 1"),

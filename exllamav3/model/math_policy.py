@@ -7,7 +7,9 @@ default of every policy is the ordinary dispatch.
 EXL3_STABLE_ARITHMETIC=1 implies EXL3_HGEMM_FIXED_ROWS=128 and EXL3_MOE_FUSED_PREFILL=1: each may be
 left unset or set to that value, anything else is refused.
 
-EXL3_EXACT_ROWS is Python only: the extension does not read it.
+EXL3_EXACT_ROWS is read in Python only. The extension does not read it: it reports which row-exact
+entry points it has (exact_rows_caps, exact_rows.h), and Python passes a flagged call to them or
+runs its own row loops (exact_rows_native).
 
 Torch-free, so tests can load this file by path.
 """
@@ -109,6 +111,20 @@ def exact_rows(rows: int, enabled: bool = None) -> bool:
     return bool(enabled) and 1 < rows <= EXACT_ROWS_MAX
 
 
+def exact_rows_native(ext_module, enabled: bool = None) -> int:
+    """
+    The row-exact entry points of the extension a flagged call of EXL3_EXACT_ROWS may use: the OR of
+    the EXACT_ROWS_CAP_* bits it reports (exact_rows_caps() in exact_rows.cpp), or 0 without the
+    switch and for an extension built before these entry points. With a bit clear, the operation
+    keeps its Python loop of one call per row, which gives the same results
+    """
+    enabled = EXACT_ROWS if enabled is None else enabled
+    if not enabled:
+        return 0
+    caps = getattr(ext_module, "exact_rows_caps", None)
+    return 0 if caps is None else int(caps())
+
+
 def require_whole_k_moe(key: str, built: bool, stable: bool = None):
     """
     EXL3_STABLE_ARITHMETIC runs every fused MoE launch through the kernel's whole-K instances, which
@@ -130,6 +146,13 @@ FUSED_COUNT_LIMIT = (1 << 31) - 1
 # EXL3_EXACT_ROWS: the widest call it covers. dsa_attn gives calls of up to this many query rows the
 # split softmax a one-row step takes (attention_fn/dsa_triton.py, SPLIT_MAX_ROWS)
 EXACT_ROWS_MAX = 8
+
+# EXL3_EXACT_ROWS: one bit per row-exact entry point of the extension (exact_rows.h)
+EXACT_ROWS_CAP_LINEAR = 1       # BC_LinearEXL3.run_alloc_rows
+EXACT_ROWS_CAP_MGEMM = 2        # exl3_mgemm_rows
+EXACT_ROWS_CAP_ROUTER = 4       # routing_ds3_nogroup_rows
+EXACT_ROWS_CAP_MOE = 8          # BC_BlockSparseMLP.run_bszN_rows, rows_exact_ok
+EXACT_ROWS_CAP_HC = 16          # hc_collapse_rows, hc_partials_rows
 
 STABLE_ARITHMETIC = stable_arithmetic_enabled()
 HGEMM_FIXED_ROWS = hgemm_fixed_rows()
