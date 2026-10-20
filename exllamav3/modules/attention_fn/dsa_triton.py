@@ -30,7 +30,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 import math
 import os
 import torch
-from ...util.backend import DSA_MQA
+from ...util.backend import DSA_MQA, ROCM
 from ...util.tensor import g_tensor_cache
 
 # EXL3_DSA_DEBUG_BOUNDS=1: compile the JIT DSA kernels with device-side bounds asserts on
@@ -734,6 +734,141 @@ def _dsa_indexer_fewq_kernel(
     tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
 
 
+@triton.jit(do_not_specialize = ["N"], debug = dsa_debug_bounds)
+def _dsa_indexer_quant_kernel(
+    x,                   # (N, D_i) fp16 rows; the flat paged pool when EPP > 0
+    block_table,         # EPP > 0: (npr,) i32 page table of the (single) job
+    y,                   # (N, D_i) int8 / fp8 e4m3, or (N, D_i // 2) e2m1 packed two per byte, low nibble first
+    s,                   # (N,) fp32 row scales, or (N, D_i // 32) e8m0 group scales for e2m1
+    N,                   # runtime: rows
+    D_i: tl.constexpr,
+    DTYPE: tl.constexpr,             # 1 int8, 2 fp8 e4m3, 3 e2m1
+    BLOCK_R: tl.constexpr,
+    EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous x
+    DEBUG_BOUNDS: tl.constexpr = 0,
+    DEBUG_PAGES: tl.constexpr = 0,
+):
+    """Operands of _dsa_indexer_q_kernel: symmetric rows with one scale per row (int8: amax / 127, fp8: amax / 448),
+    or e2m1 with a power-of-two scale per 32 values, 2 ** ceil(log2(amax / 6)), as DeepSeek's reference indexer
+    quantizes. Paged rows are gathered through the block table into contiguous output rows."""
+    offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    valid = offs_r < N
+    if EPP > 0:
+        phys = tl.load(block_table + offs_r // EPP, mask = valid, other = 0)
+        if DEBUG_BOUNDS:
+            tl.device_assert(tl.where(valid, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_indexer_quant: pool page OOB")
+        src = phys * EPP + offs_r % EPP
+    else:
+        src = offs_r
+    offs_d = tl.arange(0, D_i)
+    rows = offs_r[:, None].to(tl.int64)
+    v = tl.load(x + src[:, None].to(tl.int64) * D_i + offs_d[None, :], mask = valid[:, None], other = 0.0).to(tl.float32)
+    if DTYPE == 3:
+        g = tl.reshape(tl.abs(v), (BLOCK_R, D_i // 32, 32))
+        # amax >= 6 * 2 ** -126 keeps amax / 6 a normal float, whose exponent field is then floor(log2)
+        amax = tl.maximum(tl.max(g, axis = 2), 7.052966e-38)
+        bits = (amax * (1.0 / 6.0)).to(tl.int32, bitcast = True)
+        e8 = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)      # ceil(log2(amax / 6)) + 127
+        inv = ((254 - e8) << 23).to(tl.float32, bitcast = True)                  # 2 ** -(e8 - 127)
+        a = tl.minimum(g * inv[:, :, None], 6.0)
+        # e2m1 magnitude code of 0, .5, 1, 1.5, 2, 3, 4, 6; a tie goes to the even code, as the hardware conversion
+        code = (a > 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a > 1.25).to(tl.int32) + \
+            (a >= 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32) + (a > 5.0).to(tl.int32)
+        code = code | tl.where(tl.reshape(v < 0, (BLOCK_R, D_i // 32, 32)) & (code > 0), 8, 0)
+        lo, hi = tl.split(tl.reshape(code, (BLOCK_R, D_i // 2, 2)))
+        tl.store(y + rows * (D_i // 2) + tl.arange(0, D_i // 2)[None, :], (lo | (hi << 4)).to(tl.uint8),
+                 mask = valid[:, None])
+        tl.store(s + rows * (D_i // 32) + tl.arange(0, D_i // 32)[None, :], e8.to(tl.uint8), mask = valid[:, None])
+    else:
+        if DTYPE == 1:
+            qmax = 127.0
+        else:
+            qmax = 448.0
+        sc = tl.maximum(tl.max(tl.abs(v), axis = 1), 1e-30) / qmax
+        t = tl.clamp(v / sc[:, None], -qmax, qmax)
+        if DTYPE == 1:
+            t = tl.where(t >= 0, t + 0.5, t - 0.5).to(tl.int8)
+        else:
+            t = t.to(tl.float8e4nv)
+        tl.store(y + rows * D_i + offs_d[None, :], t, mask = valid[:, None])
+        tl.store(s + offs_r, sc, mask = valid)
+
+
+@triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max"])
+def _dsa_indexer_q_kernel(
+    q,                   # (R, H_i, D_i) int8 / fp8, or (R, H_i, D_i // 2) packed e2m1 (_dsa_indexer_quant_kernel)
+    qs,                  # e2m1: (R, H_i, D_i // 32) e8m0 group scales; unused otherwise
+    f,                   # (R, H_i) fp32 head factor: the head weight, times the row scale for int8 / fp8
+    k,                   # (T, D_i) int8 / fp8, or (T, D_i // 2) packed e2m1; contiguous
+    ks,                  # (T,) fp32 key scales, or (T, D_i // 32) e8m0 group scales
+    scores,              # (R, S_stride) fp16 out
+    T,
+    R,
+    q_pos0,
+    bound_max,
+    H_i: tl.constexpr,
+    D_i: tl.constexpr,
+    S_stride: tl.constexpr,
+    compress_rate: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DTYPE: tl.constexpr,             # 1 int8, 2 fp8 e4m3, 3 e2m1
+):
+    """_dsa_indexer_kernel on quantized operands: the MMA runs in int8 (exact int32 sums), fp8, or e2m1 with its group
+    scales inside the MMA. Row and key scales are positive, so they are applied after each head's ReLU."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_m = offs_m < R
+    valid_n = offs_n < T
+    keys = offs_n.to(tl.int64)
+    if DTYPE == 3:
+        offs_p = tl.arange(0, D_i // 2)
+        offs_g = tl.arange(0, D_i // 32)
+        kt = tl.load(k + keys[None, :] * (D_i // 2) + offs_p[:, None], mask = valid_n[None, :], other = 0)
+        kst = tl.load(ks + keys[:, None] * (D_i // 32) + offs_g[None, :], mask = valid_n[:, None], other = 127)
+    else:
+        offs_d = tl.arange(0, D_i)
+        if DTYPE == 1:
+            kt = tl.load(k + keys[None, :] * D_i + offs_d[:, None], mask = valid_n[None, :], other = 0)
+        else:
+            kt = tl.load(k + keys[None, :] * D_i + offs_d[:, None], mask = valid_n[None, :], other = 0.0)
+
+    # Head 0 of each query row; the head loop only steps these pointers
+    rows = (offs_m * H_i).to(tl.int64)
+    f_ptr = f + rows
+    if DTYPE == 3:
+        q_ptr = q + rows[:, None] * (D_i // 2) + offs_p[None, :]
+        qs_ptr = qs + rows[:, None] * (D_i // 32) + offs_g[None, :]
+    else:
+        q_ptr = q + rows[:, None] * D_i + offs_d[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for h in range(H_i):
+        if DTYPE == 3:
+            qh = tl.load(q_ptr + h * (D_i // 2), mask = valid_m[:, None], other = 0)
+            qsh = tl.load(qs_ptr + h * (D_i // 32), mask = valid_m[:, None], other = 127)
+            logits = tl.maximum(tl.dot_scaled(qh, qsh, "e2m1", kt, kst, "e2m1"), 0.0)
+        elif DTYPE == 1:
+            qh = tl.load(q_ptr + h * D_i, mask = valid_m[:, None], other = 0)
+            logits = tl.maximum(tl.dot(qh, kt, out_dtype = tl.int32), 0).to(tl.float32)
+        else:
+            qh = tl.load(q_ptr + h * D_i, mask = valid_m[:, None], other = 0.0)
+            logits = tl.maximum(tl.dot(qh, kt), 0.0)
+        fh = tl.load(f_ptr + h, mask = valid_m, other = 0.0)
+        acc += logits * fh[:, None]
+
+    if DTYPE != 3:
+        acc = acc * tl.load(ks + offs_n, mask = valid_n, other = 0.0)[None, :]
+    acc = acc * scale
+    bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
+    acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
+    tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(tl.float16),
+             mask = valid_m[:, None] & valid_n[None, :])
+
+
 @triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
 def _dsa_pool_update_kernel(
     plane,               # flat (pages * page_size, 2 * D) packed [k || gate] rows
@@ -1171,6 +1306,87 @@ def dsa_attn(
     return out
 
 
+# Operand precision of the prefill-shaped indexer scoring, per GPU architecture (EXL3_DSA_INDEXER_DTYPE,
+# doc/env_vars.md), with the compute capability each needs: int8 and fp8 MMA, block-scaled e2m1 MMA
+INDEXER_DTYPES = {"fp16": (0, 0), "int8": (8, 0), "fp8": (8, 9), "fp4": (10, 0)}
+_INDEXER_CODES = {"int8": 1, "fp8": 2, "fp4": 3}
+# Fewer query rows than one tile keep fp16: quantizing every visible key is repaid only by a prefill-sized block
+INDEXER_QUANT_MIN_ROWS = 64
+_indexer_dtypes = {}
+
+
+def parse_indexer_dtype(spec: str) -> dict:
+    """'int8', or ARCH:DTYPE items such as 'sm_80:int8,sm_120:fp4' with an optional bare item for the architectures
+    not listed -> {architecture or None: dtype}"""
+    out = {}
+    for item in spec.split(","):
+        arch, sep, dtype = item.strip().rpartition(":")
+        arch = arch.strip() if sep else None
+        dtype = dtype.strip()
+        if dtype not in INDEXER_DTYPES:
+            raise ValueError(f"indexer dtype '{spec}': '{dtype}' is not one of {', '.join(INDEXER_DTYPES)}")
+        if arch is not None and not (arch.startswith("sm_") and arch[3:].isdigit() and len(arch) in (5, 6)):
+            raise ValueError(f"indexer dtype '{spec}': '{arch}' is not an architecture such as sm_80 or sm_120")
+        if arch in out:
+            raise ValueError(f"indexer dtype '{spec}': {arch or 'the default'} is given twice")
+        out[arch] = dtype
+    return out
+
+
+def dsa_indexer_dtype(device: torch.device | int) -> str:
+    """This device's indexer scoring precision, refused where the device cannot run it"""
+    device = torch.device("cuda", device) if isinstance(device, int) else device
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    dtype = _indexer_dtypes.get(index)
+    if dtype is None:
+        spec = os.environ.get("EXL3_DSA_INDEXER_DTYPE") or "fp16"
+        cc = torch.cuda.get_device_capability(index)
+        arch = f"sm_{cc[0]}{cc[1]}"
+        archs = parse_indexer_dtype(spec)
+        dtype = archs.get(arch, archs.get(None, "fp16"))
+        if dtype != "fp16" and (ROCM or cc < INDEXER_DTYPES[dtype]):
+            need = INDEXER_DTYPES[dtype]
+            raise ValueError(f"EXL3_DSA_INDEXER_DTYPE={spec}: device {index} ({arch}) cannot score in {dtype}, which "
+                             f"needs CUDA sm_{need[0]}{need[1]} or newer; give it fp16 or another type with {arch}:DTYPE")
+        _indexer_dtypes[index] = dtype
+    return dtype
+
+
+def dsa_indexer_quant(x, dtype, n, block_table = None, epp = 0):
+    """(values, scales) of rows 0..n of x, gathered through block_table when given, for _dsa_indexer_q_kernel"""
+    D_i = x.shape[-1]
+    assert D_i % 32 == 0 and x.dtype == torch.half and x.stride(-1) == 1, "dsa_indexer_quant: fp16 rows of 32k values"
+    x = x.reshape(-1, D_i).contiguous()
+    code = _INDEXER_CODES[dtype]
+    rows = max(n, 1)
+    if code == 3:
+        y = torch.empty((rows, D_i // 2), dtype = torch.uint8, device = x.device)
+        s = torch.empty((rows, D_i // 32), dtype = torch.uint8, device = x.device)
+    else:
+        y = torch.empty((rows, D_i), dtype = torch.int8 if code == 1 else torch.float8_e4m3fn, device = x.device)
+        s = torch.empty((rows,), dtype = torch.float, device = x.device)
+    if n > 0:
+        paged = block_table is not None and epp > 0
+        assert paged or x.shape[0] >= n, "dsa_indexer_quant: fewer rows than requested"
+        dbg = 1 if (dsa_debug_bounds and paged) else 0
+        block_r = 32
+        with torch.cuda.device(x.device):
+            _dsa_indexer_quant_kernel[(triton.cdiv(n, block_r),)](
+                x, block_table.reshape(-1) if paged else 0, y, s, n, D_i = D_i, DTYPE = code, BLOCK_R = block_r,
+                EPP = epp if paged else 0, DEBUG_BOUNDS = dbg, DEBUG_PAGES = -(-x.shape[0] // epp) if dbg else 0)
+    return y, s
+
+
+def dsa_indexer_keys(k_idx, bound_max, block_table = None, epp = 0):
+    """Key operands for every dsa_indexer_scores call over the same keys (its k_quant), so a pass scored in row slabs
+    quantizes its keys once; None where this device scores in fp16"""
+    dtype = dsa_indexer_dtype(k_idx.device)
+    if dtype == "fp16":
+        return None
+    n = bound_max if block_table is not None else k_idx.shape[0]
+    return (dtype, n) + dsa_indexer_quant(k_idx, dtype, n, block_table, epp)
+
+
 def dsa_indexer_scores(
     q_idx,                   # (R, H_i, D_i) fp16, rope applied
     weights,                 # (R, H_i) fp16 raw head weights (H_i ** -0.5 folded in-kernel)
@@ -1187,6 +1403,7 @@ def dsa_indexer_scores(
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
+    k_quant = None,          # dsa_indexer_keys() of these keys, shared by the calls of one pass
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
@@ -1238,6 +1455,30 @@ def dsa_indexer_scores(
                 lambda bn: shared_bytes(_dsa_indexer_fewq_kernel, f_args, **f_consts(bn), num_warps = num_warps, num_stages = num_stages))
             grid = (R, triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
+        elif (k_quant is not None or R >= INDEXER_QUANT_MIN_ROWS) and dsa_indexer_dtype(q_idx.device) != "fp16":
+            dtype = dsa_indexer_dtype(q_idx.device)
+            if k_quant is None:
+                k_quant = dsa_indexer_keys(k_idx, T, block_table, epp)
+            k_dtype, k_rows, kq, ks = k_quant
+            assert k_dtype == dtype and k_rows == T, "dsa_indexer_scores: k_quant was built for other keys"
+            qq, qs = dsa_indexer_quant(q_idx, dtype, R * H_i)
+            f = weights.float().contiguous()
+            if dtype != "fp4":
+                f = (f * qs.view(R, H_i)).contiguous()
+            q_args = (qq, qs, f, kq, ks, scores, T, R, q_pos0, bound_max)
+            def q_consts(cfg):
+                return dict(H_i = H_i, D_i = D_i, S_stride = S_stride, compress_rate = compress_rate, scale = scale,
+                            BLOCK_M = cfg[0], BLOCK_N = cfg[1], DTYPE = _INDEXER_CODES[dtype])
+            # Measured fastest on the 170HX (int8) and the RTX PRO 6000 (int8, fp8, fp4) at 256 rows x 1M keys
+            sm80 = torch.cuda.get_device_capability(q_idx.device) == (8, 0)
+            bm, bn, q_warps, q_stages = (128, 64, 4, 2) if sm80 else (64, 128, 4, 3)
+            ladder = [(bm, bn)] + [(m, n) for n in halving_ladder(bn) for m in halving_ladder(bm) if (m, n) != (bm, bn)]
+            bm, bn = pick_config(
+                q_idx.device, "dsa_indexer_q", (H_i, D_i, S_stride, compress_rate, dtype, q_warps, q_stages, ladder[0]),
+                ladder,
+                lambda cfg: shared_bytes(_dsa_indexer_q_kernel, q_args, **q_consts(cfg), num_warps = q_warps, num_stages = q_stages))
+            grid = (triton.cdiv(R, bm), triton.cdiv(max(T, 1), bn))
+            _dsa_indexer_q_kernel[grid](*q_args, **q_consts((bm, bn)), num_warps = q_warps, num_stages = q_stages)
         else:
             t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt)
             def t_consts(cfg):

@@ -169,6 +169,16 @@ way in the top-k regime: six to eight GEMV launches collapse into two. A/B switc
 eager path only; the graphed path (`EXL3_BC_DSA`) builds its own fan and is not affected.
 Layers whose projections mix quantization formats or bitrates decline the fan by themselves.
 
+### `EXL3_DSA_INDEXER_DTYPE` (default: `fp16`)
+
+Operand precision of the lightning indexer's prefill scoring, per GPU architecture: `fp16`,
+`int8` (sm_80 and newer), `fp8` (e4m3, sm_89 and newer) or `fp4` (e2m1 with a power-of-two scale
+per 32 values, as DeepSeek's reference indexer; sm_100 and newer). One value for every card, or
+`ARCH:DTYPE` items such as `sm_80:int8,sm_120:fp4`, a bare item covering the architectures not
+listed. Queries and keys are quantized per head row and per key, once per pass; only the top-k
+selection sees the difference. Calls with fewer than 64 query rows (decode) keep fp16. A type the
+device cannot run is refused at load. `--indexer_dtype` sets it from the command line.
+
 ### `EXL3_QC_STAGING` (default: `1`)
 
 How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only

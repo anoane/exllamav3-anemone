@@ -85,6 +85,7 @@ def add_args(
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
     parser.add_argument("-tp_linear_attn", "--tp_max_parallelism_linear_attn", type = int, help = "(TP) Maximum parallelism for linear-attention layers", default = None)
     parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
+    parser.add_argument("-idt", "--indexer_dtype", type = str, help = "DSA models: precision of the lightning indexer's prefill scoring per GPU architecture, fp16 (default), int8 (sm_80+), fp8 (sm_89+) or fp4 (sm_100+); one value, or ARCH:DTYPE items such as sm_80:int8,sm_120:fp4 (sets EXL3_DSA_INDEXER_DTYPE)", default = None)
 
     parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
     parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
@@ -376,6 +377,12 @@ def init(
 
     def printp(p: bool, s: str):
         if p: print(s)
+
+    if vars(args).get("indexer_dtype"):
+        # Before any model process starts: the TP workers read it from their environment
+        from .modules.attention_fn.dsa_triton import parse_indexer_dtype
+        parse_indexer_dtype(args.indexer_dtype)
+        os.environ["EXL3_DSA_INDEXER_DTYPE"] = args.indexer_dtype
 
     return_draft = "draft_model_dir" in args
     draft_model_dir = args.draft_model_dir if return_draft else None

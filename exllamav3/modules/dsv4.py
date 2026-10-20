@@ -16,7 +16,8 @@ from ..util.device_copy import to_device
 from .quant.exl3 import LinearEXL3
 from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
-from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
+from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds, dsa_indexer_dtype, \
+    dsa_indexer_keys, INDEXER_QUANT_MIN_ROWS
 from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
 
 # Multi-job decode via the batched path: one projection pass, one MULTIROW attention
@@ -656,6 +657,8 @@ class DSV4Attention(Module):
         # as the kv norm weight; the kernel requires matching dtypes). .data references only
         self.kv_norm_w = self.kv_norm.weight.data
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
+        if self.indexer_mode == "full" and (isinstance(device, int) or device.type == "cuda"):
+            dsa_indexer_dtype(device)
 
         if self.idx_wk is not None:
             self.compressor.ape = torch.zeros((self.compress_rate, self.head_dim), dtype = torch.float, device = device)
@@ -950,6 +953,8 @@ class DSV4Attention(Module):
         self.inv_freq_compress_neg = -self.inv_freq_compress
         self.kv_norm_w = self.kv_norm.weight.data
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
+        if self.indexer_mode == "full" and (isinstance(device, int) or device.type == "cuda"):
+            dsa_indexer_dtype(device)
         if self.compressor is not None:
             # A V4.1 pool owner that keys its indexer from the pool rotates nothing here, as in load()
             freq = torch.zeros_like(self.inv_freq_compress) if self.idx_wk is not None else self.inv_freq_compress
@@ -1292,6 +1297,8 @@ class DSV4Attention(Module):
         k = min(self.index_topk, ec)
         K_pad = -(-k // 32) * 32
         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
+        k_quant = dsa_indexer_keys(idx_pool, ec, block_table, epp) \
+            if mode != "use" and seq >= INDEXER_QUANT_MIN_ROWS else None
 
         def slab(r0, r1):
             sel, ninf = indices[r0:r1], -float("inf")
@@ -1310,7 +1317,7 @@ class DSV4Attention(Module):
                 sel.copy_(torch.where(sel < 0, sel, ent.int()[sel.clamp(min = 0)]))
                 return
             scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, pos0 + r0, self.compress_rate, ec,
-                                        block_table = block_table, epp = epp)
+                                        block_table = block_table, epp = epp, k_quant = k_quant)
             if mode == "source":
                 nf = ec // bs
                 full, tail = scores[:, :nf * bs].unflatten(1, (nf, bs)), scores[:, nf * bs:]
@@ -1345,6 +1352,9 @@ class DSV4Attention(Module):
         n = slab * max(128, 1 << (ec - 1).bit_length())
         # Attention and indexer queries, live while it is scored
         n += rows * (self.num_q_heads * self.head_dim + self.index_n_heads * self.index_head_dim)
+        if dsa_indexer_dtype(self.device) != "fp16":
+            # Quantized keys of the pass and queries of a slab: one byte per value at most, plus scales
+            n += (ec + slab * self.index_n_heads) * (self.index_head_dim // 2 + 2)
         bs = self.candidate_block_size
         if self.candidate_mode == "source" and ec > self.candidate_topk_blocks * bs:
             # Block maxima of a slab, live twice while the tail block is appended, and the candidate mask
